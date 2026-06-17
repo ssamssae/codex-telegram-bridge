@@ -1,0 +1,46 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.user.telegram-agent-bridge</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>/usr/bin/python3</string>
+        <string>/Users/YOU/telegram-agent-bridge/telegram_agent_bridge.py</string>
+    </array>
+
+    <key>WorkingDirectory</key>
+    <string>/Users/YOU</string>
+
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PATH</key>
+        <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/Users/YOU/.local/bin:/Users/YOU/.npm-global/bin</string>
+        <key>TAB_BOT_TOKEN</key>
+        <string>REPLACE_WITH_BOTFATHER_TOKEN</string>
+        <key>TAB_CHAT_ID</key>
+        <string>REPLACE_WITH_YOUR_NUMERIC_CHAT_ID</string>
+        <key>TAB_AGENT</key>
+        <string>codex</string>
+        <key>TAB_AGENT_CMD</key>
+        <string>codex</string>
+        <key>TAB_STATE_DIR</key>
+        <string>/Users/YOU/.local/state/telegram-agent-bridge</string>
+        <key>TAB_WORKDIR</key>
+        <string>/Users/YOU</string>
+        <key>TAB_PREFIX</key>
+        <string>BOT</string>
+    </dict>
+
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <true/>
+    <key>StandardOutPath</key>
+    <string>/tmp/telegram-agent-bridge.log</string>
+    <key>StandardErrorPath</key>
+    <string>/tmp/telegram-agent-bridge.log</string>
+</dict>
+</plist>
