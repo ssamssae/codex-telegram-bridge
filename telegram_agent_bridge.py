@@ -9,7 +9,9 @@ from __future__ import annotations
 
 import json
 import os
+import queue
 import shlex
+import stat
 import subprocess
 import sys
 import tempfile
@@ -53,6 +55,16 @@ def bool_env(name: str, default: bool = False) -> bool:
     return value.strip().lower() in {"1", "true", "yes", "y", "on"}
 
 
+def optional_path_env(name: str, default: str | None = None) -> Path | None:
+    raw = env(name, default)
+    if raw is None:
+        return None
+    value = raw.strip()
+    if not value or value.lower() in {"0", "false", "no", "off", "none"}:
+        return None
+    return expand_path(value)
+
+
 def expand_path(value: str) -> Path:
     return Path(os.path.expandvars(os.path.expanduser(value))).resolve()
 
@@ -84,6 +96,9 @@ class Config:
     telegram_chunk: int
     codex_dangerous_bypass: bool
     codex_extra_args: list[str]
+    local_input_path: Path | None
+    stdin_input: bool
+    typing_interval: int
 
     @classmethod
     def from_env(cls) -> "Config":
@@ -109,6 +124,12 @@ class Config:
         if not agent_cmd:
             raise BridgeError("TAB_AGENT_CMD must contain at least one command word")
 
+        local_input_default = (
+            "~/.local/state/telegram-agent-bridge/input.fifo"
+            if hasattr(os, "mkfifo")
+            else None
+        )
+
         return cls(
             bot_token=bot_token.strip(),
             chat_id=str(chat_id).strip(),
@@ -121,6 +142,12 @@ class Config:
             telegram_chunk=int_env("TAB_TG_CHUNK", 4096),
             codex_dangerous_bypass=bool_env("TAB_CODEX_DANGEROUS_BYPASS", False),
             codex_extra_args=codex_extra_args,
+            local_input_path=optional_path_env(
+                "TAB_LOCAL_INPUT",
+                local_input_default,
+            ),
+            stdin_input=bool_env("TAB_STDIN_INPUT", sys.stdin.isatty()),
+            typing_interval=int_env("TAB_TYPING_INTERVAL", 4),
         )
 
 
@@ -293,12 +320,19 @@ class TelegramClient:
         return None
 
 
+@dataclass(frozen=True)
+class BridgeJob:
+    source: str
+    text: str
+
+
 class Bridge:
     def __init__(self, config: Config, backend: AgentBackend, telegram: TelegramClient) -> None:
         self.config = config
         self.backend = backend
         self.telegram = telegram
         self.lock = threading.Lock()
+        self.jobs: queue.Queue[BridgeJob] = queue.Queue()
         self.offset_file = config.state_dir / "telegram-agent-bridge.offset"
         self.thread_file = config.state_dir / f"telegram-agent-bridge.{backend.name}.thread"
         self.config.state_dir.mkdir(parents=True, exist_ok=True)
@@ -325,6 +359,42 @@ class Bridge:
     def send(self, text: str) -> None:
         for chunk in self.telegram_chunks(text):
             self.telegram.call("sendMessage", chat_id=self.config.chat_id, text=chunk)
+
+    def print_local(self, text: str) -> None:
+        print(text, flush=True)
+
+    def mirror_prompt(self, job: BridgeJob) -> None:
+        if job.source == "local":
+            self.send(f"local input:\n{job.text}")
+        else:
+            self.print_local(f"telegram input:\n{job.text}")
+
+    def mirror_answer(self, job: BridgeJob, text: str) -> None:
+        self.print_local(f"agent answer ({job.source}):\n{text}")
+        self.send(text)
+
+    def mirror_error(self, job: BridgeJob, text: str) -> None:
+        message = f"agent failed: {text}"
+        self.print_local(f"{message} ({job.source})")
+        self.send(message)
+
+    def typing_until_done(self, stop_event: threading.Event) -> None:
+        interval = max(1, self.config.typing_interval)
+        while not stop_event.wait(interval):
+            self.telegram.call("sendChatAction", chat_id=self.config.chat_id, action="typing")
+
+    def start_typing(self) -> threading.Event:
+        stop_event = threading.Event()
+        self.telegram.call("sendChatAction", chat_id=self.config.chat_id, action="typing")
+        if self.config.typing_interval > 0:
+            thread = threading.Thread(
+                target=self.typing_until_done,
+                args=(stop_event,),
+                daemon=True,
+                name="tab-typing",
+            )
+            thread.start()
+        return stop_event
 
     def run_agent_turn(self, prompt: str, thread_id: str = "") -> tuple[str, str]:
         if thread_id and self.backend.supports_resume:
@@ -388,27 +458,45 @@ class Bridge:
         self.write_thread_id(new_thread_id)
         return answer
 
-    def handle_message_text(self, text: str) -> None:
+    def process_job(self, job: BridgeJob) -> None:
+        self.mirror_prompt(job)
+        typing_stop = self.start_typing()
+        try:
+            with self.lock:
+                answer = self.execute_with_session(job.text)
+        except BridgeError as exc:
+            self.mirror_error(job, str(exc))
+            return
+        except Exception as exc:  # noqa: BLE001
+            print(f"message handling failed: {exc}", file=sys.stderr)
+            self.mirror_error(job, "internal error")
+            return
+        finally:
+            typing_stop.set()
+        self.mirror_answer(job, answer)
+
+    def job_worker(self) -> None:
+        while True:
+            job = self.jobs.get()
+            try:
+                self.process_job(job)
+            except Exception as exc:  # noqa: BLE001
+                print(f"job worker failed: {exc}", file=sys.stderr)
+            finally:
+                self.jobs.task_done()
+
+    def handle_message_text(self, text: str, source: str = "telegram") -> None:
         text = (text or "").strip()
         if not text:
             return
 
         if text.lower() in {"/start", "/ping"}:
-            self.send(f"telegram-agent-bridge running (agent={self.backend.name})")
+            status = f"telegram-agent-bridge running (agent={self.backend.name})"
+            self.print_local(status)
+            self.send(status)
             return
 
-        self.telegram.call("sendChatAction", chat_id=self.config.chat_id, action="typing")
-        with self.lock:
-            try:
-                answer = self.execute_with_session(text)
-            except BridgeError as exc:
-                self.send(f"agent failed: {exc}")
-                return
-            except Exception as exc:  # noqa: BLE001
-                print(f"message handling failed: {exc}", file=sys.stderr)
-                self.send("agent failed: internal error")
-                return
-        self.send(answer)
+        self.jobs.put(BridgeJob(source=source, text=text))
 
     def handle_update(self, update: dict[str, Any]) -> None:
         message = update.get("message") or update.get("edited_message")
@@ -421,7 +509,47 @@ class Bridge:
         if not isinstance(text, str):
             return
         print(f">>> telegram-agent-bridge[{self.backend.name}]: {text.strip()}", flush=True)
-        self.handle_message_text(text)
+        self.handle_message_text(text, source="telegram")
+
+    def ensure_local_fifo(self) -> None:
+        path = self.config.local_input_path
+        if path is None:
+            return
+        if not hasattr(os, "mkfifo"):
+            raise BridgeError("TAB_LOCAL_INPUT requires os.mkfifo support")
+        path.parent.mkdir(parents=True, exist_ok=True)
+        if path.exists():
+            if not stat.S_ISFIFO(path.stat().st_mode):
+                raise BridgeError(f"TAB_LOCAL_INPUT exists but is not a FIFO: {path}")
+            return
+        os.mkfifo(path, 0o600)
+
+    def local_fifo_loop(self) -> None:
+        path = self.config.local_input_path
+        if path is None:
+            return
+        while True:
+            try:
+                with path.open("r", encoding="utf-8") as fifo:
+                    for line in fifo:
+                        self.handle_message_text(line, source="local")
+            except Exception as exc:  # noqa: BLE001
+                print(f"local input failed: {exc}", file=sys.stderr)
+                time.sleep(2)
+
+    def stdin_loop(self) -> None:
+        for line in sys.stdin:
+            self.handle_message_text(line, source="local")
+
+    def start(self) -> None:
+        threading.Thread(target=self.job_worker, daemon=True, name="tab-agent-worker").start()
+        if self.config.local_input_path is not None:
+            self.ensure_local_fifo()
+            self.print_local(f"local input fifo: {self.config.local_input_path}")
+            threading.Thread(target=self.local_fifo_loop, daemon=True, name="tab-fifo").start()
+        if self.config.stdin_input:
+            self.print_local("stdin local input enabled")
+            threading.Thread(target=self.stdin_loop, daemon=True, name="tab-stdin").start()
 
     def poll_forever(self) -> None:
         offset_raw = read_text(self.offset_file)
@@ -456,6 +584,11 @@ def main() -> int:
         f"agent={backend.name} chat={config.chat_id} state={config.state_dir}",
         flush=True,
     )
+    try:
+        bridge.start()
+    except BridgeError as exc:
+        print(f"configuration error: {exc}", file=sys.stderr)
+        return 2
     bridge.poll_forever()
     return 0
 

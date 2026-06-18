@@ -32,6 +32,10 @@
         <string>/Users/YOU</string>
         <key>TAB_PREFIX</key>
         <string>BOT</string>
+        <key>TAB_LOCAL_INPUT</key>
+        <string>/Users/YOU/.local/state/telegram-agent-bridge/input.fifo</string>
+        <key>TAB_STDIN_INPUT</key>
+        <string>0</string>
     </dict>
 
     <key>RunAtLoad</key>

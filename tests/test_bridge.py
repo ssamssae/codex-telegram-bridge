@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 import json
 import subprocess
+import stat
 import tempfile
 import unittest
 from pathlib import Path
@@ -22,6 +23,9 @@ def config(tmpdir, **overrides):
         "telegram_chunk": 12,
         "codex_dangerous_bypass": False,
         "codex_extra_args": [],
+        "local_input_path": None,
+        "stdin_input": False,
+        "typing_interval": 4,
     }
     base.update(overrides)
     return tab.Config(**base)
@@ -34,6 +38,15 @@ class FakeTelegram:
     def call(self, method, **params):
         self.calls.append((method, params))
         return {"ok": True}
+
+
+class CapturingBridge(tab.Bridge):
+    def __init__(self, cfg, backend, telegram):
+        super().__init__(cfg, backend, telegram)
+        self.local_output = []
+
+    def print_local(self, text):
+        self.local_output.append(text)
 
 
 class BridgeTests(unittest.TestCase):
@@ -95,6 +108,62 @@ class BridgeTests(unittest.TestCase):
                 {"update_id": 1, "message": {"chat": {"id": "9999"}, "text": "/ping"}}
             )
             self.assertEqual(bridge.telegram.calls, [])
+
+    def test_telegram_message_enqueues_without_running_agent(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            cfg = config(tmpdir)
+            bridge = CapturingBridge(cfg, tab.GenericBackend(cfg), FakeTelegram())
+
+            bridge.handle_update(
+                {"update_id": 1, "message": {"chat": {"id": "1234"}, "text": "hello"}}
+            )
+
+            queued = bridge.jobs.get_nowait()
+            self.assertEqual(queued, tab.BridgeJob(source="telegram", text="hello"))
+            self.assertEqual(bridge.telegram.calls, [])
+
+    def test_local_job_mirrors_prompt_and_answer_to_both_sides(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            cfg = config(tmpdir, telegram_chunk=4096)
+            bridge = CapturingBridge(cfg, tab.GenericBackend(cfg), FakeTelegram())
+            bridge.execute_with_session = lambda prompt: f"answer to {prompt}"
+
+            bridge.process_job(tab.BridgeJob(source="local", text="hello"))
+
+            sent = [
+                params["text"]
+                for method, params in bridge.telegram.calls
+                if method == "sendMessage"
+            ]
+            self.assertEqual(sent, ["BOT local input:\nhello", "BOT answer to hello"])
+            self.assertIn("agent answer (local):\nanswer to hello", bridge.local_output)
+
+    def test_telegram_job_mirrors_prompt_to_terminal_and_answer_to_telegram(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            cfg = config(tmpdir, telegram_chunk=4096)
+            bridge = CapturingBridge(cfg, tab.GenericBackend(cfg), FakeTelegram())
+            bridge.execute_with_session = lambda prompt: "done"
+
+            bridge.process_job(tab.BridgeJob(source="telegram", text="from phone"))
+
+            sent = [
+                params["text"]
+                for method, params in bridge.telegram.calls
+                if method == "sendMessage"
+            ]
+            self.assertEqual(sent, ["BOT done"])
+            self.assertIn("telegram input:\nfrom phone", bridge.local_output)
+            self.assertIn("agent answer (telegram):\ndone", bridge.local_output)
+
+    def test_local_fifo_is_created(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            fifo_path = Path(tmpdir) / "input.fifo"
+            cfg = config(tmpdir, local_input_path=fifo_path)
+            bridge = CapturingBridge(cfg, tab.GenericBackend(cfg), FakeTelegram())
+
+            bridge.ensure_local_fifo()
+
+            self.assertTrue(stat.S_ISFIFO(fifo_path.stat().st_mode))
 
     def test_session_retries_stale_thread_once(self):
         with tempfile.TemporaryDirectory() as tmpdir:

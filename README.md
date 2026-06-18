@@ -7,11 +7,18 @@ This is not MCP. It is a small standalone relay daemon:
 ```text
 Telegram message
   -> getUpdates polling
+  -> shared turn queue
   -> single-user chat_id allowlist
   -> <agent> exec one turn
   -> optional session resume
   -> final answer only
   -> Telegram sendMessage
+
+Local terminal input
+  -> stdin or FIFO
+  -> same shared turn queue
+  -> same resumable agent thread
+  -> final answer to both Telegram and terminal
 ```
 
 ## Quickstart
@@ -38,6 +45,15 @@ python3 ~/telegram-agent-bridge/telegram_agent_bridge.py
 
 Send `/ping` to the bot. Then send a normal prompt.
 
+For local terminal input without scraping an agent TUI, either type into the
+foreground bridge process or write one prompt per line to the FIFO:
+
+```bash
+printf '%s\n' 'continue from the terminal' > ~/.local/state/telegram-agent-bridge/input.fifo
+```
+
+Prompts and final answers are mirrored to both Telegram and terminal output.
+
 ## Configuration
 
 Required settings are intentionally small and explicit.
@@ -53,6 +69,9 @@ Required settings are intentionally small and explicit.
 | `TAB_WORKDIR` | no | `~` | Working directory for the agent process. Codex also receives `-C TAB_WORKDIR`. |
 | `TAB_TIMEOUT` | no | `600` | Per-turn timeout in seconds. |
 | `TAB_TG_CHUNK` | no | `4096` | Telegram message chunk size. |
+| `TAB_TYPING_INTERVAL` | no | `4` | Seconds between repeated Telegram `typing` actions while the agent is running. |
+| `TAB_LOCAL_INPUT` | no | `~/.local/state/telegram-agent-bridge/input.fifo` on POSIX | FIFO path for local terminal prompts. Set to `0`/`off` to disable. |
+| `TAB_STDIN_INPUT` | no | auto | Read local prompts from stdin. Defaults to on only when stdin is a TTY. |
 | `TAB_CODEX_DANGEROUS_BYPASS` | no | `0` | When `1`, adds `--dangerously-bypass-approvals-and-sandbox` to Codex. |
 | `TAB_CODEX_EXTRA_ARGS` | no | empty | Extra arguments inserted after `codex exec --json -o <tmp>`. |
 
@@ -127,6 +146,7 @@ Review the `PATH` in each file. Services often start with a smaller environment 
 - Treat `TAB_BOT_TOKEN` like a password. Do not commit it, paste it into logs, or share it.
 - Keep `TAB_CHAT_ID` set to your own chat id. This single-user allowlist is the main safety boundary.
 - Run this only on a trusted personal machine or trusted server. Telegram messages become terminal agent prompts.
+- Protect `TAB_LOCAL_INPUT`. Anyone who can write to the FIFO can send prompts to the agent.
 - Be careful with `TAB_CODEX_DANGEROUS_BYPASS=1`. It adds `--dangerously-bypass-approvals-and-sandbox`, allowing Codex to act without normal approval and sandbox protections.
 - Prefer a limited working directory in `TAB_WORKDIR` when possible.
 - This daemon uses Telegram polling, not a public inbound webhook. You do not need to expose a local port.
