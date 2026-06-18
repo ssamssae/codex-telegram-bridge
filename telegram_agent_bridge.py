@@ -303,13 +303,13 @@ class TelegramClient:
     def __init__(self, token: str) -> None:
         self.api = f"https://api.telegram.org/bot{token}"
 
-    def call(self, method: str, **params: Any) -> dict[str, Any] | None:
+    def call(self, method: str, timeout: int = 60, **params: Any) -> dict[str, Any] | None:
         data = urllib.parse.urlencode(params).encode()
         url = f"{self.api}/{method}"
         for attempt in range(3):
             try:
                 request = urllib.request.Request(url, data=data)
-                with urllib.request.urlopen(request, timeout=60) as response:
+                with urllib.request.urlopen(request, timeout=timeout) as response:
                     payload = json.load(response)
                 return payload if isinstance(payload, dict) else None
             except Exception as exc:  # noqa: BLE001
@@ -380,12 +380,18 @@ class Bridge:
 
     def typing_until_done(self, stop_event: threading.Event) -> None:
         interval = max(1, self.config.typing_interval)
-        while not stop_event.wait(interval):
-            self.telegram.call("sendChatAction", chat_id=self.config.chat_id, action="typing")
+        while not stop_event.is_set():
+            self.telegram.call(
+                "sendChatAction",
+                timeout=5,
+                chat_id=self.config.chat_id,
+                action="typing",
+            )
+            if stop_event.wait(interval):
+                break
 
     def start_typing(self) -> threading.Event:
         stop_event = threading.Event()
-        self.telegram.call("sendChatAction", chat_id=self.config.chat_id, action="typing")
         if self.config.typing_interval > 0:
             thread = threading.Thread(
                 target=self.typing_until_done,
