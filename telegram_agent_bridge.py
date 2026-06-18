@@ -91,6 +91,7 @@ class Config:
     agent_cmd: list[str]
     state_dir: Path
     prefix: str
+    prefix_line: bool
     workdir: Path
     timeout: int
     telegram_chunk: int
@@ -137,6 +138,7 @@ class Config:
             agent_cmd=agent_cmd,
             state_dir=expand_path(env("TAB_STATE_DIR", "~/.local/state/telegram-agent-bridge") or ""),
             prefix=env("TAB_PREFIX", "") or "",
+            prefix_line=bool_env("TAB_PREFIX_LINE", False),
             workdir=expand_path(env("TAB_WORKDIR", "~") or "~"),
             timeout=int_env("TAB_TIMEOUT", 600),
             telegram_chunk=int_env("TAB_TG_CHUNK", 4096),
@@ -348,7 +350,11 @@ class Bridge:
 
     def telegram_chunks(self, text: str) -> list[str]:
         text = text or "(empty response)"
-        prefix = f"{self.config.prefix} " if self.config.prefix else ""
+        if self.config.prefix:
+            separator = "\n" if self.config.prefix_line else " "
+            prefix = f"{self.config.prefix}{separator}"
+        else:
+            prefix = ""
         first_limit = max(1, self.config.telegram_chunk - len(prefix))
         chunks = [prefix + text[:first_limit]]
         rest = text[first_limit:]

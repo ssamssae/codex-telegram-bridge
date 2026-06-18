@@ -68,6 +68,7 @@ Required settings are intentionally small and explicit.
 | `TAB_AGENT_CMD` | depends | `codex` for Codex | Base command. Split like shell arguments. Required for `generic`. |
 | `TAB_STATE_DIR` | no | `~/.local/state/telegram-agent-bridge` | Offset and thread-id state directory. |
 | `TAB_PREFIX` | no | empty | Prefix shown on the first Telegram reply chunk, for example an emoji or node label. |
+| `TAB_PREFIX_LINE` | no | `0` | When `1`, puts `TAB_PREFIX` on its own first line. |
 | `TAB_WORKDIR` | no | `~` | Working directory for the agent process. Codex also receives `-C TAB_WORKDIR`. |
 | `TAB_TIMEOUT` | no | `600` | Per-turn timeout in seconds. |
 | `TAB_TG_CHUNK` | no | `4096` | Telegram message chunk size. |

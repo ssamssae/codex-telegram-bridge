@@ -18,6 +18,7 @@ def config(tmpdir, **overrides):
         "agent_cmd": ["/tmp/fake-codex"],
         "state_dir": Path(tmpdir),
         "prefix": "BOT",
+        "prefix_line": False,
         "workdir": Path(tmpdir),
         "timeout": 600,
         "telegram_chunk": 12,
@@ -108,6 +109,13 @@ class BridgeTests(unittest.TestCase):
                 {"update_id": 1, "message": {"chat": {"id": "9999"}, "text": "/ping"}}
             )
             self.assertEqual(bridge.telegram.calls, [])
+
+    def test_bridge_prefix_can_use_own_line(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            cfg = config(tmpdir, prefix="BOT", prefix_line=True, telegram_chunk=12)
+            bridge = tab.Bridge(cfg, tab.GenericBackend(cfg), FakeTelegram())
+
+            self.assertEqual(bridge.telegram_chunks("answer"), ["BOT\nanswer"])
 
     def test_telegram_message_enqueues_without_running_agent(self):
         with tempfile.TemporaryDirectory() as tmpdir:
