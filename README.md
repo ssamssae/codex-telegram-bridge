@@ -1,6 +1,8 @@
-# Telegram Agent Bridge
+# Codex Telegram Bridge
 
-Run any terminal AI coding agent from Telegram: Codex now, generic one-shot commands today, and Claude Code / Aider / Gemini CLI templates next.
+Run Codex from Telegram, with local terminal input mirrored back to Telegram.
+Generic one-shot command backends can also adapt Claude Code, Aider, Gemini CLI,
+or your own terminal agent.
 
 This is not MCP. It is a small standalone relay daemon:
 
