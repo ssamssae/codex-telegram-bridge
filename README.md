@@ -3,10 +3,13 @@
 [![Release](https://img.shields.io/github/v/release/ssamssae/codex-telegram-bridge)](https://github.com/ssamssae/codex-telegram-bridge/releases)
 [![License: MIT](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
 
-Run Codex from Telegram, with the visible Codex CLI REPL and Telegram kept in
-sync. Telegram text, images, video metadata/thumbnails, and audio transcripts
-can be delivered into the Codex CLI transcript, while Codex final answers are
-mirrored back to Telegram.
+Run Codex from Telegram. Built to support other terminal AI agents.
+
+Codex Telegram Bridge is a phone remote for your local Codex CLI: send prompts,
+screenshots, videos, and voice notes from Telegram, then get Codex final answers
+and generated media back in Telegram. The default mode keeps your visible Codex
+CLI REPL and Telegram in sync, so the terminal transcript stays readable while
+the phone stays useful.
 
 Install with `pipx`, then run the setup wizard:
 
@@ -34,14 +37,9 @@ Release: <https://github.com/ssamssae/codex-telegram-bridge/releases/latest>
 Promo video:
 <https://github.com/ssamssae/codex-telegram-bridge/releases/download/v0.3.0/codex-telegram-bridge-promo-v0.3.0.mp4>
 
-The repo also includes a simpler one-shot `codex exec` mode. Generic one-shot
-command backends can adapt Claude Code, Aider, Gemini CLI, or your own terminal
-agent.
-
-Multi-head runtime design is tracked in [docs/agent-runtime.md](docs/agent-runtime.md).
-The first runtime slice includes a head adapter contract, approval TTL model,
-capability registry, transport abstraction, workdir lock, and a Codex REPL
-adapter.
+The repo also includes a simpler one-shot `codex exec` mode. Internally, the
+bridge now has an adapter foundation for future Claude Code, Aider, Gemini CLI,
+GLM, or custom terminal-agent heads. Codex remains the default product path.
 
 This is not MCP. It is a small standalone relay daemon. Default `repl` mode:
 

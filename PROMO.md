@@ -1,16 +1,17 @@
-# Codex Telegram Bridge
+# Codex Telegram Bridge — Run Codex from Telegram
 
-Codex Telegram Bridge turns Telegram into a lightweight control plane for Codex CLI.
+Codex Telegram Bridge turns Telegram into a phone remote for your local Codex CLI.
 
 Why it is useful:
 
 - Send a prompt from Telegram and get the final Codex answer back in Telegram.
+- Send screenshots, videos, and voice notes without leaving Telegram.
 - Keep a local terminal input path too, so a prompt typed on the machine can be mirrored back to Telegram.
-- Preserve Codex `exec` session context across turns.
+- Keep the visible Codex REPL transcript readable while Telegram mirrors final answers.
 - Avoid webhooks and exposed ports; it uses Telegram polling.
 - Run with only the Python standard library.
 
-The first public release is intentionally small: one trusted chat id, one bot token, one local machine, one terminal agent turn at a time. That shape keeps the safety boundary easy to understand while still making Codex reachable from a phone.
+The product is Codex-first today, with an adapter foundation for other terminal AI agents later. The safety boundary stays simple: one trusted chat id, one bot token, one local machine, and no public web server.
 
 Repository:
 https://github.com/ssamssae/codex-telegram-bridge
