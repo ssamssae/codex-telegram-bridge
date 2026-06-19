@@ -51,6 +51,7 @@ MEDIA_ATTACHMENT_EXTENSIONS = IMAGE_ATTACHMENT_EXTENSIONS | AUDIO_EXTENSIONS | V
 VOICE_ATTACHMENT_EXTENSIONS = {".ogg", ".oga", ".opus"}
 APPROVAL_CALLBACK_PREFIX = "crb_approval"
 CHOICE_CALLBACK_PREFIX = "crb_choice"
+STATUS_COMMANDS = {"status", "/status"}
 ANSI_RE = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]")
 MARKDOWN_LOCAL_PATH_RE = re.compile(r"!?\[[^\]]*]\((?P<path>[^)\n]+)\)")
 MEDIA_ATTACHMENT_SUFFIX_RE = "|".join(
@@ -125,6 +126,54 @@ def is_codex_slash_command(text: str) -> bool:
         return False
     command = stripped.split(maxsplit=1)[0].lower()
     return command not in {"/start", "/ping"}
+
+
+def is_status_command(text: str) -> bool:
+    stripped = (text or "").strip().lower()
+    if stripped in STATUS_COMMANDS:
+        return True
+    command = stripped.split(maxsplit=1)[0] if stripped else ""
+    return command == "/status" or command.startswith("/status@")
+
+
+def extract_codex_status_text(screen: str) -> str:
+    lines = (screen or "").splitlines()
+    header_index = None
+    for index in range(len(lines) - 1, -1, -1):
+        if "OpenAI Codex" in lines[index]:
+            header_index = index
+            break
+    if header_index is None:
+        return truncate_text((screen or "").strip(), 3500)
+
+    start = header_index
+    while start > 0 and "╭" not in lines[start]:
+        start -= 1
+    if "╭" not in lines[start]:
+        start = max(0, header_index - 2)
+
+    end = header_index
+    while end < len(lines) - 1 and "╰" not in lines[end]:
+        end += 1
+    if "╰" not in lines[end]:
+        end = min(len(lines) - 1, header_index + 25)
+
+    cleaned: list[str] = []
+    for raw_line in lines[start : end + 1]:
+        line = raw_line.strip()
+        if not line or set(line) <= set("╭╮╰╯─━ "):
+            continue
+        if "│" in raw_line:
+            parts = raw_line.split("│")
+            line = "│".join(parts[1:-1]).strip() if len(parts) >= 3 else raw_line.strip(" │")
+        if not line:
+            continue
+        if line.startswith("Visit ") or line.startswith("information on "):
+            continue
+        cleaned.append(re.sub(r"\s{2,}", "  ", line).rstrip())
+
+    body = "\n".join(cleaned).strip()
+    return f"Codex status\n{body}" if body else "Codex status not visible yet."
 
 
 def suffix_from_metadata(file_name: str = "", mime_type: str = "", default: str = ".bin") -> str:
@@ -1399,6 +1448,22 @@ class Bridge:
                 self.repl_typing_stop = None
                 log("TYPE", "stop")
 
+    def handle_status_command(self, text: str) -> bool:
+        if not is_status_command(text):
+            return False
+        log("TG", "status -> Codex REPL")
+        self.begin_repl_typing()
+        try:
+            self.head.send(AgentMessage("/status"))
+            time.sleep(1.0)
+            self.telegram.send(extract_codex_status_text(self.head.capture_pane(120)))
+        except Exception as exc:  # noqa: BLE001
+            log("REPL", f"status failed: {exc}")
+            self.telegram.send(f"codex status failed: {exc}")
+        finally:
+            self.stop_repl_typing()
+        return True
+
     def approval_loop(self) -> None:
         while not self.stop_event.is_set():
             try:
@@ -2384,6 +2449,8 @@ class Bridge:
                     continue
                 if prompt.text.strip().lower() in {"/start", "/ping"}:
                     self.telegram.send("codex REPL bridge running")
+                    continue
+                if self.handle_status_command(prompt.text):
                     continue
                 log("TG", "prompt -> Codex REPL")
                 self.begin_repl_typing()

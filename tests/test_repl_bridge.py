@@ -169,6 +169,39 @@ class ReplBridgeTests(unittest.TestCase):
 
             self.assertEqual(codex.sent_keys(), ["Enter"])
 
+    def test_status_command_aliases(self):
+        self.assertTrue(repl.is_status_command("status"))
+        self.assertTrue(repl.is_status_command("/status"))
+        self.assertTrue(repl.is_status_command("/status@codex_bot"))
+        self.assertFalse(repl.is_status_command("status please"))
+
+    def test_extract_codex_status_text_from_tui_box(self):
+        screen = """
+/status
+
+╭─────────────────────────────────────────────────────────────────────────────────────────╮
+│  >_ OpenAI Codex (v0.141.0)                                                             │
+│                                                                                         │
+│ Visit https://chatgpt.com/codex/settings/usage for up-to-date                           │
+│ information on rate limits and credits                                                  │
+│                                                                                         │
+│  Model:                       gpt-5.5 (reasoning xhigh, summaries auto)                 │
+│  Directory:                   ~                                                         │
+│  Permissions:                 Full Access                                               │
+│  Session:                     019ee042-0a6e-76c1-9da8-ce73a0bd670a                      │
+│                                                                                         │
+│  5h limit:                    [████████████████████] 100% left (resets 04:20 on 20 Jun) │
+│  Weekly limit:                [████████████████░░░░] 81% left (resets 20:49 on 25 Jun)  │
+╰─────────────────────────────────────────────────────────────────────────────────────────╯
+"""
+        status = repl.extract_codex_status_text(screen)
+
+        self.assertIn("Codex status", status)
+        self.assertIn("OpenAI Codex (v0.141.0)", status)
+        self.assertIn("Model:  gpt-5.5", status)
+        self.assertIn("Weekly limit:  [████████████████░░░░] 81% left", status)
+        self.assertNotIn("Visit https://chatgpt.com", status)
+
     def test_regular_prompt_keeps_configured_submit_key(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             codex = RecordingCodexRepl(config(tmpdir, submit_key="Tab", enter_count=5))

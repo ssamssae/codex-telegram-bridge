@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "codex-telegram-bridge"
-version = "0.3.3"
+version = "0.3.4"
 description = "Run Codex from Telegram, with an adapter foundation for other terminal AI agents."
 readme = "README.md"
 requires-python = ">=3.10"
