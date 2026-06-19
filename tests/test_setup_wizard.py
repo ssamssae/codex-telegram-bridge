@@ -1,4 +1,6 @@
 #!/usr/bin/env python3
+import contextlib
+import io
 import tempfile
 import unittest
 from pathlib import Path
@@ -148,6 +150,50 @@ class SetupWizardTests(unittest.TestCase):
             self.assertEqual(values["TAB_BRIDGE_MODE"], "repl")
             self.assertTrue((base / "bridge-run").exists())
             self.assertIn("sendMessage", [call[1] for call in api.calls])
+
+    def test_setup_output_guides_first_time_users(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            base = Path(tmpdir)
+            api = FakeApi()
+            buffer = io.StringIO()
+            with contextlib.redirect_stdout(buffer):
+                rc = setup.setup_bridge(
+                    setup.SetupOptions(
+                        config_file=base / "bridge.env",
+                        runner_file=base / "bridge-run",
+                        mode="repl",
+                        token="token",
+                        chat_id="",
+                        agent="codex",
+                        agent_cmd="codex",
+                        workdir=base,
+                        prefix="BOT",
+                        prefix_line=False,
+                        state_dir=base / "state",
+                        dangerous_bypass=False,
+                        tmux_socket="codex",
+                        tmux_session="codex",
+                        submit_key="Tab",
+                        install_asr=False,
+                        wait_timeout=1,
+                        install_service=False,
+                        start_service=False,
+                        send_test=False,
+                        non_interactive=False,
+                        yes=True,
+                    ),
+                    api_call=api,
+                )
+
+            output = buffer.getvalue()
+            self.assertEqual(rc, 0)
+            self.assertIn("[1/6] Paste the BotFather token", output)
+            self.assertIn("Using the token provided by --token", output)
+            self.assertIn("[2/6] Connect your Telegram chat", output)
+            self.assertIn("Do not paste the bot token into Telegram", output)
+            self.assertIn("Only send /start", output)
+            self.assertIn("tmux -L codex new -s codex", output)
+            self.assertIn("Setup complete.", output)
 
     def test_doctor_reports_ok_with_fake_api(self):
         with tempfile.TemporaryDirectory() as tmpdir:

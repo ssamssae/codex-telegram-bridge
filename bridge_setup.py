@@ -28,6 +28,7 @@ REPO_DIR = Path(__file__).resolve().parent
 EXEC_BRIDGE_SCRIPT = REPO_DIR / "telegram_agent_bridge.py"
 REPL_BRIDGE_SCRIPT = REPO_DIR / "codex_repl_bridge.py"
 AUDIO_TRANSCRIBE_SCRIPT = REPO_DIR / "codex_audio_transcribe.py"
+SETUP_TOTAL_STEPS = 6
 
 
 class SetupError(RuntimeError):
@@ -72,6 +73,19 @@ def fail(message: str) -> None:
 
 def ok(message: str) -> None:
     out(f"[ok] {message}")
+
+
+def setup_step(number: int, title: str) -> None:
+    out("")
+    out(f"[{number}/{SETUP_TOTAL_STEPS}] {title}")
+
+
+def setup_note(message: str) -> None:
+    out(f"    {message}")
+
+
+def setup_command(command: str) -> None:
+    out(f"      {command}")
 
 
 def doctor_command_hint() -> str:
@@ -230,7 +244,10 @@ def wait_for_chat_id(
             extracted = extract_chat_id(update)
             if extracted:
                 return extracted
-    raise SetupError("Timed out waiting for a Telegram message to the bot")
+    raise SetupError(
+        "Timed out waiting for /start. Open your bot chat in Telegram, send /start, "
+        "and keep this terminal setup running."
+    )
 
 
 def send_test_message(token: str, chat_id: str, api_call: ApiCall = telegram_call) -> bool:
@@ -556,48 +573,90 @@ class SetupOptions:
 
 
 def setup_bridge(options: SetupOptions, api_call: ApiCall = telegram_call) -> int:
-    out("Telegram Agent Bridge setup")
+    out("Codex Telegram Bridge setup")
+    out("This wizard connects one Telegram bot to this local machine.")
     out("")
+    out("You will need:")
+    setup_note("a Telegram bot token from @BotFather")
+    setup_note("the Telegram app open so you can send /start to your bot")
+    setup_note("Codex installed and logged in locally")
+    if options.mode == "repl":
+        setup_note("for full REPL mode, a Codex tmux session: tmux -L codex new -s codex")
+
     if options.mode not in {"repl", "exec"}:
         raise SetupError("--mode must be repl or exec")
 
+    setup_step(1, "Paste the BotFather token")
     token = (options.token or "").strip()
+    if token:
+        setup_note("Using the token provided by --token.")
+    else:
+        setup_note("Paste the token here in the terminal. Do not send it in any Telegram chat.")
+    setup_note(f"It will be stored only in your private config: {options.config_file}")
     if not token:
         if options.non_interactive:
             raise SetupError("--token is required in non-interactive mode")
         token = getpass.getpass("BotFather token (hidden): ").strip()
-    username = validate_bot_token(token, api_call=api_call)
+    try:
+        username = validate_bot_token(token, api_call=api_call)
+    except SetupError as exc:
+        raise SetupError(
+            f"{exc}. Copy the token from @BotFather and paste it into this terminal, "
+            "not into your Telegram chat."
+        ) from exc
     ok(f"token valid: @{username}")
 
+    setup_step(2, "Connect your Telegram chat")
     chat_id = (options.chat_id or "").strip()
     if not chat_id:
         if options.non_interactive:
             raise SetupError("--chat-id is required in non-interactive mode")
         offset = current_update_offset(token, api_call=api_call)
-        out("")
-        out(f"Open Telegram, send /start to @{username}, then leave this setup running.")
-        chat_id, label = wait_for_chat_id(
-            token,
-            offset=offset,
-            timeout_seconds=options.wait_timeout,
-            api_call=api_call,
-        )
+        setup_note(f"Open Telegram and send /start to @{username}.")
+        setup_note("Do not paste the bot token into Telegram. Only send /start.")
+        setup_note(f"Waiting up to {options.wait_timeout} seconds for that message...")
+        try:
+            chat_id, label = wait_for_chat_id(
+                token,
+                offset=offset,
+                timeout_seconds=options.wait_timeout,
+                api_call=api_call,
+            )
+        except SetupError as exc:
+            raise SetupError(
+                f"{exc} If this keeps failing, make sure you opened the bot chat itself "
+                "and pressed Start or sent /start."
+            ) from exc
         ok(f"chat id detected: {chat_id} ({label})")
     else:
+        setup_note("Using the chat id provided on the command line.")
         ok(f"chat id configured: {chat_id}")
 
-    if options.agent == "codex" and not shutil.which(shlex.split(options.agent_cmd)[0]):
+    setup_step(3, "Check the local Codex mode")
+    if options.mode == "repl":
+        setup_note("REPL mode mirrors Telegram into an existing Codex CLI tmux session.")
+        setup_note("If you have not started that session yet, open another terminal and run:")
+        setup_command(f"tmux -L {options.tmux_socket} new -s {options.tmux_session}")
+        setup_command(options.agent_cmd)
+    else:
+        setup_note("Exec mode runs one text-only Codex turn per Telegram prompt.")
+    try:
+        agent_binary = shlex.split(options.agent_cmd)[0]
+    except (ValueError, IndexError):
+        agent_binary = ""
+    if options.agent == "codex" and agent_binary and not shutil.which(agent_binary):
         warn(f"agent command not found on PATH now: {options.agent_cmd}")
-
     if options.mode == "repl" and not shutil.which("tmux"):
         warn("tmux was not found on PATH. REPL mode requires an existing tmux Codex session.")
     if options.mode == "repl":
-        out("Mode: repl (Codex CLI transcript, image/video/audio prompts, Telegram typing)")
+        ok("mode selected: repl (visible Codex transcript, media prompts, Telegram typing)")
     else:
-        out("Mode: exec (one-shot codex exec text bridge)")
+        ok("mode selected: exec (one-shot codex exec text bridge)")
 
+    setup_step(4, "Write the private config")
     local_input = options.state_dir / "input.fifo"
     if options.config_file.exists() and not options.yes and not options.non_interactive:
+        setup_note("An existing config was found. Keeping it is safest if this is already working.")
         if not prompt_yes_no(f"Overwrite existing config {options.config_file}?", default=False):
             raise SetupError("setup cancelled")
 
@@ -629,10 +688,12 @@ def setup_bridge(options: SetupOptions, api_call: ApiCall = telegram_call) -> in
         audio_transcribe_cmd=audio_transcribe_cmd,
     )
     ok(f"wrote private config: {options.config_file}")
+    setup_note("The config file is chmod 600 and should stay out of git.")
 
     install_runner(options.runner_file, options.config_file)
     ok(f"installed runner: {options.runner_file}")
 
+    setup_step(5, "Install the background service")
     if options.install_service:
         installed = install_service(options.runner_file, start=options.start_service)
         if installed:
@@ -641,17 +702,24 @@ def setup_bridge(options: SetupOptions, api_call: ApiCall = telegram_call) -> in
                 ok(f"service status: {service_status()}")
     else:
         warn("service install skipped; run the runner manually")
+        setup_command(str(options.runner_file))
 
+    setup_step(6, "Send a setup-complete test message")
     if options.send_test:
         if send_test_message(token, chat_id, api_call=api_call):
             ok("sent setup-complete test message")
         else:
             warn("could not send setup-complete test message")
+            setup_note("Run doctor next; it will test token, chat_id, service, and local command paths.")
+    else:
+        setup_note("Test message skipped by option.")
 
     out("")
-    out("Next:")
-    out("  Send /ping to your bot.")
-    out(f"  Run doctor: {doctor_command_hint()}")
+    out("Setup complete.")
+    out("Try it now:")
+    out("  1. In Telegram, send /ping to your bot.")
+    out("  2. If /ping works, send a normal Codex prompt.")
+    out(f"  3. Run a health check any time: {doctor_command_hint()}")
     return 0
 
 

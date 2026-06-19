@@ -21,7 +21,7 @@ https://github.com/ssamssae/codex-telegram-bridge/releases/latest
 Install sketch:
 
 ```bash
-pipx install "git+https://github.com/ssamssae/codex-telegram-bridge.git@v0.2.1"
+pipx install "git+https://github.com/ssamssae/codex-telegram-bridge.git@v0.2.2"
 codex-telegram-bridge setup
 codex-telegram-bridge doctor
 ```

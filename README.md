@@ -11,7 +11,7 @@ mirrored back to Telegram.
 Install with `pipx`, then run the setup wizard:
 
 ```bash
-pipx install "git+https://github.com/ssamssae/codex-telegram-bridge.git@v0.2.1"
+pipx install "git+https://github.com/ssamssae/codex-telegram-bridge.git@v0.2.2"
 codex-telegram-bridge setup
 codex-telegram-bridge doctor
 ```
@@ -32,7 +32,7 @@ or normal prompts to your bot.
 Release: <https://github.com/ssamssae/codex-telegram-bridge/releases/latest>
 
 Promo video:
-<https://github.com/ssamssae/codex-telegram-bridge/releases/download/v0.2.1/codex-telegram-bridge-promo-v0.2.1.mp4>
+<https://github.com/ssamssae/codex-telegram-bridge/releases/download/v0.2.2/codex-telegram-bridge-promo-v0.2.2.mp4>
 
 The repo also includes a simpler one-shot `codex exec` mode. Generic one-shot
 command backends can adapt Claude Code, Aider, Gemini CLI, or your own terminal
@@ -56,6 +56,20 @@ Codex CLI input
 
 ## Quickstart
 
+The setup wizard is designed for first-time users. It shows six steps:
+
+```text
+[1/6] Paste the BotFather token
+[2/6] Connect your Telegram chat
+[3/6] Check the local Codex mode
+[4/6] Write the private config
+[5/6] Install the background service
+[6/6] Send a setup-complete test message
+```
+
+Important: paste the BotFather token only into the terminal when the setup
+wizard asks for it. In Telegram, send only `/start`, `/ping`, or normal prompts.
+
 1. Install and log in to Codex on the same machine. Start Codex in a named tmux
    session for full REPL mode:
 
@@ -65,7 +79,7 @@ codex
 ```
 
 If you only want text-only one-shot mode without a visible Codex TUI, you can use
-`python3 bridge_setup.py setup --mode exec` instead.
+`codex-telegram-bridge setup --mode exec` instead.
 
 2. Create a Telegram bot with [@BotFather](https://t.me/BotFather) and copy the bot token.
    Do not send this token in any Telegram chat. Paste it only into the local
@@ -90,6 +104,7 @@ The wizard will:
 - validate the BotFather token with Telegram `getMe`
 - ask you to send `/start` to the bot in Telegram
 - detect your numeric `chat_id` automatically
+- show what it is doing at each step
 - write a private `~/.config/telegram-agent-bridge.env` with mode `0600`
 - install `~/.local/bin/telegram-agent-bridge-run`
 - install and start a user service with systemd on Linux/WSL or launchd on macOS
