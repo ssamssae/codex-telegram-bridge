@@ -5,13 +5,11 @@ Wants=network-online.target
 
 [Service]
 Type=simple
-# Create this file from config.example.env and chmod 600 it.
-EnvironmentFile=%h/.config/telegram-agent-bridge.env
 # Services do not inherit your interactive shell PATH. Add the directory that
 # contains codex, claude, aider, gemini, or your chosen agent command.
 Environment=PATH=%h/.local/bin:%h/.npm-global/bin:/usr/local/bin:/opt/homebrew/bin:/usr/bin:/bin
-WorkingDirectory=%h
-ExecStart=/usr/bin/env python3 %h/telegram-agent-bridge/telegram_agent_bridge.py
+# The setup wizard creates this runner. It reads the private env file.
+ExecStart=%h/.local/bin/telegram-agent-bridge-run
 Restart=always
 RestartSec=5
 

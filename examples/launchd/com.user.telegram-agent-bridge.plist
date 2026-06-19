@@ -7,35 +7,13 @@
 
     <key>ProgramArguments</key>
     <array>
-        <string>/usr/bin/python3</string>
-        <string>/Users/YOU/telegram-agent-bridge/telegram_agent_bridge.py</string>
+        <string>/Users/YOU/.local/bin/telegram-agent-bridge-run</string>
     </array>
-
-    <key>WorkingDirectory</key>
-    <string>/Users/YOU</string>
 
     <key>EnvironmentVariables</key>
     <dict>
         <key>PATH</key>
         <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/Users/YOU/.local/bin:/Users/YOU/.npm-global/bin</string>
-        <key>TAB_BOT_TOKEN</key>
-        <string>REPLACE_WITH_BOTFATHER_TOKEN</string>
-        <key>TAB_CHAT_ID</key>
-        <string>REPLACE_WITH_YOUR_NUMERIC_CHAT_ID</string>
-        <key>TAB_AGENT</key>
-        <string>codex</string>
-        <key>TAB_AGENT_CMD</key>
-        <string>codex</string>
-        <key>TAB_STATE_DIR</key>
-        <string>/Users/YOU/.local/state/telegram-agent-bridge</string>
-        <key>TAB_WORKDIR</key>
-        <string>/Users/YOU</string>
-        <key>TAB_PREFIX</key>
-        <string>BOT</string>
-        <key>TAB_LOCAL_INPUT</key>
-        <string>/Users/YOU/.local/state/telegram-agent-bridge/input.fifo</string>
-        <key>TAB_STDIN_INPUT</key>
-        <string>0</string>
     </dict>
 
     <key>RunAtLoad</key>
