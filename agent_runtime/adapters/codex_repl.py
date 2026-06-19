@@ -70,6 +70,9 @@ class CodexReplAdapter:
     def capture_pane(self, lines: int = 80) -> str:
         return self.repl.capture_pane(lines)
 
+    def clear_composer(self) -> None:
+        self.repl.clear_composer()
+
     def session_file(self) -> Path:
         return self.repl.session_file()
 

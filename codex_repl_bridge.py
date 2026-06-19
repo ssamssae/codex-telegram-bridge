@@ -54,6 +54,7 @@ CHOICE_CALLBACK_PREFIX = "crb_choice"
 STATUS_COMMANDS = {"status", "/status"}
 CONTEXT_COMMANDS = {"context", "/context"}
 ANSI_RE = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]")
+UNRECOGNIZED_COMMAND_RE = re.compile(r"Unrecognized command ['\"](?P<command>/[^'\"]+)['\"]")
 MARKDOWN_LOCAL_PATH_RE = re.compile(r"!?\[[^\]]*]\((?P<path>[^)\n]+)\)")
 MEDIA_ATTACHMENT_SUFFIX_RE = "|".join(
     re.escape(ext) for ext in sorted(MEDIA_ATTACHMENT_EXTENSIONS, key=len, reverse=True)
@@ -122,11 +123,15 @@ def safe_filename_part(value: str) -> str:
 
 
 def is_codex_slash_command(text: str) -> bool:
+    command = slash_command_token(text)
+    return bool(command and command not in {"/start", "/ping"})
+
+
+def slash_command_token(text: str) -> str:
     stripped = (text or "").strip()
     if "\n" in stripped or not stripped.startswith("/"):
-        return False
-    command = stripped.split(maxsplit=1)[0].lower()
-    return command not in {"/start", "/ping"}
+        return ""
+    return stripped.split(maxsplit=1)[0].lower()
 
 
 def is_status_command(text: str) -> bool:
@@ -191,6 +196,18 @@ def extract_codex_context_text(screen: str) -> str:
         if line.startswith("Context window:"):
             return f"Codex context\n{line}"
     return status_text
+
+
+def extract_unrecognized_slash_error(screen: str, command: str) -> str:
+    normalized = command.strip().lower()
+    if not normalized:
+        return ""
+    for line in reversed((screen or "").splitlines()):
+        cleaned = line.strip()
+        match = UNRECOGNIZED_COMMAND_RE.search(cleaned)
+        if match and match.group("command").lower() == normalized:
+            return cleaned
+    return ""
 
 
 def suffix_from_metadata(file_name: str = "", mime_type: str = "", default: str = ".bin") -> str:
@@ -666,6 +683,11 @@ class CodexRepl:
         for _ in range(count):
             self.tmux("send-keys", "-t", self.config.pane_target, key)
             time.sleep(0.3)
+
+    def clear_composer(self) -> None:
+        self.verify()
+        self.tmux("send-keys", "-t", self.config.pane_target, "C-u")
+        time.sleep(0.1)
 
     def capture_pane(self, lines: int = 80) -> str:
         out = self.tmux(
@@ -1325,6 +1347,7 @@ class Bridge:
         self.stop_event = threading.Event()
         self.current_origin: str | None = None
         self.suppress_until_user = False
+        self.needs_composer_clear = False
         self.session_path: Path | None = None
         self.session_pos = 0
 
@@ -1484,6 +1507,31 @@ class Bridge:
         finally:
             self.stop_repl_typing()
         return True
+
+    def clear_stale_composer_if_needed(self) -> None:
+        if not self.needs_composer_clear:
+            return
+        try:
+            self.head.clear_composer()
+            log("REPL", "cleared stale slash command composer")
+        except Exception as exc:  # noqa: BLE001
+            log("REPL", f"composer clear failed: {exc}")
+        finally:
+            self.needs_composer_clear = False
+
+    def handle_slash_command_result(self, text: str) -> None:
+        command = slash_command_token(text)
+        if not command:
+            return
+        screen = self.head.capture_pane(120)
+        error = extract_unrecognized_slash_error(screen, command)
+        if error:
+            self.needs_composer_clear = True
+            log("REPL", f"slash command error: {error}")
+            self.telegram.send(
+                f"Codex slash command error\n{error}\n\n"
+                "다음 Telegram 프롬프트를 넣기 전에 터미널 입력줄을 비웁니다."
+            )
 
     def approval_loop(self) -> None:
         while not self.stop_event.is_set():
@@ -2475,9 +2523,16 @@ class Bridge:
                     continue
                 log("TG", "prompt -> Codex REPL")
                 self.begin_repl_typing()
-                self.add_pending_telegram(prompt.text)
+                slash_command = is_codex_slash_command(prompt.text)
+                if not slash_command:
+                    self.add_pending_telegram(prompt.text)
                 try:
+                    self.clear_stale_composer_if_needed()
                     self.head.send(AgentMessage(prompt.text))
+                    if slash_command:
+                        time.sleep(0.8)
+                        self.handle_slash_command_result(prompt.text)
+                        self.stop_repl_typing()
                 except Exception as exc:  # noqa: BLE001
                     self.stop_repl_typing()
                     log("REPL", f"paste failed: {exc}")

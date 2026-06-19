@@ -103,12 +103,24 @@ class FakeRepl:
     def __init__(self):
         self.approval_keys = []
         self.choice_options = []
+        self.prompts = []
+        self.screen = ""
+        self.cleared = 0
 
     def send_approval_key(self, key):
         self.approval_keys.append(key)
 
     def send_choice_option(self, prompt, option):
         self.choice_options.append((prompt, option))
+
+    def paste_prompt(self, prompt):
+        self.prompts.append(prompt)
+
+    def capture_pane(self, lines=80):
+        return self.screen
+
+    def clear_composer(self):
+        self.cleared += 1
 
 
 class RecordingCodexRepl(repl.CodexRepl):
@@ -169,6 +181,19 @@ class ReplBridgeTests(unittest.TestCase):
 
             self.assertEqual(codex.sent_keys(), ["Enter"])
 
+    def test_clear_composer_sends_ctrl_u(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            codex = RecordingCodexRepl(config(tmpdir))
+
+            codex.clear_composer()
+
+            self.assertEqual(codex.sent_keys(), ["C-u"])
+
+    def test_slash_command_token_ignores_multiline_prompts(self):
+        self.assertEqual(repl.slash_command_token("/model"), "/model")
+        self.assertEqual(repl.slash_command_token("/model fast"), "/model")
+        self.assertEqual(repl.slash_command_token("/model\nexplain"), "")
+
     def test_status_command_aliases(self):
         self.assertTrue(repl.is_status_command("status"))
         self.assertTrue(repl.is_status_command("/status"))
@@ -209,6 +234,40 @@ class ReplBridgeTests(unittest.TestCase):
         self.assertIn("Context window:  45% left", status)
         self.assertIn("Weekly limit:  [████████████████░░░░] 81% left", status)
         self.assertNotIn("Visit https://chatgpt.com", status)
+
+    def test_extract_unrecognized_slash_error(self):
+        screen = """
+• Unrecognized command '/bad'. Type "/" for a list of supported commands.
+"""
+        self.assertEqual(
+            repl.extract_unrecognized_slash_error(screen, "/bad"),
+            "• Unrecognized command '/bad'. Type \"/\" for a list of supported commands.",
+        )
+
+    def test_unrecognized_slash_command_notifies_and_marks_composer_clear(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            fake_repl = FakeRepl()
+            fake_repl.screen = "• Unrecognized command '/bad'. Type \"/\" for a list of supported commands."
+            telegram = FakeTelegram()
+            bridge = repl.Bridge(config(tmpdir), telegram, fake_repl)
+
+            bridge.handle_slash_command_result("/bad")
+
+            self.assertTrue(bridge.needs_composer_clear)
+            self.assertIn("Codex slash command error", telegram.sent[0])
+            self.assertIn("Unrecognized command '/bad'", telegram.sent[0])
+
+    def test_stale_slash_composer_is_cleared_once(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            fake_repl = FakeRepl()
+            bridge = repl.Bridge(config(tmpdir), FakeTelegram(), fake_repl)
+            bridge.needs_composer_clear = True
+
+            bridge.clear_stale_composer_if_needed()
+            bridge.clear_stale_composer_if_needed()
+
+            self.assertEqual(fake_repl.cleared, 1)
+            self.assertFalse(bridge.needs_composer_clear)
 
     def test_extract_codex_context_text_from_tui_box(self):
         screen = """
