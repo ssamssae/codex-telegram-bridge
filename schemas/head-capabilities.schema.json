@@ -1,0 +1,45 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/ssamssae/codex-telegram-bridge/schemas/head-capabilities.schema.json",
+  "title": "HeadCapabilities",
+  "type": "object",
+  "required": ["head", "vision", "audio", "video", "repl", "approval", "workdir_access"],
+  "additionalProperties": false,
+  "properties": {
+    "head": {
+      "type": "string",
+      "minLength": 1
+    },
+    "vision": {
+      "type": "boolean"
+    },
+    "audio": {
+      "type": "boolean"
+    },
+    "video": {
+      "type": "boolean"
+    },
+    "repl": {
+      "type": "boolean"
+    },
+    "approval": {
+      "type": "boolean"
+    },
+    "streaming": {
+      "type": "boolean"
+    },
+    "workdir_access": {
+      "type": "array",
+      "items": {
+        "type": "string",
+        "minLength": 1
+      }
+    },
+    "notes": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    }
+  }
+}

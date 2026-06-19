@@ -20,6 +20,7 @@ def config(tmpdir, **overrides):
         "prefix": "BOT",
         "prefix_line": False,
         "workdir": Path(tmpdir),
+        "workdir_lock": True,
         "timeout": 600,
         "telegram_chunk": 12,
         "codex_dangerous_bypass": False,
@@ -264,6 +265,18 @@ class BridgeTests(unittest.TestCase):
                     bridge.run_agent_turn("hello")
             finally:
                 subprocess.run = original_run
+
+    def test_run_agent_turn_respects_workdir_lock(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            cfg = config(tmpdir, agent="generic", agent_cmd=["echo", "ok"])
+            bridge = tab.Bridge(cfg, tab.GenericBackend(cfg), FakeTelegram())
+            held = tab.WorkdirLock(cfg.workdir, cfg.state_dir, "other-head")
+            held.acquire()
+            try:
+                with self.assertRaisesRegex(tab.AgentExecError, "workdir already locked"):
+                    bridge.run_agent_turn("hello")
+            finally:
+                held.release()
 
 
 if __name__ == "__main__":

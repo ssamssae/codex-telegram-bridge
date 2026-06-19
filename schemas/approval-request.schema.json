@@ -1,0 +1,58 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/ssamssae/codex-telegram-bridge/schemas/approval-request.schema.json",
+  "title": "ApprovalRequest",
+  "type": "object",
+  "required": [
+    "approval_id",
+    "expires_at",
+    "cancelled",
+    "source_head",
+    "command",
+    "reason",
+    "options"
+  ],
+  "additionalProperties": false,
+  "properties": {
+    "approval_id": {
+      "type": "string",
+      "minLength": 16
+    },
+    "expires_at": {
+      "type": "number"
+    },
+    "cancelled": {
+      "type": "boolean"
+    },
+    "source_head": {
+      "type": "string",
+      "minLength": 1
+    },
+    "command": {
+      "type": "string"
+    },
+    "reason": {
+      "type": "string"
+    },
+    "options": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "object",
+        "required": ["number", "label", "key"],
+        "additionalProperties": false,
+        "properties": {
+          "number": {
+            "type": "string"
+          },
+          "label": {
+            "type": "string"
+          },
+          "key": {
+            "type": "string"
+          }
+        }
+      }
+    }
+  }
+}

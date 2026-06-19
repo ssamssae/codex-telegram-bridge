@@ -27,6 +27,8 @@ def config(tmpdir, **overrides):
         "audio_transcribe_cmd": None,
         "video_frame_count": 3,
         "typing_max_seconds": 30,
+        "approval_ttl_seconds": 300,
+        "workdir": Path(tmpdir),
         "attachment_roots": (Path(tmpdir),),
         "max_attachment_bytes": 50 * 1024 * 1024,
         "telegram_chunk": 4096,
@@ -220,8 +222,9 @@ Press enter to confirm or esc to cancel
         with tempfile.TemporaryDirectory() as tmpdir:
             fake_repl = FakeRepl()
             bridge = repl.Bridge(config(tmpdir), FakeTelegram(), fake_repl)
-            bridge.pending_approval = repl.ApprovalPrompt(
-                signature="abcdef1234567890",
+            bridge.pending_approval = repl.ApprovalRequest.create(
+                approval_id="abcdef1234567890",
+                source_head="codex_repl",
                 command="$ git status",
                 reason="test",
                 options=(
@@ -229,6 +232,7 @@ Press enter to confirm or esc to cancel
                     repl.ApprovalOption("2", "Yes always", "p"),
                     repl.ApprovalOption("3", "No", "esc"),
                 ),
+                ttl_seconds=300,
             )
 
             self.assertTrue(bridge.handle_approval_text("2"))
@@ -239,8 +243,9 @@ Press enter to confirm or esc to cancel
             fake_repl = FakeRepl()
             telegram = FakeTelegram()
             bridge = repl.Bridge(config(tmpdir), telegram, fake_repl)
-            bridge.pending_approval = repl.ApprovalPrompt(
-                signature="abcdef1234567890fedcba",
+            bridge.pending_approval = repl.ApprovalRequest.create(
+                approval_id="abcdef1234567890fedcba",
+                source_head="codex_repl",
                 command="$ git status",
                 reason="test",
                 options=(
@@ -248,6 +253,7 @@ Press enter to confirm or esc to cancel
                     repl.ApprovalOption("2", "Yes always", "p"),
                     repl.ApprovalOption("3", "No", "esc"),
                 ),
+                ttl_seconds=300,
             )
             callback = {
                 "id": "cb1",
@@ -258,6 +264,33 @@ Press enter to confirm or esc to cancel
             self.assertTrue(bridge.handle_callback_query(callback))
             self.assertEqual(fake_repl.approval_keys, ["esc"])
             self.assertEqual(telegram.calls[0][0], "answerCallbackQuery")
+
+    def test_expired_approval_callback_does_not_send_key(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            fake_repl = FakeRepl()
+            telegram = FakeTelegram()
+            bridge = repl.Bridge(config(tmpdir), telegram, fake_repl)
+            bridge.pending_approval = repl.ApprovalRequest(
+                approval_id="abcdef1234567890fedcba",
+                source_head="codex_repl",
+                command="$ git status",
+                reason="test",
+                options=(
+                    repl.ApprovalOption("1", "Yes", "y"),
+                    repl.ApprovalOption("2", "Yes always", "p"),
+                    repl.ApprovalOption("3", "No", "esc"),
+                ),
+                expires_at=0,
+            )
+            callback = {
+                "id": "cb1",
+                "data": "crb_approval:abcdef1234567890:1",
+                "message": {"chat": {"id": "1234"}},
+            }
+
+            self.assertTrue(bridge.handle_callback_query(callback))
+            self.assertEqual(fake_repl.approval_keys, [])
+            self.assertEqual(telegram.calls[0][1]["text"], "That approval prompt expired.")
 
     def test_extracts_and_sends_local_markdown_image_path(self):
         with tempfile.TemporaryDirectory() as tmpdir:

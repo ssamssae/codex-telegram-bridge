@@ -11,7 +11,7 @@ mirrored back to Telegram.
 Install with `pipx`, then run the setup wizard:
 
 ```bash
-pipx install "git+https://github.com/ssamssae/codex-telegram-bridge.git@v0.2.6"
+pipx install "git+https://github.com/ssamssae/codex-telegram-bridge.git@v0.3.0"
 codex-telegram-bridge setup
 codex-telegram-bridge doctor
 ```
@@ -32,11 +32,16 @@ or normal prompts to your bot.
 Release: <https://github.com/ssamssae/codex-telegram-bridge/releases/latest>
 
 Promo video:
-<https://github.com/ssamssae/codex-telegram-bridge/releases/download/v0.2.6/codex-telegram-bridge-promo-v0.2.6.mp4>
+<https://github.com/ssamssae/codex-telegram-bridge/releases/download/v0.3.0/codex-telegram-bridge-promo-v0.3.0.mp4>
 
 The repo also includes a simpler one-shot `codex exec` mode. Generic one-shot
 command backends can adapt Claude Code, Aider, Gemini CLI, or your own terminal
 agent.
+
+Multi-head runtime design is tracked in [docs/agent-runtime.md](docs/agent-runtime.md).
+The first runtime slice includes a head adapter contract, approval TTL model,
+capability registry, transport abstraction, workdir lock, and a Codex REPL
+adapter.
 
 This is not MCP. It is a small standalone relay daemon. Default `repl` mode:
 
@@ -252,6 +257,7 @@ Required settings are intentionally small and explicit.
 | `TAB_PREFIX` | no | empty | Prefix shown on the first Telegram reply chunk, for example an emoji or node label. |
 | `TAB_PREFIX_LINE` | no | `0` | When `1`, puts `TAB_PREFIX` on its own first line. |
 | `TAB_WORKDIR` | no | `~` | Working directory for the agent process. Codex also receives `-C TAB_WORKDIR`. |
+| `TAB_WORKDIR_LOCK` | no | `1` | Acquire a local workdir lock around one-shot agent turns. |
 | `TAB_TIMEOUT` | no | `600` | Per-turn timeout in seconds. |
 | `TAB_TG_CHUNK` | no | `4096` | Telegram message chunk size. |
 | `TAB_TYPING_INTERVAL` | no | `4` | Seconds between repeated Telegram `typing` actions while the agent is running. |
@@ -263,7 +269,8 @@ Required settings are intentionally small and explicit.
 | `CRB_TMUX_SESSION` | repl only | `codex` | tmux session or target for the visible Codex TUI. |
 | `CRB_TMUX_SUBMIT_KEY` | repl only | `Tab` | key sent after pasting Telegram prompts into Codex. |
 | `CRB_AUDIO_TRANSCRIBE_CMD` | no | empty | Optional command template for audio transcription. Use `{path}` for the media file. |
-| `CRB_ATTACHMENT_ROOTS` | no | state dir, workdir, `/tmp` | `:`-separated roots where answer-referenced local image files may be uploaded from. |
+| `CRB_APPROVAL_TTL_SECONDS` | no | `300` | Seconds before a Telegram approval button is treated as stale. |
+| `CRB_ATTACHMENT_ROOTS` | no | state dir, workdir, `/tmp` | `:`-separated roots where answer-referenced local media files may be uploaded from. |
 | `CRB_MAX_ATTACHMENT_BYTES` | no | `52428800` | Maximum size for local answer attachments. |
 
 ## REPL Mode Media Support

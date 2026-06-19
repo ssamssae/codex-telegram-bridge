@@ -23,6 +23,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from agent_runtime import WorkdirLock, WorkdirLockError
+
 
 HOME = Path.home()
 
@@ -93,6 +95,7 @@ class Config:
     prefix: str
     prefix_line: bool
     workdir: Path
+    workdir_lock: bool
     timeout: int
     telegram_chunk: int
     codex_dangerous_bypass: bool
@@ -140,6 +143,7 @@ class Config:
             prefix=env("TAB_PREFIX", "") or "",
             prefix_line=bool_env("TAB_PREFIX_LINE", False),
             workdir=expand_path(env("TAB_WORKDIR", "~") or "~"),
+            workdir_lock=bool_env("TAB_WORKDIR_LOCK", True),
             timeout=int_env("TAB_TIMEOUT", 600),
             telegram_chunk=int_env("TAB_TG_CHUNK", 4096),
             codex_dangerous_bypass=bool_env("TAB_CODEX_DANGEROUS_BYPASS", False),
@@ -415,15 +419,32 @@ class Bridge:
             cmd = self.backend.build_exec_cmd(prompt)
 
         try:
-            try:
-                proc = subprocess.run(
-                    cmd,
-                    capture_output=True,
-                    text=True,
-                    timeout=self.config.timeout,
-                    stdin=subprocess.DEVNULL,
-                    cwd=str(self.config.workdir),
+            lock = (
+                WorkdirLock(
+                    self.config.workdir,
+                    self.config.state_dir,
+                    owner=f"{self.backend.name}:exec",
                 )
+                if self.config.workdir_lock
+                else None
+            )
+            try:
+                if lock:
+                    lock.acquire()
+                try:
+                    proc = subprocess.run(
+                        cmd,
+                        capture_output=True,
+                        text=True,
+                        timeout=self.config.timeout,
+                        stdin=subprocess.DEVNULL,
+                        cwd=str(self.config.workdir),
+                    )
+                finally:
+                    if lock:
+                        lock.release()
+            except WorkdirLockError as exc:
+                raise AgentExecError(str(exc)) from exc
             except subprocess.TimeoutExpired as exc:
                 raise AgentExecError(f"agent timed out after {self.config.timeout}s") from exc
             except OSError as exc:
