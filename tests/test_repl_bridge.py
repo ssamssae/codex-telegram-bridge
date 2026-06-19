@@ -111,6 +111,21 @@ class FakeRepl:
         self.choice_options.append((prompt, option))
 
 
+class RecordingCodexRepl(repl.CodexRepl):
+    def __init__(self, cfg):
+        super().__init__(cfg)
+        self.calls = []
+
+    def verify(self):
+        self.calls.append((("verify",), None))
+
+    def tmux(self, *args, input_text=None):
+        self.calls.append((args, input_text))
+
+    def sent_keys(self):
+        return [args[-1] for args, _input_text in self.calls if args and args[0] == "send-keys"]
+
+
 class ReplBridgeTests(unittest.TestCase):
     def test_load_token_prefers_environment_token(self):
         old_env = os.environ.copy()
@@ -145,6 +160,22 @@ class ReplBridgeTests(unittest.TestCase):
             self.assertEqual(cfg.emoji, "BOT")
             self.assertEqual(cfg.state_dir, Path(tmpdir))
             self.assertIsNone(cfg.token_file)
+
+    def test_slash_command_uses_enter_submit_key(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            codex = RecordingCodexRepl(config(tmpdir, submit_key="Tab", enter_count=5))
+
+            codex.paste_prompt("/model")
+
+            self.assertEqual(codex.sent_keys(), ["Enter"])
+
+    def test_regular_prompt_keeps_configured_submit_key(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            codex = RecordingCodexRepl(config(tmpdir, submit_key="Tab", enter_count=5))
+
+            codex.paste_prompt("hello")
+
+            self.assertEqual(codex.sent_keys(), ["Tab"])
 
     def test_photo_prompt_includes_local_path_and_caption(self):
         with tempfile.TemporaryDirectory() as tmpdir:

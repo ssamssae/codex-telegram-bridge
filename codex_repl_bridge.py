@@ -119,6 +119,14 @@ def safe_filename_part(value: str) -> str:
     return cleaned.strip("-")[:80] or "file"
 
 
+def is_codex_slash_command(text: str) -> bool:
+    stripped = (text or "").strip()
+    if "\n" in stripped or not stripped.startswith("/"):
+        return False
+    command = stripped.split(maxsplit=1)[0].lower()
+    return command not in {"/start", "/ping"}
+
+
 def suffix_from_metadata(file_name: str = "", mime_type: str = "", default: str = ".bin") -> str:
     suffix = Path(file_name or "").suffix.lower()
     if suffix:
@@ -586,8 +594,9 @@ class CodexRepl:
         self.tmux("paste-buffer", "-p", "-t", self.config.pane_target)
         # Codex TUI uses Tab as the submit/queue key while a turn is running.
         # Repeated Enter can leave Telegram-origin text sitting in the composer.
-        key = self.config.submit_key
-        count = self.config.enter_count if key == "Enter" else 1
+        slash_command = is_codex_slash_command(payload)
+        key = "Enter" if slash_command else self.config.submit_key
+        count = 1 if slash_command else self.config.enter_count if key == "Enter" else 1
         for _ in range(count):
             self.tmux("send-keys", "-t", self.config.pane_target, key)
             time.sleep(0.3)
