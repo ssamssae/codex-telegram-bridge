@@ -73,6 +73,17 @@ class FakeTelegram:
         return True
 
 
+class CaptureTelegram(repl.TelegramClient):
+    def __init__(self, upload_ok=True):
+        super().__init__("token", "1234", "BOT", 4096)
+        self.upload_ok = upload_ok
+        self.multipart = []
+
+    def call_multipart(self, method, fields, file_field, file_path):
+        self.multipart.append((method, file_field, file_path.name))
+        return {"ok": self.upload_ok}
+
+
 class FakeRepl:
     def __init__(self):
         self.approval_keys = []
@@ -289,7 +300,78 @@ Press enter to confirm or esc to cancel
             bridge.send_answer(f"![screenshot]({image})")
 
             self.assertEqual(len(telegram.attachments), 1)
-            self.assertEqual(telegram.sent, ["이미지를 첨부했어요."])
+            self.assertEqual(telegram.sent, ["파일을 첨부했어요."])
+
+    def test_hides_and_sends_local_video_path(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            base = Path(tmpdir)
+            video = base / "demo.mp4"
+            video.write_bytes(b"fake-video")
+            telegram = FakeTelegram()
+            bridge = repl.Bridge(config(tmpdir), telegram, None)
+
+            bridge.send_answer(f"영상입니다: {video}")
+
+            self.assertEqual(len(telegram.attachments), 1)
+            self.assertEqual(telegram.attachments[0][0], video)
+            self.assertEqual(telegram.sent, ["영상입니다:"])
+            self.assertNotIn(str(video), telegram.sent[0])
+
+    def test_hides_and_sends_local_audio_markdown_path(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            base = Path(tmpdir)
+            audio = base / "voice.oga"
+            audio.write_bytes(b"fake-audio")
+            telegram = FakeTelegram()
+            bridge = repl.Bridge(config(tmpdir), telegram, None)
+
+            bridge.send_answer(f"음성입니다: [voice.oga]({audio})")
+
+            self.assertEqual(len(telegram.attachments), 1)
+            self.assertEqual(telegram.attachments[0][0], audio)
+            self.assertEqual(telegram.sent, ["음성입니다:"])
+            self.assertNotIn(str(audio), telegram.sent[0])
+
+    def test_send_local_attachment_uses_media_specific_methods(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            base = Path(tmpdir)
+            video = base / "demo.mp4"
+            voice = base / "voice.oga"
+            audio = base / "track.mp3"
+            image = base / "screenshot.png"
+            for path in (video, voice, audio, image):
+                path.write_bytes(b"fake-media")
+            telegram = CaptureTelegram()
+
+            self.assertTrue(telegram.send_local_attachment(video, 50 * 1024 * 1024))
+            self.assertTrue(telegram.send_local_attachment(voice, 50 * 1024 * 1024))
+            self.assertTrue(telegram.send_local_attachment(audio, 50 * 1024 * 1024))
+            self.assertTrue(telegram.send_local_attachment(image, 50 * 1024 * 1024))
+
+            self.assertEqual(
+                telegram.multipart,
+                [
+                    ("sendVideo", "video", "demo.mp4"),
+                    ("sendVoice", "voice", "voice.oga"),
+                    ("sendAudio", "audio", "track.mp3"),
+                    ("sendPhoto", "photo", "screenshot.png"),
+                ],
+            )
+
+    def test_video_upload_falls_back_to_document(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            video = Path(tmpdir) / "demo.mov"
+            video.write_bytes(b"fake-video")
+            telegram = CaptureTelegram(upload_ok=False)
+
+            self.assertFalse(telegram.send_local_attachment(video, 50 * 1024 * 1024))
+            self.assertEqual(
+                telegram.multipart,
+                [
+                    ("sendVideo", "video", "demo.mov"),
+                    ("sendDocument", "document", "demo.mov"),
+                ],
+            )
 
     def test_local_image_attachment_respects_allowed_roots(self):
         with tempfile.TemporaryDirectory() as allowed, tempfile.TemporaryDirectory() as outside:

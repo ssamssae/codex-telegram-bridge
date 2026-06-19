@@ -42,11 +42,16 @@ IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".webp", ".gif"}
 IMAGE_ATTACHMENT_EXTENSIONS = IMAGE_EXTENSIONS | {".bmp", ".tif", ".tiff"}
 AUDIO_EXTENSIONS = {".ogg", ".oga", ".opus", ".mp3", ".m4a", ".aac", ".wav", ".flac", ".weba"}
 VIDEO_EXTENSIONS = {".mp4", ".mov", ".m4v", ".webm", ".avi", ".mkv"}
+MEDIA_ATTACHMENT_EXTENSIONS = IMAGE_ATTACHMENT_EXTENSIONS | AUDIO_EXTENSIONS | VIDEO_EXTENSIONS
+VOICE_ATTACHMENT_EXTENSIONS = {".ogg", ".oga", ".opus"}
 APPROVAL_CALLBACK_PREFIX = "crb_approval"
 ANSI_RE = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]")
 MARKDOWN_LOCAL_PATH_RE = re.compile(r"!?\[[^\]]*]\((?P<path>[^)\n]+)\)")
-RAW_LOCAL_IMAGE_PATH_RE = re.compile(
-    r"(?P<path>(?:file://)?/(?:[^\s\])<>\"']+?)(?:\.png|\.jpe?g|\.webp|\.gif|\.bmp|\.tiff?))",
+MEDIA_ATTACHMENT_SUFFIX_RE = "|".join(
+    re.escape(ext) for ext in sorted(MEDIA_ATTACHMENT_EXTENSIONS, key=len, reverse=True)
+)
+RAW_LOCAL_ATTACHMENT_PATH_RE = re.compile(
+    rf"(?P<path>(?:file://)?/(?:[^\s\])<>\"']+?)(?:{MEDIA_ATTACHMENT_SUFFIX_RE}))",
     re.IGNORECASE,
 )
 
@@ -395,6 +400,33 @@ class TelegramClient:
         suffix = path.suffix.lower()
         if suffix in {".jpg", ".jpeg", ".png", ".webp"} and size <= 10 * 1024 * 1024:
             payload = self.call_multipart("sendPhoto", {"chat_id": self.chat_id}, "photo", path)
+        elif suffix in VIDEO_EXTENSIONS:
+            payload = self.call_multipart("sendVideo", {"chat_id": self.chat_id}, "video", path)
+            if not payload or not payload.get("ok"):
+                payload = self.call_multipart(
+                    "sendDocument",
+                    {"chat_id": self.chat_id},
+                    "document",
+                    path,
+                )
+        elif suffix in VOICE_ATTACHMENT_EXTENSIONS:
+            payload = self.call_multipart("sendVoice", {"chat_id": self.chat_id}, "voice", path)
+            if not payload or not payload.get("ok"):
+                payload = self.call_multipart(
+                    "sendDocument",
+                    {"chat_id": self.chat_id},
+                    "document",
+                    path,
+                )
+        elif suffix in AUDIO_EXTENSIONS:
+            payload = self.call_multipart("sendAudio", {"chat_id": self.chat_id}, "audio", path)
+            if not payload or not payload.get("ok"):
+                payload = self.call_multipart(
+                    "sendDocument",
+                    {"chat_id": self.chat_id},
+                    "document",
+                    path,
+                )
         else:
             payload = self.call_multipart("sendDocument", {"chat_id": self.chat_id}, "document", path)
         return bool(payload and payload.get("ok"))
@@ -598,7 +630,7 @@ def normalize_local_path_candidate(raw: str) -> Path | None:
     return path if path.is_absolute() else None
 
 
-def extract_local_image_paths(
+def extract_local_attachment_paths(
     text: str,
     roots: tuple[Path, ...],
     max_bytes: int,
@@ -606,7 +638,7 @@ def extract_local_image_paths(
     candidates: list[str] = []
     for match in MARKDOWN_LOCAL_PATH_RE.finditer(text or ""):
         candidates.append(match.group("path"))
-    for match in RAW_LOCAL_IMAGE_PATH_RE.finditer(text or ""):
+    for match in RAW_LOCAL_ATTACHMENT_PATH_RE.finditer(text or ""):
         candidates.append(match.group("path"))
 
     out: list[Path] = []
@@ -614,7 +646,7 @@ def extract_local_image_paths(
     resolved_roots = tuple(root.expanduser().resolve() for root in roots)
     for raw in candidates:
         path = normalize_local_path_candidate(raw)
-        if path is None or path.suffix.lower() not in IMAGE_ATTACHMENT_EXTENSIONS:
+        if path is None or path.suffix.lower() not in MEDIA_ATTACHMENT_EXTENSIONS:
             continue
         try:
             resolved = path.resolve()
@@ -631,6 +663,18 @@ def extract_local_image_paths(
         seen.add(resolved)
         out.append(resolved)
     return out
+
+
+def extract_local_image_paths(
+    text: str,
+    roots: tuple[Path, ...],
+    max_bytes: int,
+) -> list[Path]:
+    return [
+        path
+        for path in extract_local_attachment_paths(text, roots, max_bytes)
+        if path.suffix.lower() in IMAGE_ATTACHMENT_EXTENSIONS
+    ]
 
 
 def strip_sent_attachment_references(text: str, attachments: list[Path]) -> str:
@@ -654,13 +698,13 @@ def strip_sent_attachment_references(text: str, attachments: list[Path]) -> str:
         return "" if is_sent_attachment(match.group("path")) else match.group(0)
 
     cleaned = MARKDOWN_LOCAL_PATH_RE.sub(replace_markdown, text or "")
-    cleaned = RAW_LOCAL_IMAGE_PATH_RE.sub(replace_raw_path, cleaned)
+    cleaned = RAW_LOCAL_ATTACHMENT_PATH_RE.sub(replace_raw_path, cleaned)
     lines = []
     for line in cleaned.splitlines():
         line = re.sub(r"[ \t]{2,}", " ", line).strip()
         if line:
             lines.append(line)
-    return "\n".join(lines).strip() or "이미지를 첨부했어요."
+    return "\n".join(lines).strip() or "파일을 첨부했어요."
 
 
 @dataclass(frozen=True)
@@ -883,7 +927,7 @@ class Bridge:
         self.suppress_until_user = True
 
     def send_answer(self, answer: str) -> None:
-        attachments = extract_local_image_paths(
+        attachments = extract_local_attachment_paths(
             answer,
             self.config.attachment_roots,
             self.config.max_attachment_bytes,
