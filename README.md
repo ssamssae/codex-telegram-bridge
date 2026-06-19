@@ -11,7 +11,7 @@ mirrored back to Telegram.
 Install with `pipx`, then run the setup wizard:
 
 ```bash
-pipx install "git+https://github.com/ssamssae/codex-telegram-bridge.git@v0.2.2"
+pipx install "git+https://github.com/ssamssae/codex-telegram-bridge.git@v0.2.3"
 codex-telegram-bridge setup
 codex-telegram-bridge doctor
 ```
@@ -32,7 +32,7 @@ or normal prompts to your bot.
 Release: <https://github.com/ssamssae/codex-telegram-bridge/releases/latest>
 
 Promo video:
-<https://github.com/ssamssae/codex-telegram-bridge/releases/download/v0.2.2/codex-telegram-bridge-promo-v0.2.2.mp4>
+<https://github.com/ssamssae/codex-telegram-bridge/releases/download/v0.2.3/codex-telegram-bridge-promo-v0.2.3.mp4>
 
 The repo also includes a simpler one-shot `codex exec` mode. Generic one-shot
 command backends can adapt Claude Code, Aider, Gemini CLI, or your own terminal
@@ -52,6 +52,11 @@ Codex CLI input
   -> JSONL user event
   -> Telegram "typing..." while Codex is working
   -> final answer mirrored to Telegram
+
+Codex approval prompt
+  -> detect "Would you like to run..." in the tmux pane
+  -> send Telegram buttons for 1/2/3
+  -> inject the selected key back into the Codex TUI
 ```
 
 ## Quickstart
@@ -112,7 +117,8 @@ The wizard will:
 
 Default setup mode is `repl`, which supports the visible Codex CLI transcript,
 Telegram text, image prompts, video thumbnails/metadata, audio-file delivery,
-optional audio transcription, answer mirroring, and Telegram `typing...`.
+optional audio transcription, answer mirroring, Telegram `typing...`, and Codex
+approval prompts.
 
 4. Check the installation:
 
@@ -261,6 +267,7 @@ Required settings are intentionally small and explicit.
 - Telegram voice/audio files
 - Telegram `typing...` while Codex is generating
 - terminal-origin Codex prompts mirrored back to Telegram
+- Codex command approval prompts mirrored to Telegram with 1/2/3 buttons
 
 Images are saved under `TAB_STATE_DIR` and passed to Codex as local paths in the
 prompt. Video messages include the local video path, Telegram thumbnail when
@@ -275,6 +282,28 @@ python3 bridge_setup.py setup --install-asr
 ```
 
 This is optional because it downloads Python packages and Whisper model files.
+
+## REPL Mode Approval Prompts
+
+When Codex is not running in a bypass/YOLO approval mode, it may pause inside the
+terminal with a prompt such as:
+
+```text
+Would you like to run the following command?
+1. Yes, proceed (y)
+2. Yes, and don't ask again... (p)
+3. No, and tell Codex what to do differently (esc)
+```
+
+In `repl` mode the bridge watches the tmux pane for that prompt and sends a
+Telegram message with buttons:
+
+- `1. Yes`
+- `2. Yes, don't ask again`
+- `3. No`
+
+You can also reply with `1`, `2`, `3`, `y`, `p`, `esc`, or `/approve 1`. The
+bridge injects the matching key back into the Codex TUI.
 
 ## Backends
 

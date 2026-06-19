@@ -15,9 +15,11 @@ input delivery uses tmux. Reply extraction uses the structured session log.
 from __future__ import annotations
 
 import glob
+import hashlib
 import json
 import mimetypes
 import os
+import re
 import signal
 import shlex
 import shutil
@@ -38,6 +40,8 @@ NODE_EMOJI_LINES = {"\U0001f34e", "\U0001f3ed", "\U0001fa9f", "\U0001f5a5", "\U0
 IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".webp", ".gif"}
 AUDIO_EXTENSIONS = {".ogg", ".oga", ".opus", ".mp3", ".m4a", ".aac", ".wav", ".flac", ".weba"}
 VIDEO_EXTENSIONS = {".mp4", ".mov", ".m4v", ".webm", ".avi", ".mkv"}
+APPROVAL_CALLBACK_PREFIX = "crb_approval"
+ANSI_RE = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]")
 
 
 def env(name: str, default: str | None = None) -> str | None:
@@ -302,6 +306,26 @@ class TelegramClient:
         for chunk in self.chunks(text):
             self.call("sendMessage", chat_id=self.chat_id, text=chunk)
 
+    def send_approval_prompt(self, prompt: "ApprovalPrompt") -> None:
+        buttons = [
+            [
+                {
+                    "text": f"{option.number}. {option.short_label}",
+                    "callback_data": (
+                        f"{APPROVAL_CALLBACK_PREFIX}:{prompt.short_signature}:{option.number}"
+                    ),
+                }
+            ]
+            for option in prompt.options
+        ]
+        reply_markup = json.dumps({"inline_keyboard": buttons}, ensure_ascii=False)
+        self.call(
+            "sendMessage",
+            chat_id=self.chat_id,
+            text=self.with_emoji_prefix(prompt.telegram_text()),
+            reply_markup=reply_markup,
+        )
+
 
 class CodexRepl:
     def __init__(self, config: Config) -> None:
@@ -348,6 +372,32 @@ class CodexRepl:
         for _ in range(count):
             self.tmux("send-keys", "-t", self.config.pane_target, key)
             time.sleep(0.3)
+
+    def capture_pane(self, lines: int = 80) -> str:
+        out = self.tmux(
+            "capture-pane",
+            "-p",
+            "-J",
+            "-S",
+            f"-{max(1, lines)}",
+            "-t",
+            self.config.pane_target,
+        )
+        return out.stdout
+
+    def send_approval_key(self, key: str) -> None:
+        normalized = key.strip().lower()
+        if normalized in {"esc", "escape"}:
+            self.tmux("send-keys", "-t", self.config.pane_target, "Escape")
+            return
+        if normalized in {"enter", "return"}:
+            self.tmux("send-keys", "-t", self.config.pane_target, "Enter")
+            return
+        if not normalized:
+            raise RuntimeError("empty approval key")
+        self.tmux("send-keys", "-t", self.config.pane_target, normalized)
+        time.sleep(0.1)
+        self.tmux("send-keys", "-t", self.config.pane_target, "Enter")
 
     def session_file(self) -> Path:
         pid = self.pane_pid()
@@ -433,6 +483,99 @@ def normalize_prompt(text: str) -> str:
     return (text or "").replace("\r\n", "\n").strip()
 
 
+@dataclass(frozen=True)
+class ApprovalOption:
+    number: str
+    label: str
+    key: str
+
+    @property
+    def short_label(self) -> str:
+        if self.number == "2":
+            return "Yes, don't ask again"
+        if self.number == "3":
+            return "No"
+        return "Yes"
+
+
+@dataclass(frozen=True)
+class ApprovalPrompt:
+    signature: str
+    command: str
+    reason: str
+    options: tuple[ApprovalOption, ...]
+
+    @property
+    def short_signature(self) -> str:
+        return self.signature[:16]
+
+    def telegram_text(self) -> str:
+        lines = ["Codex is waiting for command approval.", ""]
+        if self.command:
+            lines.extend(["Command:", truncate_text(self.command, 600), ""])
+        if self.reason:
+            lines.extend(["Reason:", truncate_text(self.reason, 600), ""])
+        lines.append("Choose a button, or reply with 1, 2, 3, y, p, or esc.")
+        return "\n".join(lines)
+
+
+def clean_pane_lines(screen: str) -> list[str]:
+    return [ANSI_RE.sub("", line).rstrip() for line in screen.splitlines()]
+
+
+def parse_approval_prompt(screen: str) -> ApprovalPrompt | None:
+    lines = clean_pane_lines(screen)
+    trigger_index = -1
+    for index, line in enumerate(lines):
+        if "Would you like to run the following command?" in line:
+            trigger_index = index
+            break
+    if trigger_index < 0:
+        return None
+
+    window = lines[trigger_index : trigger_index + 24]
+    reason = ""
+    command = ""
+    options: list[ApprovalOption] = []
+
+    for line in window:
+        stripped = line.strip()
+        if stripped.startswith("Reason:"):
+            reason = stripped.removeprefix("Reason:").strip()
+            continue
+        if stripped.startswith("$ "):
+            command = stripped
+            continue
+
+        option_line = stripped.lstrip("›>•* ")
+        match = re.match(r"(?P<number>[123])\.\s*(?P<label>.+?)\s*$", option_line)
+        if not match:
+            continue
+        number = match.group("number")
+        label = match.group("label").strip()
+        shortcut = ""
+        shortcut_match = re.search(r"\(([^()]+)\)\s*$", label)
+        if shortcut_match:
+            shortcut = shortcut_match.group(1).strip().lower()
+            label = label[: shortcut_match.start()].rstrip()
+        if not shortcut:
+            shortcut = {"1": "y", "2": "p", "3": "esc"}[number]
+        options.append(ApprovalOption(number=number, label=label, key=shortcut))
+
+    found_numbers = {option.number for option in options}
+    if not {"1", "2", "3"}.issubset(found_numbers):
+        return None
+
+    signature_source = "\n".join(window).strip()
+    signature = hashlib.sha256(signature_source.encode("utf-8", errors="replace")).hexdigest()
+    return ApprovalPrompt(
+        signature=signature,
+        command=command,
+        reason=reason,
+        options=tuple(options),
+    )
+
+
 def extract_event(record: dict[str, Any]) -> tuple[str, str] | None:
     kind = record.get("type")
     payload = record.get("payload") if isinstance(record.get("payload"), dict) else {}
@@ -497,8 +640,10 @@ class Bridge:
         self.lock = threading.Lock()
         self.exec_lock = threading.Lock()
         self.typing_lock = threading.Lock()
+        self.approval_lock = threading.Lock()
         self.repl_typing_stop: threading.Event | None = None
         self.pending_telegram: list[str] = []
+        self.pending_approval: ApprovalPrompt | None = None
         self.stop_event = threading.Event()
         self.current_origin: str | None = None
         self.suppress_until_user = False
@@ -629,6 +774,131 @@ class Bridge:
                 self.repl_typing_stop.set()
                 self.repl_typing_stop = None
                 log("TYPE", "stop")
+
+    def approval_loop(self) -> None:
+        while not self.stop_event.is_set():
+            try:
+                prompt = parse_approval_prompt(self.repl.capture_pane())
+                should_send = False
+                if prompt:
+                    with self.approval_lock:
+                        previous = self.pending_approval
+                        if previous is None or previous.signature != prompt.signature:
+                            self.pending_approval = prompt
+                            should_send = True
+                    if should_send:
+                        log("APPROV", f"approval prompt detected {prompt.short_signature}")
+                        self.telegram.send_approval_prompt(prompt)
+                else:
+                    with self.approval_lock:
+                        if self.pending_approval is not None:
+                            log("APPROV", "approval prompt cleared")
+                        self.pending_approval = None
+            except Exception as exc:  # noqa: BLE001
+                log("APPROV", f"watch error: {exc}")
+            self.stop_event.wait(1.0)
+
+    def approval_choice_from_text(self, text: str) -> str | None:
+        value = text.strip().lower()
+        if value.startswith("/approve"):
+            parts = value.split(maxsplit=1)
+            value = parts[1].strip() if len(parts) > 1 else ""
+        aliases = {
+            "1": "1",
+            "y": "1",
+            "yes": "1",
+            "2": "2",
+            "p": "2",
+            "permanent": "2",
+            "always": "2",
+            "3": "3",
+            "n": "3",
+            "no": "3",
+            "esc": "3",
+            "escape": "3",
+            "cancel": "3",
+        }
+        return aliases.get(value)
+
+    def handle_approval_choice(
+        self,
+        choice: str,
+        signature: str | None = None,
+        callback_query_id: str | None = None,
+    ) -> bool:
+        with self.approval_lock:
+            prompt = self.pending_approval
+        if not prompt:
+            if callback_query_id:
+                self.telegram.call(
+                    "answerCallbackQuery",
+                    callback_query_id=callback_query_id,
+                    text="No active Codex approval prompt.",
+                )
+            return False
+        if signature and signature != prompt.short_signature:
+            if callback_query_id:
+                self.telegram.call(
+                    "answerCallbackQuery",
+                    callback_query_id=callback_query_id,
+                    text="That approval prompt is no longer active.",
+                )
+            return True
+
+        option = next((item for item in prompt.options if item.number == choice), None)
+        if option is None:
+            return False
+        try:
+            self.repl.send_approval_key(option.key)
+        except Exception as exc:  # noqa: BLE001
+            log("APPROV", f"choice failed: {exc}")
+            self.telegram.send(f"Codex approval choice failed: {exc}")
+            if callback_query_id:
+                self.telegram.call(
+                    "answerCallbackQuery",
+                    callback_query_id=callback_query_id,
+                    text="Approval choice failed.",
+                )
+            return True
+
+        log("APPROV", f"choice {choice} -> {option.key}")
+        if callback_query_id:
+            self.telegram.call(
+                "answerCallbackQuery",
+                callback_query_id=callback_query_id,
+                text=f"Sent choice {choice} to Codex.",
+            )
+        else:
+            self.telegram.send(f"Sent Codex approval choice {choice}: {option.short_label}")
+        return True
+
+    def handle_callback_query(self, callback: dict[str, Any]) -> bool:
+        data = str(callback.get("data") or "")
+        if not data.startswith(f"{APPROVAL_CALLBACK_PREFIX}:"):
+            return False
+        message = callback.get("message") if isinstance(callback.get("message"), dict) else {}
+        chat = message.get("chat") if isinstance(message.get("chat"), dict) else {}
+        if str(chat.get("id")) != self.config.chat_id:
+            return True
+        parts = data.split(":")
+        if len(parts) != 3:
+            return True
+        _prefix, signature, choice = parts
+        return self.handle_approval_choice(
+            choice,
+            signature=signature,
+            callback_query_id=str(callback.get("id") or ""),
+        )
+
+    def handle_approval_text(self, text: str) -> bool:
+        with self.approval_lock:
+            has_pending = self.pending_approval is not None
+        if not has_pending:
+            return False
+        choice = self.approval_choice_from_text(text)
+        if not choice:
+            return False
+        return self.handle_approval_choice(choice)
 
     def run_codex_image(self, prompt: str, image_path: Path) -> str:
         self.config.state_dir.mkdir(parents=True, exist_ok=True)
@@ -1163,6 +1433,12 @@ class Bridge:
                     continue
                 offset = int(update["update_id"]) + 1
                 write_text_atomic(self.config.offset_file, offset)
+
+                callback = update.get("callback_query")
+                if isinstance(callback, dict):
+                    if self.handle_callback_query(callback):
+                        continue
+
                 message = update.get("message") or update.get("edited_message")
                 if not isinstance(message, dict):
                     continue
@@ -1176,6 +1452,8 @@ class Bridge:
                     self.telegram.send(f"codex REPL media delivery failed: {exc}")
                     continue
                 if not prompt.text.strip():
+                    continue
+                if self.handle_approval_text(prompt.text):
                     continue
                 if prompt.image_path and self.config.image_mode == "exec":
                     self.handle_image_prompt(prompt)
@@ -1199,6 +1477,8 @@ class Bridge:
         self.acquire_lock()
         jsonl_thread = threading.Thread(target=self.jsonl_loop, daemon=True)
         jsonl_thread.start()
+        approval_thread = threading.Thread(target=self.approval_loop, daemon=True)
+        approval_thread.start()
         try:
             self.telegram_loop()
         finally:

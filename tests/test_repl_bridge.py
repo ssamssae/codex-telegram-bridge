@@ -38,6 +38,8 @@ def config(tmpdir, **overrides):
 class FakeTelegram:
     def __init__(self):
         self.downloads = []
+        self.sent = []
+        self.calls = []
 
     def download_file(
         self,
@@ -52,6 +54,24 @@ class FakeTelegram:
         path.write_bytes(b"fake-media")
         self.downloads.append((file_id, path, allowed_extensions))
         return path
+
+    def send(self, text):
+        self.sent.append(text)
+
+    def send_approval_prompt(self, prompt):
+        self.sent.append(prompt.telegram_text())
+
+    def call(self, method, **params):
+        self.calls.append((method, params))
+        return {"ok": True, "result": True}
+
+
+class FakeRepl:
+    def __init__(self):
+        self.approval_keys = []
+
+    def send_approval_key(self, key):
+        self.approval_keys.append(key)
 
 
 class ReplBridgeTests(unittest.TestCase):
@@ -155,6 +175,71 @@ class ReplBridgeTests(unittest.TestCase):
             self.assertIn("[Telegram video received]", prompt.text)
             self.assertIn("thumbnail_path:", prompt.text)
             self.assertIn("metadata: duration=5; mime_type=video/mp4; width=1280; height=720", prompt.text)
+
+    def test_parse_codex_approval_prompt_from_tmux_screen(self):
+        screen = """
+Would you like to run the following command?
+
+Reason: Create an isolated git worktree for this branch.
+
+$ rtk git worktree add .worktrees/raylib-survival-sample -b raylib-survival.sample
+
+› 1. Yes, proceed (y)
+  2. Yes, and don't ask again for commands that start with `rtk git worktree` (p)
+  3. No, and tell Codex what to do differently (esc)
+
+Press enter to confirm or esc to cancel
+"""
+        prompt = repl.parse_approval_prompt(screen)
+        self.assertIsNotNone(prompt)
+        assert prompt is not None
+        self.assertIn("rtk git worktree add", prompt.command)
+        self.assertEqual([option.number for option in prompt.options], ["1", "2", "3"])
+        self.assertEqual([option.key for option in prompt.options], ["y", "p", "esc"])
+        self.assertIn("Choose a button", prompt.telegram_text())
+
+    def test_approval_text_choice_sends_tmux_key(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            fake_repl = FakeRepl()
+            bridge = repl.Bridge(config(tmpdir), FakeTelegram(), fake_repl)
+            bridge.pending_approval = repl.ApprovalPrompt(
+                signature="abcdef1234567890",
+                command="$ git status",
+                reason="test",
+                options=(
+                    repl.ApprovalOption("1", "Yes", "y"),
+                    repl.ApprovalOption("2", "Yes always", "p"),
+                    repl.ApprovalOption("3", "No", "esc"),
+                ),
+            )
+
+            self.assertTrue(bridge.handle_approval_text("2"))
+            self.assertEqual(fake_repl.approval_keys, ["p"])
+
+    def test_approval_callback_checks_signature_and_sends_key(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            fake_repl = FakeRepl()
+            telegram = FakeTelegram()
+            bridge = repl.Bridge(config(tmpdir), telegram, fake_repl)
+            bridge.pending_approval = repl.ApprovalPrompt(
+                signature="abcdef1234567890fedcba",
+                command="$ git status",
+                reason="test",
+                options=(
+                    repl.ApprovalOption("1", "Yes", "y"),
+                    repl.ApprovalOption("2", "Yes always", "p"),
+                    repl.ApprovalOption("3", "No", "esc"),
+                ),
+            )
+            callback = {
+                "id": "cb1",
+                "data": "crb_approval:abcdef1234567890:3",
+                "message": {"chat": {"id": "1234"}},
+            }
+
+            self.assertTrue(bridge.handle_callback_query(callback))
+            self.assertEqual(fake_repl.approval_keys, ["esc"])
+            self.assertEqual(telegram.calls[0][0], "answerCallbackQuery")
 
 
 if __name__ == "__main__":
