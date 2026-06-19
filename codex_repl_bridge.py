@@ -633,6 +633,36 @@ def extract_local_image_paths(
     return out
 
 
+def strip_sent_attachment_references(text: str, attachments: list[Path]) -> str:
+    if not attachments:
+        return (text or "").strip()
+    attachment_set = {path.resolve() for path in attachments}
+
+    def is_sent_attachment(raw: str) -> bool:
+        path = normalize_local_path_candidate(raw)
+        if path is None:
+            return False
+        try:
+            return path.resolve() in attachment_set
+        except OSError:
+            return False
+
+    def replace_markdown(match: re.Match[str]) -> str:
+        return "" if is_sent_attachment(match.group("path")) else match.group(0)
+
+    def replace_raw_path(match: re.Match[str]) -> str:
+        return "" if is_sent_attachment(match.group("path")) else match.group(0)
+
+    cleaned = MARKDOWN_LOCAL_PATH_RE.sub(replace_markdown, text or "")
+    cleaned = RAW_LOCAL_IMAGE_PATH_RE.sub(replace_raw_path, cleaned)
+    lines = []
+    for line in cleaned.splitlines():
+        line = re.sub(r"[ \t]{2,}", " ", line).strip()
+        if line:
+            lines.append(line)
+    return "\n".join(lines).strip() or "이미지를 첨부했어요."
+
+
 @dataclass(frozen=True)
 class ApprovalOption:
     number: str
@@ -853,12 +883,12 @@ class Bridge:
         self.suppress_until_user = True
 
     def send_answer(self, answer: str) -> None:
-        self.telegram.send(answer)
         attachments = extract_local_image_paths(
             answer,
             self.config.attachment_roots,
             self.config.max_attachment_bytes,
         )
+        self.telegram.send(strip_sent_attachment_references(answer, attachments))
         for path in attachments:
             log("ATTACH", f"send {path}")
             if not self.telegram.send_local_attachment(path, self.config.max_attachment_bytes):

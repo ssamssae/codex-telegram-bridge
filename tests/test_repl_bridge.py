@@ -260,6 +260,36 @@ Press enter to confirm or esc to cancel
 
             self.assertEqual(len(telegram.attachments), 1)
             self.assertEqual(telegram.attachments[0][0], image)
+            self.assertEqual(telegram.sent, ["Here:"])
+            self.assertNotIn(str(image), telegram.sent[0])
+
+    def test_hides_raw_local_image_path_after_sending_attachment(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            base = Path(tmpdir)
+            image = base / "screenshot.png"
+            image.write_bytes(b"fake-png")
+            telegram = FakeTelegram()
+            bridge = repl.Bridge(config(tmpdir), telegram, None)
+
+            bridge.send_answer(f"스크린샷입니다: {image}")
+
+            self.assertEqual(len(telegram.attachments), 1)
+            self.assertEqual(telegram.attachments[0][0], image)
+            self.assertEqual(telegram.sent, ["스크린샷입니다:"])
+            self.assertNotIn(str(image), telegram.sent[0])
+
+    def test_attachment_only_answer_uses_human_fallback_text(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            base = Path(tmpdir)
+            image = base / "screenshot.png"
+            image.write_bytes(b"fake-png")
+            telegram = FakeTelegram()
+            bridge = repl.Bridge(config(tmpdir), telegram, None)
+
+            bridge.send_answer(f"![screenshot]({image})")
+
+            self.assertEqual(len(telegram.attachments), 1)
+            self.assertEqual(telegram.sent, ["이미지를 첨부했어요."])
 
     def test_local_image_attachment_respects_allowed_roots(self):
         with tempfile.TemporaryDirectory() as allowed, tempfile.TemporaryDirectory() as outside:
