@@ -14,7 +14,7 @@ the phone stays useful.
 Install with `pipx`, then run the setup wizard:
 
 ```bash
-pipx install "git+https://github.com/ssamssae/codex-telegram-bridge.git@v0.3.8"
+pipx install "git+https://github.com/ssamssae/codex-telegram-bridge.git@v0.3.9"
 codex-telegram-bridge setup
 codex-telegram-bridge doctor
 ```
@@ -35,7 +35,7 @@ or normal prompts to your bot.
 Release: <https://github.com/ssamssae/codex-telegram-bridge/releases/latest>
 
 Promo video:
-<https://github.com/ssamssae/codex-telegram-bridge/releases/download/v0.3.8/codex-telegram-bridge-promo-v0.3.8.mp4>
+<https://github.com/ssamssae/codex-telegram-bridge/releases/download/v0.3.9/codex-telegram-bridge-promo-v0.3.9.mp4>
 
 The repo also includes a simpler one-shot `codex exec` mode. Internally, the
 bridge now has an adapter foundation for future Claude Code, Aider, Gemini CLI,
@@ -73,6 +73,7 @@ Codex slash command
   -> submit them with Enter instead of the normal queued prompt key
   -> mirror "Unrecognized command" errors back to Telegram
   -> clear the Codex composer before Telegram input so stale typo commands cannot be appended
+  -> keep Telegram typing active for long-running slash commands such as /goal
 
 Answer media attachments
   -> detect local image/video/audio paths in final answers

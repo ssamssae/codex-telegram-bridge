@@ -53,6 +53,7 @@ APPROVAL_CALLBACK_PREFIX = "crb_approval"
 CHOICE_CALLBACK_PREFIX = "crb_choice"
 STATUS_COMMANDS = {"status", "/status"}
 CONTEXT_COMMANDS = {"context", "/context"}
+LONG_RUNNING_SLASH_COMMANDS = {"/goal"}
 ANSI_RE = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]")
 UNRECOGNIZED_COMMAND_RE = re.compile(r"Unrecognized command ['\"](?P<command>/[^'\"]+)['\"]")
 MARKDOWN_LOCAL_PATH_RE = re.compile(r"!?\[[^\]]*]\((?P<path>[^)\n]+)\)")
@@ -132,6 +133,15 @@ def slash_command_token(text: str) -> str:
     if "\n" in stripped or not stripped.startswith("/"):
         return ""
     return stripped.split(maxsplit=1)[0].lower()
+
+
+def slash_command_keeps_typing(text: str) -> bool:
+    command = slash_command_token(text)
+    return command.split("@", 1)[0] in LONG_RUNNING_SLASH_COMMANDS
+
+
+def should_stop_typing_after_slash_command(text: str, had_error: bool) -> bool:
+    return had_error or not slash_command_keeps_typing(text)
 
 
 def is_status_command(text: str) -> bool:
@@ -322,7 +332,7 @@ class Config:
             ffprobe_bin=env("CRB_FFPROBE_BIN", "ffprobe") or "ffprobe",
             audio_transcribe_cmd=env("CRB_AUDIO_TRANSCRIBE_CMD"),
             video_frame_count=int_env("CRB_VIDEO_FRAME_COUNT", 3, minimum=1),
-            typing_max_seconds=int_env("CRB_TYPING_MAX_SECONDS", 1800, minimum=30),
+            typing_max_seconds=int_env("CRB_TYPING_MAX_SECONDS", 7200, minimum=30),
             approval_ttl_seconds=int_env("CRB_APPROVAL_TTL_SECONDS", 300, minimum=30),
             workdir=workdir,
             attachment_roots=path_env_list(
@@ -1527,10 +1537,10 @@ class Bridge:
             return
         self.clear_composer_before_telegram_input("stale slash command")
 
-    def handle_slash_command_result(self, text: str) -> None:
+    def handle_slash_command_result(self, text: str) -> bool:
         command = slash_command_token(text)
         if not command:
-            return
+            return False
         screen = self.head.capture_pane(120)
         error = extract_unrecognized_slash_error(screen, command)
         if error:
@@ -1541,6 +1551,8 @@ class Bridge:
                 "터미널 입력줄도 바로 비웠습니다."
             )
             self.clear_composer_before_telegram_input("slash command error")
+            return True
+        return False
 
     def approval_loop(self) -> None:
         while not self.stop_event.is_set():
@@ -2540,8 +2552,9 @@ class Bridge:
                     self.head.send(AgentMessage(prompt.text))
                     if slash_command:
                         time.sleep(0.8)
-                        self.handle_slash_command_result(prompt.text)
-                        self.stop_repl_typing()
+                        had_slash_error = self.handle_slash_command_result(prompt.text)
+                        if should_stop_typing_after_slash_command(prompt.text, had_slash_error):
+                            self.stop_repl_typing()
                 except Exception as exc:  # noqa: BLE001
                     self.stop_repl_typing()
                     log("REPL", f"paste failed: {exc}")

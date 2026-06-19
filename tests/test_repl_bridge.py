@@ -194,6 +194,17 @@ class ReplBridgeTests(unittest.TestCase):
         self.assertEqual(repl.slash_command_token("/model fast"), "/model")
         self.assertEqual(repl.slash_command_token("/model\nexplain"), "")
 
+    def test_goal_slash_command_keeps_typing(self):
+        self.assertTrue(repl.slash_command_keeps_typing("/goal"))
+        self.assertTrue(repl.slash_command_keeps_typing("/goal run this"))
+        self.assertTrue(repl.slash_command_keeps_typing("/goal@codex_bot run this"))
+        self.assertFalse(repl.slash_command_keeps_typing("/model"))
+
+    def test_slash_command_typing_stop_policy(self):
+        self.assertFalse(repl.should_stop_typing_after_slash_command("/goal", had_error=False))
+        self.assertTrue(repl.should_stop_typing_after_slash_command("/goal", had_error=True))
+        self.assertTrue(repl.should_stop_typing_after_slash_command("/model", had_error=False))
+
     def test_status_command_aliases(self):
         self.assertTrue(repl.is_status_command("status"))
         self.assertTrue(repl.is_status_command("/status"))
@@ -251,13 +262,26 @@ class ReplBridgeTests(unittest.TestCase):
             telegram = FakeTelegram()
             bridge = repl.Bridge(config(tmpdir), telegram, fake_repl)
 
-            bridge.handle_slash_command_result("/bad")
+            had_error = bridge.handle_slash_command_result("/bad")
 
+            self.assertTrue(had_error)
             self.assertEqual(fake_repl.cleared, 1)
             self.assertFalse(bridge.needs_composer_clear)
             self.assertIn("Codex slash command error", telegram.sent[0])
             self.assertIn("Unrecognized command '/bad'", telegram.sent[0])
             self.assertIn("바로 비웠습니다", telegram.sent[0])
+
+    def test_recognized_slash_command_result_returns_no_error(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            fake_repl = FakeRepl()
+            telegram = FakeTelegram()
+            bridge = repl.Bridge(config(tmpdir), telegram, fake_repl)
+
+            had_error = bridge.handle_slash_command_result("/goal")
+
+            self.assertFalse(had_error)
+            self.assertEqual(fake_repl.cleared, 0)
+            self.assertEqual(telegram.sent, [])
 
     def test_clear_composer_before_telegram_input_always_clears(self):
         with tempfile.TemporaryDirectory() as tmpdir:
