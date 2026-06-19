@@ -14,7 +14,7 @@ the phone stays useful.
 Install with `pipx`, then run the setup wizard:
 
 ```bash
-pipx install "git+https://github.com/ssamssae/codex-telegram-bridge.git@v0.3.0"
+pipx install "git+https://github.com/ssamssae/codex-telegram-bridge.git@v0.3.1"
 codex-telegram-bridge setup
 codex-telegram-bridge doctor
 ```
@@ -35,7 +35,7 @@ or normal prompts to your bot.
 Release: <https://github.com/ssamssae/codex-telegram-bridge/releases/latest>
 
 Promo video:
-<https://github.com/ssamssae/codex-telegram-bridge/releases/download/v0.3.0/codex-telegram-bridge-promo-v0.3.0.mp4>
+<https://github.com/ssamssae/codex-telegram-bridge/releases/download/v0.3.1/codex-telegram-bridge-promo-v0.3.1.mp4>
 
 The repo also includes a simpler one-shot `codex exec` mode. Internally, the
 bridge now has an adapter foundation for future Claude Code, Aider, Gemini CLI,
@@ -59,6 +59,7 @@ Codex CLI input
 Codex approval prompt
   -> detect "Would you like to run..." in the tmux pane
   -> send Telegram buttons for 1/2/3
+  -> mark the selected button and remove stale choices
   -> inject the selected key back into the Codex TUI
 
 Answer media attachments
@@ -319,7 +320,8 @@ Telegram message with buttons:
 - `3. No`
 
 You can also reply with `1`, `2`, `3`, `y`, `p`, `esc`, or `/approve 1`. The
-bridge injects the matching key back into the Codex TUI.
+bridge injects the matching key back into the Codex TUI, edits the original
+Telegram approval message to show the selected button, and removes stale choices.
 
 ## Answer Media Attachments
 

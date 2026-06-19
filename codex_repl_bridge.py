@@ -440,7 +440,7 @@ class TelegramClient:
             payload = self.call_multipart("sendDocument", {"chat_id": self.chat_id}, "document", path)
         return bool(payload and payload.get("ok"))
 
-    def send_approval_prompt(self, prompt: ApprovalRequest) -> None:
+    def send_approval_prompt(self, prompt: ApprovalRequest) -> int | None:
         buttons = [
             [
                 {
@@ -453,11 +453,43 @@ class TelegramClient:
             for option in prompt.options
         ]
         reply_markup = json.dumps({"inline_keyboard": buttons}, ensure_ascii=False)
-        self.call(
+        payload = self.call(
             "sendMessage",
             chat_id=self.chat_id,
             text=self.with_emoji_prefix(prompt.telegram_text()),
             reply_markup=reply_markup,
+        )
+        result = payload.get("result") if isinstance(payload, dict) else None
+        if isinstance(result, dict) and isinstance(result.get("message_id"), int):
+            return int(result["message_id"])
+        return None
+
+    def update_approval_prompt(
+        self,
+        message_id: int | None,
+        prompt: ApprovalRequest,
+        status_text: str,
+        selected: ApprovalOption | None = None,
+    ) -> None:
+        if message_id is None:
+            return
+        if selected:
+            buttons = [
+                [
+                    {
+                        "text": f"✅ {selected.number}. {selected.short_label}",
+                        "callback_data": f"{APPROVAL_CALLBACK_PREFIX}:done:{selected.number}",
+                    }
+                ]
+            ]
+        else:
+            buttons = []
+        self.call(
+            "editMessageText",
+            chat_id=self.chat_id,
+            message_id=message_id,
+            text=self.with_emoji_prefix(f"{prompt.telegram_text()}\n\n{status_text}"),
+            reply_markup=json.dumps({"inline_keyboard": buttons}, ensure_ascii=False),
         )
 
 
@@ -763,7 +795,13 @@ def parse_approval_prompt(screen: str, ttl_seconds: int = 300) -> ApprovalReques
     if not {"1", "2", "3"}.issubset(found_numbers):
         return None
 
-    signature_source = "\n".join(window).strip()
+    signature_source = "\n".join(
+        [
+            command,
+            reason,
+            *[f"{option.number}:{option.label}:{option.key}" for option in options],
+        ]
+    ).strip()
     signature = hashlib.sha256(signature_source.encode("utf-8", errors="replace")).hexdigest()
     return ApprovalRequest.create(
         approval_id=signature,
@@ -846,6 +884,8 @@ class Bridge:
         self.repl_typing_stop: threading.Event | None = None
         self.pending_telegram: list[str] = []
         self.pending_approval: ApprovalRequest | None = None
+        self.pending_approval_message_id: int | None = None
+        self.resolved_approval_ids: set[str] = set()
         self.stop_event = threading.Event()
         self.current_origin: str | None = None
         self.suppress_until_user = False
@@ -1002,15 +1042,31 @@ class Bridge:
                         previous = self.pending_approval
                         if previous is None or previous.approval_id != prompt.approval_id:
                             self.pending_approval = prompt
+                            self.pending_approval_message_id = None
                             should_send = True
                     if should_send:
                         log("APPROV", f"approval prompt detected {prompt.short_signature}")
-                        self.telegram.send_approval_prompt(prompt)
+                        message_id = self.telegram.send_approval_prompt(prompt)
+                        with self.approval_lock:
+                            if (
+                                self.pending_approval
+                                and self.pending_approval.approval_id == prompt.approval_id
+                            ):
+                                self.pending_approval_message_id = message_id
                 else:
                     with self.approval_lock:
-                        if self.pending_approval is not None:
+                        prompt_to_clear = self.pending_approval
+                        message_id = self.pending_approval_message_id
+                        if prompt_to_clear is not None:
                             log("APPROV", "approval prompt cleared")
+                            if prompt_to_clear.approval_id not in self.resolved_approval_ids:
+                                self.telegram.update_approval_prompt(
+                                    message_id,
+                                    prompt_to_clear,
+                                    "Approval prompt is no longer active.",
+                                )
                         self.pending_approval = None
+                        self.pending_approval_message_id = None
             except Exception as exc:  # noqa: BLE001
                 log("APPROV", f"watch error: {exc}")
             self.stop_event.wait(1.0)
@@ -1047,6 +1103,7 @@ class Bridge:
             prompt = self.pending_approval
             if prompt and not prompt.is_active():
                 self.pending_approval = prompt.cancel()
+            message_id = self.pending_approval_message_id
         if not prompt:
             if callback_query_id:
                 self.telegram.call(
@@ -1056,6 +1113,11 @@ class Bridge:
                 )
             return False
         if not prompt.is_active():
+            self.telegram.update_approval_prompt(
+                message_id,
+                prompt,
+                "⏳ Approval expired. Please trigger the command again if you still want it.",
+            )
             if callback_query_id:
                 self.telegram.call(
                     "answerCallbackQuery",
@@ -1069,6 +1131,14 @@ class Bridge:
                     "answerCallbackQuery",
                     callback_query_id=callback_query_id,
                     text="That approval prompt is no longer active.",
+                )
+            return True
+        if prompt.approval_id in self.resolved_approval_ids:
+            if callback_query_id:
+                self.telegram.call(
+                    "answerCallbackQuery",
+                    callback_query_id=callback_query_id,
+                    text="This approval choice was already sent.",
                 )
             return True
 
@@ -1089,9 +1159,17 @@ class Bridge:
             return True
 
         log("APPROV", f"choice {choice} -> {option.key}")
+        self.telegram.update_approval_prompt(
+            message_id,
+            prompt,
+            f"✅ Selected {option.number}. {option.short_label}",
+            selected=option,
+        )
         with self.approval_lock:
             if self.pending_approval and self.pending_approval.approval_id == prompt.approval_id:
+                self.resolved_approval_ids.add(prompt.approval_id)
                 self.pending_approval = prompt.cancel()
+                self.pending_approval_message_id = None
         if callback_query_id:
             self.telegram.call(
                 "answerCallbackQuery",
@@ -1114,6 +1192,14 @@ class Bridge:
         if len(parts) != 3:
             return True
         _prefix, signature, choice = parts
+        if signature == "done":
+            if callback.get("id"):
+                self.telegram.call(
+                    "answerCallbackQuery",
+                    callback_query_id=str(callback.get("id") or ""),
+                    text="This approval choice was already sent.",
+                )
+            return True
         return self.handle_approval_choice(
             choice,
             signature=signature,

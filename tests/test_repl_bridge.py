@@ -45,6 +45,7 @@ class FakeTelegram:
         self.sent = []
         self.calls = []
         self.attachments = []
+        self.approval_updates = []
 
     def download_file(
         self,
@@ -65,6 +66,10 @@ class FakeTelegram:
 
     def send_approval_prompt(self, prompt):
         self.sent.append(prompt.telegram_text())
+        return 42
+
+    def update_approval_prompt(self, message_id, prompt, status_text, selected=None):
+        self.approval_updates.append((message_id, prompt, status_text, selected))
 
     def call(self, method, **params):
         self.calls.append((method, params))
@@ -218,6 +223,26 @@ Press enter to confirm or esc to cancel
         self.assertEqual([option.key for option in prompt.options], ["y", "p", "esc"])
         self.assertIn("Choose a button", prompt.telegram_text())
 
+    def test_approval_signature_ignores_surrounding_screen_changes(self):
+        base = """
+Would you like to run the following command?
+
+Reason: test
+
+$ git status
+
+› 1. Yes, proceed (y)
+  2. Yes, and don't ask again (p)
+  3. No (esc)
+"""
+        first = repl.parse_approval_prompt(base)
+        second = repl.parse_approval_prompt(base + "\nWorking for 2s\n")
+
+        self.assertIsNotNone(first)
+        self.assertIsNotNone(second)
+        assert first is not None and second is not None
+        self.assertEqual(first.approval_id, second.approval_id)
+
     def test_approval_text_choice_sends_tmux_key(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             fake_repl = FakeRepl()
@@ -255,6 +280,7 @@ Press enter to confirm or esc to cancel
                 ),
                 ttl_seconds=300,
             )
+            bridge.pending_approval_message_id = 42
             callback = {
                 "id": "cb1",
                 "data": "crb_approval:abcdef1234567890:3",
@@ -263,7 +289,46 @@ Press enter to confirm or esc to cancel
 
             self.assertTrue(bridge.handle_callback_query(callback))
             self.assertEqual(fake_repl.approval_keys, ["esc"])
+            self.assertEqual(telegram.approval_updates[0][0], 42)
+            self.assertEqual(telegram.approval_updates[0][3].number, "3")
+            self.assertIn("Selected 3", telegram.approval_updates[0][2])
             self.assertEqual(telegram.calls[0][0], "answerCallbackQuery")
+
+    def test_done_approval_callback_only_acknowledges(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            telegram = FakeTelegram()
+            bridge = repl.Bridge(config(tmpdir), telegram, FakeRepl())
+            callback = {
+                "id": "cb1",
+                "data": "crb_approval:done:2",
+                "message": {"chat": {"id": "1234"}},
+            }
+
+            self.assertTrue(bridge.handle_callback_query(callback))
+            self.assertEqual(telegram.calls[0][0], "answerCallbackQuery")
+            self.assertIn("already sent", telegram.calls[0][1]["text"])
+
+    def test_resolved_approval_text_choice_is_not_sent_twice(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            fake_repl = FakeRepl()
+            bridge = repl.Bridge(config(tmpdir), FakeTelegram(), fake_repl)
+            approval = repl.ApprovalRequest.create(
+                approval_id="abcdef1234567890fedcba",
+                source_head="codex_repl",
+                command="$ git status",
+                reason="test",
+                options=(
+                    repl.ApprovalOption("1", "Yes", "y"),
+                    repl.ApprovalOption("2", "Yes always", "p"),
+                    repl.ApprovalOption("3", "No", "esc"),
+                ),
+                ttl_seconds=300,
+            )
+            bridge.pending_approval = approval
+            bridge.resolved_approval_ids.add(approval.approval_id)
+
+            self.assertTrue(bridge.handle_approval_text("2"))
+            self.assertEqual(fake_repl.approval_keys, [])
 
     def test_expired_approval_callback_does_not_send_key(self):
         with tempfile.TemporaryDirectory() as tmpdir:
