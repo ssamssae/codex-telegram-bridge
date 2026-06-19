@@ -244,7 +244,7 @@ class ReplBridgeTests(unittest.TestCase):
             "• Unrecognized command '/bad'. Type \"/\" for a list of supported commands.",
         )
 
-    def test_unrecognized_slash_command_notifies_and_marks_composer_clear(self):
+    def test_unrecognized_slash_command_notifies_and_clears_composer(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             fake_repl = FakeRepl()
             fake_repl.screen = "• Unrecognized command '/bad'. Type \"/\" for a list of supported commands."
@@ -253,9 +253,22 @@ class ReplBridgeTests(unittest.TestCase):
 
             bridge.handle_slash_command_result("/bad")
 
-            self.assertTrue(bridge.needs_composer_clear)
+            self.assertEqual(fake_repl.cleared, 1)
+            self.assertFalse(bridge.needs_composer_clear)
             self.assertIn("Codex slash command error", telegram.sent[0])
             self.assertIn("Unrecognized command '/bad'", telegram.sent[0])
+            self.assertIn("바로 비웠습니다", telegram.sent[0])
+
+    def test_clear_composer_before_telegram_input_always_clears(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            fake_repl = FakeRepl()
+            bridge = repl.Bridge(config(tmpdir), FakeTelegram(), fake_repl)
+            bridge.needs_composer_clear = True
+
+            bridge.clear_composer_before_telegram_input("telegram prompt")
+
+            self.assertEqual(fake_repl.cleared, 1)
+            self.assertFalse(bridge.needs_composer_clear)
 
     def test_stale_slash_composer_is_cleared_once(self):
         with tempfile.TemporaryDirectory() as tmpdir:

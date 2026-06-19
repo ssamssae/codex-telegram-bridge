@@ -1496,6 +1496,7 @@ class Bridge:
         log("TG", f"{label} -> Codex REPL")
         self.begin_repl_typing()
         try:
+            self.clear_composer_before_telegram_input(label)
             self.head.send(AgentMessage("/status"))
             time.sleep(1.0)
             screen = self.head.capture_pane(120)
@@ -1508,16 +1509,19 @@ class Bridge:
             self.stop_repl_typing()
         return True
 
+    def clear_composer_before_telegram_input(self, label: str = "telegram input") -> None:
+        try:
+            self.head.clear_composer()
+            log("REPL", f"cleared composer before {label}")
+        except Exception as exc:  # noqa: BLE001
+            log("REPL", f"composer clear failed before {label}: {exc}")
+        finally:
+            self.needs_composer_clear = False
+
     def clear_stale_composer_if_needed(self) -> None:
         if not self.needs_composer_clear:
             return
-        try:
-            self.head.clear_composer()
-            log("REPL", "cleared stale slash command composer")
-        except Exception as exc:  # noqa: BLE001
-            log("REPL", f"composer clear failed: {exc}")
-        finally:
-            self.needs_composer_clear = False
+        self.clear_composer_before_telegram_input("stale slash command")
 
     def handle_slash_command_result(self, text: str) -> None:
         command = slash_command_token(text)
@@ -1530,8 +1534,9 @@ class Bridge:
             log("REPL", f"slash command error: {error}")
             self.telegram.send(
                 f"Codex slash command error\n{error}\n\n"
-                "다음 Telegram 프롬프트를 넣기 전에 터미널 입력줄을 비웁니다."
+                "터미널 입력줄도 바로 비웠습니다."
             )
+            self.clear_composer_before_telegram_input("slash command error")
 
     def approval_loop(self) -> None:
         while not self.stop_event.is_set():
@@ -2527,7 +2532,7 @@ class Bridge:
                 if not slash_command:
                     self.add_pending_telegram(prompt.text)
                 try:
-                    self.clear_stale_composer_if_needed()
+                    self.clear_composer_before_telegram_input("telegram prompt")
                     self.head.send(AgentMessage(prompt.text))
                     if slash_command:
                         time.sleep(0.8)
