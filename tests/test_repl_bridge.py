@@ -175,6 +175,12 @@ class ReplBridgeTests(unittest.TestCase):
         self.assertTrue(repl.is_status_command("/status@codex_bot"))
         self.assertFalse(repl.is_status_command("status please"))
 
+    def test_context_command_aliases(self):
+        self.assertTrue(repl.is_context_command("context"))
+        self.assertTrue(repl.is_context_command("/context"))
+        self.assertTrue(repl.is_context_command("/context@codex_bot"))
+        self.assertFalse(repl.is_context_command("context please"))
+
     def test_extract_codex_status_text_from_tui_box(self):
         screen = """
 /status
@@ -190,6 +196,7 @@ class ReplBridgeTests(unittest.TestCase):
 │  Permissions:                 Full Access                                               │
 │  Session:                     019ee042-0a6e-76c1-9da8-ce73a0bd670a                      │
 │                                                                                         │
+│  Context window:              45% left (147K used / 258K)                               │
 │  5h limit:                    [████████████████████] 100% left (resets 04:20 on 20 Jun) │
 │  Weekly limit:                [████████████████░░░░] 81% left (resets 20:49 on 25 Jun)  │
 ╰─────────────────────────────────────────────────────────────────────────────────────────╯
@@ -199,8 +206,25 @@ class ReplBridgeTests(unittest.TestCase):
         self.assertIn("Codex status", status)
         self.assertIn("OpenAI Codex (v0.141.0)", status)
         self.assertIn("Model:  gpt-5.5", status)
+        self.assertIn("Context window:  45% left", status)
         self.assertIn("Weekly limit:  [████████████████░░░░] 81% left", status)
         self.assertNotIn("Visit https://chatgpt.com", status)
+
+    def test_extract_codex_context_text_from_tui_box(self):
+        screen = """
+╭─────────────────────────────────────────────────────────────────────────────────────────╮
+│  >_ OpenAI Codex (v0.141.0)                                                             │
+│  Model:                       gpt-5.5 (reasoning xhigh, summaries auto)                 │
+│  Context window:              45% left (147K used / 258K)                               │
+│  Weekly limit:                [████████████████░░░░] 81% left (resets 20:49 on 25 Jun)  │
+╰─────────────────────────────────────────────────────────────────────────────────────────╯
+"""
+        context = repl.extract_codex_context_text(screen)
+
+        self.assertEqual(
+            context,
+            "Codex context\nContext window:  45% left (147K used / 258K)",
+        )
 
     def test_regular_prompt_keeps_configured_submit_key(self):
         with tempfile.TemporaryDirectory() as tmpdir:

@@ -52,6 +52,7 @@ VOICE_ATTACHMENT_EXTENSIONS = {".ogg", ".oga", ".opus"}
 APPROVAL_CALLBACK_PREFIX = "crb_approval"
 CHOICE_CALLBACK_PREFIX = "crb_choice"
 STATUS_COMMANDS = {"status", "/status"}
+CONTEXT_COMMANDS = {"context", "/context"}
 ANSI_RE = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]")
 MARKDOWN_LOCAL_PATH_RE = re.compile(r"!?\[[^\]]*]\((?P<path>[^)\n]+)\)")
 MEDIA_ATTACHMENT_SUFFIX_RE = "|".join(
@@ -136,6 +137,14 @@ def is_status_command(text: str) -> bool:
     return command == "/status" or command.startswith("/status@")
 
 
+def is_context_command(text: str) -> bool:
+    stripped = (text or "").strip().lower()
+    if stripped in CONTEXT_COMMANDS:
+        return True
+    command = stripped.split(maxsplit=1)[0] if stripped else ""
+    return command == "/context" or command.startswith("/context@")
+
+
 def extract_codex_status_text(screen: str) -> str:
     lines = (screen or "").splitlines()
     header_index = None
@@ -174,6 +183,14 @@ def extract_codex_status_text(screen: str) -> str:
 
     body = "\n".join(cleaned).strip()
     return f"Codex status\n{body}" if body else "Codex status not visible yet."
+
+
+def extract_codex_context_text(screen: str) -> str:
+    status_text = extract_codex_status_text(screen)
+    for line in status_text.splitlines():
+        if line.startswith("Context window:"):
+            return f"Codex context\n{line}"
+    return status_text
 
 
 def suffix_from_metadata(file_name: str = "", mime_type: str = "", default: str = ".bin") -> str:
@@ -1449,17 +1466,21 @@ class Bridge:
                 log("TYPE", "stop")
 
     def handle_status_command(self, text: str) -> bool:
-        if not is_status_command(text):
+        context_only = is_context_command(text)
+        if not (context_only or is_status_command(text)):
             return False
-        log("TG", "status -> Codex REPL")
+        label = "context" if context_only else "status"
+        log("TG", f"{label} -> Codex REPL")
         self.begin_repl_typing()
         try:
             self.head.send(AgentMessage("/status"))
             time.sleep(1.0)
-            self.telegram.send(extract_codex_status_text(self.head.capture_pane(120)))
+            screen = self.head.capture_pane(120)
+            answer = extract_codex_context_text(screen) if context_only else extract_codex_status_text(screen)
+            self.telegram.send(answer)
         except Exception as exc:  # noqa: BLE001
-            log("REPL", f"status failed: {exc}")
-            self.telegram.send(f"codex status failed: {exc}")
+            log("REPL", f"{label} failed: {exc}")
+            self.telegram.send(f"codex {label} failed: {exc}")
         finally:
             self.stop_repl_typing()
         return True
