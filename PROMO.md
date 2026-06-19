@@ -16,17 +16,14 @@ Repository:
 https://github.com/ssamssae/codex-telegram-bridge
 
 Release:
-https://github.com/ssamssae/codex-telegram-bridge/releases/tag/v0.1.0
+https://github.com/ssamssae/codex-telegram-bridge/releases/latest
 
 Install sketch:
 
 ```bash
-git clone https://github.com/ssamssae/codex-telegram-bridge.git
-cd codex-telegram-bridge
-cp config.example.env ~/.config/telegram-agent-bridge.env
-chmod 600 ~/.config/telegram-agent-bridge.env
-$EDITOR ~/.config/telegram-agent-bridge.env
-python3 telegram_agent_bridge.py
+pipx install "git+https://github.com/ssamssae/codex-telegram-bridge.git@v0.2.1"
+codex-telegram-bridge setup
+codex-telegram-bridge doctor
 ```
 
 This is free and MIT licensed.

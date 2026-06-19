@@ -1,0 +1,47 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "codex-telegram-bridge"
+version = "0.2.1"
+description = "Run Codex from Telegram with a visible Codex CLI REPL and mirrored answers."
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+authors = [
+  { name = "Kang Daejong" }
+]
+keywords = ["codex", "telegram", "cli", "automation", "agent"]
+classifiers = [
+  "Development Status :: 4 - Beta",
+  "Environment :: Console",
+  "Intended Audience :: Developers",
+  "License :: OSI Approved :: MIT License",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3 :: Only",
+  "Topic :: Communications :: Chat",
+  "Topic :: Software Development"
+]
+dependencies = []
+
+[project.optional-dependencies]
+asr = ["faster-whisper", "imageio-ffmpeg"]
+
+[project.urls]
+Homepage = "https://github.com/ssamssae/codex-telegram-bridge"
+Repository = "https://github.com/ssamssae/codex-telegram-bridge"
+Releases = "https://github.com/ssamssae/codex-telegram-bridge/releases"
+Issues = "https://github.com/ssamssae/codex-telegram-bridge/issues"
+
+[project.scripts]
+codex-telegram-bridge = "bridge_setup:main"
+telegram-agent-bridge = "bridge_setup:main"
+
+[tool.setuptools]
+py-modules = [
+  "bridge_setup",
+  "telegram_agent_bridge",
+  "codex_repl_bridge",
+  "codex_audio_transcribe"
+]

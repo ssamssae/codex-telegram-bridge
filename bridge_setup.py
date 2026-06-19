@@ -74,6 +74,15 @@ def ok(message: str) -> None:
     out(f"[ok] {message}")
 
 
+def doctor_command_hint() -> str:
+    invoked = Path(sys.argv[0]).name
+    if invoked == "bridge_setup.py":
+        return "python3 bridge_setup.py doctor"
+    if invoked in {"codex-telegram-bridge", "telegram-agent-bridge"}:
+        return f"{invoked} doctor"
+    return "codex-telegram-bridge doctor"
+
+
 def shell_quote(value: str | Path | int | bool) -> str:
     return shlex.quote(str(value))
 
@@ -642,7 +651,7 @@ def setup_bridge(options: SetupOptions, api_call: ApiCall = telegram_call) -> in
     out("")
     out("Next:")
     out("  Send /ping to your bot.")
-    out(f"  Run doctor: python3 {Path(__file__).name} doctor")
+    out(f"  Run doctor: {doctor_command_hint()}")
     return 0
 
 
@@ -768,7 +777,7 @@ def uninstall(
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="Setup helper for telegram-agent-bridge")
+    parser = argparse.ArgumentParser(description="Setup helper for Codex Telegram Bridge")
     subparsers = parser.add_subparsers(dest="command", required=True)
 
     setup_parser = subparsers.add_parser("setup", help="interactive setup wizard")

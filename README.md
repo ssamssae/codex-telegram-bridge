@@ -1,9 +1,38 @@
 # Codex Telegram Bridge
 
+[![Release](https://img.shields.io/github/v/release/ssamssae/codex-telegram-bridge)](https://github.com/ssamssae/codex-telegram-bridge/releases)
+[![License: MIT](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
+
 Run Codex from Telegram, with the visible Codex CLI REPL and Telegram kept in
 sync. Telegram text, images, video metadata/thumbnails, and audio transcripts
 can be delivered into the Codex CLI transcript, while Codex final answers are
 mirrored back to Telegram.
+
+Install with `pipx`, then run the setup wizard:
+
+```bash
+pipx install "git+https://github.com/ssamssae/codex-telegram-bridge.git@v0.2.1"
+codex-telegram-bridge setup
+codex-telegram-bridge doctor
+```
+
+Or install from a clone:
+
+```bash
+git clone https://github.com/ssamssae/codex-telegram-bridge.git
+cd codex-telegram-bridge
+python3 bridge_setup.py setup
+python3 bridge_setup.py doctor
+```
+
+Token safety rule: BotFather shows the bot token in Telegram, but paste it only
+into the local terminal setup wizard. In Telegram, send only `/start`, `/ping`,
+or normal prompts to your bot.
+
+Release: <https://github.com/ssamssae/codex-telegram-bridge/releases/latest>
+
+Promo video:
+<https://github.com/ssamssae/codex-telegram-bridge/releases/download/v0.2.1/codex-telegram-bridge-promo-v0.2.1.mp4>
 
 The repo also includes a simpler one-shot `codex exec` mode. Generic one-shot
 command backends can adapt Claude Code, Aider, Gemini CLI, or your own terminal
@@ -42,7 +71,13 @@ If you only want text-only one-shot mode without a visible Codex TUI, you can us
    Do not send this token in any Telegram chat. Paste it only into the local
    terminal setup wizard in the next step.
 
-3. Run the setup wizard:
+3. Run the setup wizard. If you used `pipx`, run:
+
+```bash
+codex-telegram-bridge setup
+```
+
+If you installed from a clone, run:
 
 ```bash
 git clone https://github.com/ssamssae/codex-telegram-bridge.git
@@ -67,14 +102,16 @@ optional audio transcription, answer mirroring, and Telegram `typing...`.
 4. Check the installation:
 
 ```bash
+codex-telegram-bridge doctor
+# or, from a clone:
 python3 bridge_setup.py doctor
 ```
 
 5. Send `/ping` to the bot. Then send a normal prompt.
 
 Token safety rule: BotFather shows the token in Telegram, but you should copy it
-from BotFather and paste it into `python3 bridge_setup.py setup` in your local
-terminal. In Telegram, send only `/start` or normal prompts to your bot.
+from BotFather and paste it into the local setup wizard in your terminal. In
+Telegram, send only `/start` or normal prompts to your bot.
 
 For local terminal input without scraping an agent TUI, either type into the
 foreground bridge process or write one prompt per line to the FIFO:
@@ -90,24 +127,37 @@ Prompts and final answers are mirrored to both Telegram and terminal output.
 Interactive install:
 
 ```bash
+codex-telegram-bridge setup
+# or:
 python3 bridge_setup.py setup
 ```
 
 Text-only one-shot install:
 
 ```bash
+codex-telegram-bridge setup --mode exec
+# or:
 python3 bridge_setup.py setup --mode exec
 ```
 
 Install optional local audio transcription dependencies for voice/audio files:
 
 ```bash
+codex-telegram-bridge setup --install-asr
+# or:
 python3 bridge_setup.py setup --install-asr
 ```
 
 Non-interactive install, useful for scripts:
 
 ```bash
+codex-telegram-bridge setup \
+  --token '123456:BOT_TOKEN' \
+  --chat-id '123456789' \
+  --non-interactive \
+  -y
+
+# or, from a clone:
 python3 bridge_setup.py setup \
   --token '123456:BOT_TOKEN' \
   --chat-id '123456789' \
@@ -118,18 +168,24 @@ python3 bridge_setup.py setup \
 Health check:
 
 ```bash
+codex-telegram-bridge doctor
+# or:
 python3 bridge_setup.py doctor
 ```
 
 Uninstall the service and runner while keeping your private config:
 
 ```bash
+codex-telegram-bridge uninstall
+# or:
 python3 bridge_setup.py uninstall
 ```
 
 Remove the private config too:
 
 ```bash
+codex-telegram-bridge uninstall --purge
+# or:
 python3 bridge_setup.py uninstall --purge
 ```
 
