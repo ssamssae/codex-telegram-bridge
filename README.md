@@ -14,7 +14,7 @@ the phone stays useful.
 Install with `pipx`, then run the setup wizard:
 
 ```bash
-pipx install "git+https://github.com/ssamssae/codex-telegram-bridge.git@v0.3.1"
+pipx install "git+https://github.com/ssamssae/codex-telegram-bridge.git@v0.3.2"
 codex-telegram-bridge setup
 codex-telegram-bridge doctor
 ```
@@ -35,7 +35,7 @@ or normal prompts to your bot.
 Release: <https://github.com/ssamssae/codex-telegram-bridge/releases/latest>
 
 Promo video:
-<https://github.com/ssamssae/codex-telegram-bridge/releases/download/v0.3.1/codex-telegram-bridge-promo-v0.3.1.mp4>
+<https://github.com/ssamssae/codex-telegram-bridge/releases/download/v0.3.2/codex-telegram-bridge-promo-v0.3.2.mp4>
 
 The repo also includes a simpler one-shot `codex exec` mode. Internally, the
 bridge now has an adapter foundation for future Claude Code, Aider, Gemini CLI,
@@ -58,9 +58,15 @@ Codex CLI input
 
 Codex approval prompt
   -> detect "Would you like to run..." in the tmux pane
-  -> send Telegram buttons for 1/2/3
+  -> send Telegram buttons for the visible approval choices
   -> mark the selected button and remove stale choices
   -> inject the selected key back into the Codex TUI
+
+Codex selection prompt
+  -> detect numbered/lettered menus and y/n confirmations in the tmux pane
+  -> send Telegram buttons for the visible options
+  -> mark the selected button and remove stale choices
+  -> inject shortcut keys or arrow+Enter navigation back into the Codex TUI
 
 Answer media attachments
   -> detect local image/video/audio paths in final answers
@@ -282,7 +288,9 @@ Required settings are intentionally small and explicit.
 - Telegram voice/audio files
 - Telegram `typing...` while Codex is generating
 - terminal-origin Codex prompts mirrored back to Telegram
-- Codex command approval prompts mirrored to Telegram with 1/2/3 buttons
+- Codex command approval prompts mirrored to Telegram with buttons
+- Codex numbered/lettered selection prompts and y/n confirmations mirrored to
+  Telegram with buttons
 - local image/video/audio paths in final answers hidden from Telegram text and
   sent as Telegram attachments
 
@@ -319,9 +327,23 @@ Telegram message with buttons:
 - `2. Yes, don't ask again`
 - `3. No`
 
-You can also reply with `1`, `2`, `3`, `y`, `p`, `esc`, or `/approve 1`. The
-bridge injects the matching key back into the Codex TUI, edits the original
-Telegram approval message to show the selected button, and removes stale choices.
+You can also reply with the visible number or shortcut, for example `1`, `2`,
+`y`, `p`, `esc`, or `/approve 1`. The bridge injects the matching key back into
+the Codex TUI, edits the original Telegram approval message to show the selected
+button, and removes stale choices.
+
+## REPL Mode Selection Prompts
+
+The bridge also watches for non-approval Codex TUI choices, for example model
+pickers, mode pickers, numbered/lettered menus, and inline confirmations such as
+`[y/N]` or `(yes/no)`. When a selection prompt is visible, Telegram receives
+buttons for the visible options.
+
+If a visible option has a shortcut such as `(y)`, `(n)`, `(esc)`, or `(enter)`,
+the bridge sends that shortcut back to Codex. If there is no explicit shortcut,
+it uses the currently highlighted `›` row and sends Up/Down plus Enter. Text
+replies such as `1`, `2`, `a`, `y`, `yes`, `n`, `no`, and `/choose 2` are also
+accepted while the prompt is active.
 
 ## Answer Media Attachments
 

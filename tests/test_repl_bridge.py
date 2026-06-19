@@ -46,6 +46,7 @@ class FakeTelegram:
         self.calls = []
         self.attachments = []
         self.approval_updates = []
+        self.choice_updates = []
 
     def download_file(
         self,
@@ -71,6 +72,13 @@ class FakeTelegram:
     def update_approval_prompt(self, message_id, prompt, status_text, selected=None):
         self.approval_updates.append((message_id, prompt, status_text, selected))
 
+    def send_choice_prompt(self, prompt):
+        self.sent.append(prompt.telegram_text())
+        return 43
+
+    def update_choice_prompt(self, message_id, prompt, status_text, selected=None):
+        self.choice_updates.append((message_id, prompt, status_text, selected))
+
     def call(self, method, **params):
         self.calls.append((method, params))
         return {"ok": True, "result": True}
@@ -94,9 +102,13 @@ class CaptureTelegram(repl.TelegramClient):
 class FakeRepl:
     def __init__(self):
         self.approval_keys = []
+        self.choice_options = []
 
     def send_approval_key(self, key):
         self.approval_keys.append(key)
+
+    def send_choice_option(self, prompt, option):
+        self.choice_options.append((prompt, option))
 
 
 class ReplBridgeTests(unittest.TestCase):
@@ -243,6 +255,58 @@ $ git status
         assert first is not None and second is not None
         self.assertEqual(first.approval_id, second.approval_id)
 
+    def test_parse_two_option_approval_prompt_with_wrapped_escape_label(self):
+        screen = """
+Would you like to run the following command?
+
+Reason: Capture the desktop.
+
+$ python3 screenshot.py
+
+› 1. Yes, proceed (y)
+  2. No, and tell Codex what to do
+differently (esc)
+
+Press enter to confirm or esc to cancel
+"""
+        prompt = repl.parse_approval_prompt(screen)
+
+        self.assertIsNotNone(prompt)
+        assert prompt is not None
+        self.assertEqual([option.number for option in prompt.options], ["1", "2"])
+        self.assertEqual([option.key for option in prompt.options], ["y", "esc"])
+        self.assertIn("No, and tell Codex", prompt.options[1].label)
+
+    def test_parse_generic_numbered_choice_prompt(self):
+        screen = """
+Select model
+
+› 1. GPT-5.5 xhigh fast
+  2. GPT-5.5 high
+  3. GPT-5 mini
+
+Press enter to confirm or esc to cancel
+"""
+        prompt = repl.parse_choice_prompt(screen)
+
+        self.assertIsNotNone(prompt)
+        assert prompt is not None
+        self.assertEqual(prompt.title, "Select model")
+        self.assertEqual([option.value for option in prompt.options], ["1", "2", "3"])
+        self.assertTrue(prompt.options[0].selected)
+
+    def test_parse_inline_yes_no_choice_prompt(self):
+        screen = """
+Overwrite existing file? [y/N]
+"""
+        prompt = repl.parse_choice_prompt(screen)
+
+        self.assertIsNotNone(prompt)
+        assert prompt is not None
+        self.assertEqual([option.value for option in prompt.options], ["y", "n"])
+        self.assertEqual([option.key for option in prompt.options], ["y", "n"])
+        self.assertTrue(prompt.options[1].selected)
+
     def test_approval_text_choice_sends_tmux_key(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             fake_repl = FakeRepl()
@@ -262,6 +326,44 @@ $ git status
 
             self.assertTrue(bridge.handle_approval_text("2"))
             self.assertEqual(fake_repl.approval_keys, ["p"])
+
+    def test_two_option_approval_no_text_maps_to_visible_no_option(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            fake_repl = FakeRepl()
+            bridge = repl.Bridge(config(tmpdir), FakeTelegram(), fake_repl)
+            bridge.pending_approval = repl.ApprovalRequest.create(
+                approval_id="abcdef1234567890",
+                source_head="codex_repl",
+                command="$ screenshot",
+                reason="test",
+                options=(
+                    repl.ApprovalOption("1", "Yes, proceed", "y"),
+                    repl.ApprovalOption("2", "No, and tell Codex what to do differently", "esc"),
+                ),
+                ttl_seconds=300,
+            )
+
+            self.assertTrue(bridge.handle_approval_text("no"))
+            self.assertEqual(fake_repl.approval_keys, ["esc"])
+
+    def test_choice_text_sends_matching_option(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            fake_repl = FakeRepl()
+            bridge = repl.Bridge(config(tmpdir), FakeTelegram(), fake_repl)
+            bridge.pending_choice = repl.ChoicePrompt.create(
+                choice_id="abcdef1234567890",
+                source_head="codex_repl",
+                title="Select model",
+                options=(
+                    repl.ChoiceOption("1", "GPT-5.5 xhigh fast", index=0, selected=True),
+                    repl.ChoiceOption("2", "GPT-5.5 high", index=1),
+                    repl.ChoiceOption("3", "GPT-5 mini", index=2),
+                ),
+                ttl_seconds=300,
+            )
+
+            self.assertTrue(bridge.handle_choice_text("2"))
+            self.assertEqual(fake_repl.choice_options[0][1].value, "2")
 
     def test_approval_callback_checks_signature_and_sends_key(self):
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -294,6 +396,35 @@ $ git status
             self.assertIn("Selected 3", telegram.approval_updates[0][2])
             self.assertEqual(telegram.calls[0][0], "answerCallbackQuery")
 
+    def test_choice_callback_checks_signature_and_marks_selection(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            fake_repl = FakeRepl()
+            telegram = FakeTelegram()
+            bridge = repl.Bridge(config(tmpdir), telegram, fake_repl)
+            bridge.pending_choice = repl.ChoicePrompt.create(
+                choice_id="abcdef1234567890fedcba",
+                source_head="codex_repl",
+                title="Select model",
+                options=(
+                    repl.ChoiceOption("1", "GPT-5.5 xhigh fast", index=0, selected=True),
+                    repl.ChoiceOption("2", "GPT-5.5 high", index=1),
+                ),
+                ttl_seconds=300,
+            )
+            bridge.pending_choice_message_id = 43
+            callback = {
+                "id": "cb1",
+                "data": "crb_choice:abcdef1234567890:2",
+                "message": {"chat": {"id": "1234"}},
+            }
+
+            self.assertTrue(bridge.handle_callback_query(callback))
+            self.assertEqual(fake_repl.choice_options[0][1].value, "2")
+            self.assertEqual(telegram.choice_updates[0][0], 43)
+            self.assertEqual(telegram.choice_updates[0][3].value, "2")
+            self.assertIn("Selected 2", telegram.choice_updates[0][2])
+            self.assertEqual(telegram.calls[0][0], "answerCallbackQuery")
+
     def test_done_approval_callback_only_acknowledges(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             telegram = FakeTelegram()
@@ -301,6 +432,20 @@ $ git status
             callback = {
                 "id": "cb1",
                 "data": "crb_approval:done:2",
+                "message": {"chat": {"id": "1234"}},
+            }
+
+            self.assertTrue(bridge.handle_callback_query(callback))
+            self.assertEqual(telegram.calls[0][0], "answerCallbackQuery")
+            self.assertIn("already sent", telegram.calls[0][1]["text"])
+
+    def test_done_choice_callback_only_acknowledges(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            telegram = FakeTelegram()
+            bridge = repl.Bridge(config(tmpdir), telegram, FakeRepl())
+            callback = {
+                "id": "cb1",
+                "data": "crb_choice:done:2",
                 "message": {"chat": {"id": "1234"}},
             }
 

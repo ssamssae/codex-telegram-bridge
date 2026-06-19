@@ -83,5 +83,5 @@ class ApprovalRequest:
             lines.extend(["Command:", self.command[:600], ""])
         if self.reason:
             lines.extend(["Reason:", self.reason[:600], ""])
-        lines.append("Choose a button, or reply with 1, 2, 3, y, p, or esc.")
+        lines.append("Choose a button, or reply with the visible number/shortcut.")
         return "\n".join(lines)

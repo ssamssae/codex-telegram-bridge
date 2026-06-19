@@ -31,7 +31,7 @@ import threading
 import time
 import urllib.parse
 import urllib.request
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any
 
@@ -50,6 +50,7 @@ VIDEO_EXTENSIONS = {".mp4", ".mov", ".m4v", ".webm", ".avi", ".mkv"}
 MEDIA_ATTACHMENT_EXTENSIONS = IMAGE_ATTACHMENT_EXTENSIONS | AUDIO_EXTENSIONS | VIDEO_EXTENSIONS
 VOICE_ATTACHMENT_EXTENSIONS = {".ogg", ".oga", ".opus"}
 APPROVAL_CALLBACK_PREFIX = "crb_approval"
+CHOICE_CALLBACK_PREFIX = "crb_choice"
 ANSI_RE = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]")
 MARKDOWN_LOCAL_PATH_RE = re.compile(r"!?\[[^\]]*]\((?P<path>[^)\n]+)\)")
 MEDIA_ATTACHMENT_SUFFIX_RE = "|".join(
@@ -492,6 +493,58 @@ class TelegramClient:
             reply_markup=json.dumps({"inline_keyboard": buttons}, ensure_ascii=False),
         )
 
+    def send_choice_prompt(self, prompt: ChoicePrompt) -> int | None:
+        buttons = [
+            [
+                {
+                    "text": f"{option.value}. {option.short_label}",
+                    "callback_data": (
+                        f"{CHOICE_CALLBACK_PREFIX}:{prompt.short_signature}:{option.value}"
+                    ),
+                }
+            ]
+            for option in prompt.options
+        ]
+        reply_markup = json.dumps({"inline_keyboard": buttons}, ensure_ascii=False)
+        payload = self.call(
+            "sendMessage",
+            chat_id=self.chat_id,
+            text=self.with_emoji_prefix(prompt.telegram_text()),
+            reply_markup=reply_markup,
+        )
+        result = payload.get("result") if isinstance(payload, dict) else None
+        if isinstance(result, dict) and isinstance(result.get("message_id"), int):
+            return int(result["message_id"])
+        return None
+
+    def update_choice_prompt(
+        self,
+        message_id: int | None,
+        prompt: ChoicePrompt,
+        status_text: str,
+        selected: ChoiceOption | None = None,
+    ) -> None:
+        if message_id is None:
+            return
+        if selected:
+            buttons = [
+                [
+                    {
+                        "text": f"✅ {selected.value}. {selected.short_label}",
+                        "callback_data": f"{CHOICE_CALLBACK_PREFIX}:done:{selected.value}",
+                    }
+                ]
+            ]
+        else:
+            buttons = []
+        self.call(
+            "editMessageText",
+            chat_id=self.chat_id,
+            message_id=message_id,
+            text=self.with_emoji_prefix(f"{prompt.telegram_text()}\n\n{status_text}"),
+            reply_markup=json.dumps({"inline_keyboard": buttons}, ensure_ascii=False),
+        )
+
 
 class CodexRepl:
     def __init__(self, config: Config) -> None:
@@ -564,6 +617,23 @@ class CodexRepl:
         self.tmux("send-keys", "-t", self.config.pane_target, normalized)
         time.sleep(0.1)
         self.tmux("send-keys", "-t", self.config.pane_target, "Enter")
+
+    def send_choice_option(self, prompt: ChoicePrompt, option: ChoiceOption) -> None:
+        if option.key:
+            self.send_approval_key(option.key)
+            return
+
+        selected = prompt.selected_option()
+        if selected is not None:
+            delta = option.index - selected.index
+            key = "Down" if delta > 0 else "Up"
+            for _ in range(abs(delta)):
+                self.tmux("send-keys", "-t", self.config.pane_target, key)
+                time.sleep(0.05)
+            self.tmux("send-keys", "-t", self.config.pane_target, "Enter")
+            return
+
+        self.send_approval_key(option.value)
 
     def session_file(self) -> Path:
         pid = self.pane_pid()
@@ -752,6 +822,135 @@ def clean_pane_lines(screen: str) -> list[str]:
     return [ANSI_RE.sub("", line).rstrip() for line in screen.splitlines()]
 
 
+@dataclass(frozen=True)
+class ParsedScreenOption:
+    value: str
+    label: str
+    key: str
+    index: int
+    line_index: int
+    selected: bool = False
+
+
+OPTION_LINE_RE = re.compile(
+    r"^(?:(?:\[(?P<bracket>[A-Za-z0-9]{1,3})\])|(?P<value>[A-Za-z0-9]{1,3})[\.\)])\s+"
+    r"(?P<label>.+?)\s*$"
+)
+CHOICE_HINT_RE = re.compile(
+    r"\b("
+    r"press\s+enter|enter\s+to\s+confirm|esc\s+to\s+cancel|escape\s+to\s+cancel|"
+    r"use\s+(?:the\s+)?(?:arrow|up|down|↑|↓)|select(?:\s+one)?|choose(?:\s+one)?|"
+    r"confirm\s+or\s+cancel"
+    r")\b",
+    re.IGNORECASE,
+)
+YES_NO_RE = re.compile(
+    r"(?:\[(?P<bracket>[yYnN]/[yYnN])\]|\((?P<paren>y/n|n/y|yes/no|no/yes)\)|\b(?P<plain>y/n|n/y|yes/no|no/yes)\b)",
+    re.IGNORECASE,
+)
+SHORTCUT_WORDS = {
+    "y",
+    "n",
+    "yes",
+    "no",
+    "p",
+    "a",
+    "all",
+    "always",
+    "esc",
+    "escape",
+    "enter",
+    "return",
+    "tab",
+    "space",
+}
+
+
+def is_choice_hint_line(line: str) -> bool:
+    return bool(CHOICE_HINT_RE.search(line.strip()))
+
+
+def split_trailing_shortcut(label: str, value: str) -> tuple[str, str]:
+    match = re.search(r"\(([^()]+)\)\s*$", label)
+    if not match:
+        return label.strip(), ""
+    raw = match.group(1).strip()
+    lowered = raw.lower()
+    if (
+        lowered in SHORTCUT_WORDS
+        or lowered == value.lower()
+        or re.fullmatch(r"[A-Za-z0-9]", raw)
+    ):
+        return label[: match.start()].rstrip(), lowered
+    return label.strip(), ""
+
+
+def is_option_boundary(line: str) -> bool:
+    stripped = line.strip()
+    if not stripped:
+        return True
+    if is_choice_hint_line(stripped):
+        return True
+    return stripped.startswith(("Reason:", "$ ", "Command:", "Would you like to run"))
+
+
+def parse_screen_options(lines: list[str]) -> list[ParsedScreenOption]:
+    options: list[ParsedScreenOption] = []
+    current: dict[str, Any] | None = None
+
+    def flush() -> None:
+        nonlocal current
+        if current is None:
+            return
+        raw_label = " ".join(part.strip() for part in current["label_parts"] if part.strip())
+        label, key = split_trailing_shortcut(raw_label, str(current["value"]))
+        options.append(
+            ParsedScreenOption(
+                value=str(current["value"]),
+                label=label,
+                key=key,
+                index=len(options),
+                line_index=int(current["line_index"]),
+                selected=bool(current["selected"]),
+            )
+        )
+        current = None
+
+    for line_index, raw_line in enumerate(lines):
+        stripped = raw_line.strip()
+        selected = stripped.startswith(("›", ">"))
+        normalized = stripped[1:].strip() if selected else stripped
+        match = OPTION_LINE_RE.match(normalized)
+        if match:
+            flush()
+            value = match.group("bracket") or match.group("value") or ""
+            current = {
+                "value": value,
+                "label_parts": [match.group("label")],
+                "line_index": line_index,
+                "selected": selected,
+            }
+            continue
+        if current is not None and not is_option_boundary(stripped):
+            current["label_parts"].append(stripped)
+            continue
+        flush()
+
+    flush()
+    return options
+
+
+def approval_fallback_key(option: ParsedScreenOption) -> str:
+    label = option.label.lower()
+    if "don't ask" in label or "do not ask" in label:
+        return "p"
+    if label.startswith("yes") or "proceed" in label:
+        return "y"
+    if label.startswith("no"):
+        return "esc"
+    return option.value.lower()
+
+
 def parse_approval_prompt(screen: str, ttl_seconds: int = 300) -> ApprovalRequest | None:
     lines = clean_pane_lines(screen)
     trigger_index = -1
@@ -765,7 +964,7 @@ def parse_approval_prompt(screen: str, ttl_seconds: int = 300) -> ApprovalReques
     window = lines[trigger_index : trigger_index + 24]
     reason = ""
     command = ""
-    options: list[ApprovalOption] = []
+    parsed_options = parse_screen_options(window)
 
     for line in window:
         stripped = line.strip()
@@ -776,23 +975,16 @@ def parse_approval_prompt(screen: str, ttl_seconds: int = 300) -> ApprovalReques
             command = stripped
             continue
 
-        option_line = stripped.lstrip("›>•* ")
-        match = re.match(r"(?P<number>[123])\.\s*(?P<label>.+?)\s*$", option_line)
-        if not match:
-            continue
-        number = match.group("number")
-        label = match.group("label").strip()
-        shortcut = ""
-        shortcut_match = re.search(r"\(([^()]+)\)\s*$", label)
-        if shortcut_match:
-            shortcut = shortcut_match.group(1).strip().lower()
-            label = label[: shortcut_match.start()].rstrip()
-        if not shortcut:
-            shortcut = {"1": "y", "2": "p", "3": "esc"}[number]
-        options.append(ApprovalOption(number=number, label=label, key=shortcut))
-
-    found_numbers = {option.number for option in options}
-    if not {"1", "2", "3"}.issubset(found_numbers):
+    options = [
+        ApprovalOption(
+            number=option.value,
+            label=option.label,
+            key=option.key or approval_fallback_key(option),
+        )
+        for option in parsed_options
+        if option.value.isdigit()
+    ]
+    if len(options) < 2:
         return None
 
     signature_source = "\n".join(
@@ -809,6 +1001,97 @@ def parse_approval_prompt(screen: str, ttl_seconds: int = 300) -> ApprovalReques
         command=command,
         reason=reason,
         options=tuple(options),
+        ttl_seconds=ttl_seconds,
+    )
+
+
+def parse_yes_no_choice_prompt(lines: list[str], ttl_seconds: int = 300) -> ChoicePrompt | None:
+    for line in reversed(lines[-24:]):
+        stripped = line.strip()
+        if not stripped or not ("?" in stripped or is_choice_hint_line(stripped)):
+            continue
+        match = YES_NO_RE.search(stripped)
+        if not match:
+            continue
+        raw = match.group("bracket") or match.group("paren") or match.group("plain") or "y/n"
+        first, second = [part.strip() for part in raw.split("/", 1)]
+        options: list[ChoiceOption] = []
+        for value in (first, second):
+            lowered = value.lower()
+            label = "Yes" if lowered.startswith("y") else "No"
+            options.append(
+                ChoiceOption(
+                    value=lowered[0],
+                    label=label,
+                    key=lowered[0],
+                    index=len(options),
+                    selected=value.isupper(),
+                )
+            )
+        signature_source = "\n".join(
+            [
+                stripped,
+                *[f"{option.value}:{option.label}:{option.key}" for option in options],
+            ]
+        )
+        signature = hashlib.sha256(signature_source.encode("utf-8", errors="replace")).hexdigest()
+        return ChoicePrompt.create(
+            choice_id=signature,
+            source_head="codex_repl",
+            title=stripped,
+            options=tuple(options),
+            ttl_seconds=ttl_seconds,
+        )
+    return None
+
+
+def parse_choice_prompt(screen: str, ttl_seconds: int = 300) -> ChoicePrompt | None:
+    if parse_approval_prompt(screen, ttl_seconds=ttl_seconds):
+        return None
+
+    lines = clean_pane_lines(screen)
+    tail_start = max(0, len(lines) - 40)
+    tail = lines[tail_start:]
+    yes_no = parse_yes_no_choice_prompt(tail, ttl_seconds=ttl_seconds)
+    if yes_no:
+        return yes_no
+
+    parsed_options = parse_screen_options(tail)
+    if len(parsed_options) < 2:
+        return None
+    has_selected = any(option.selected for option in parsed_options)
+    has_hint = any(is_choice_hint_line(line) for line in tail)
+    if not has_selected and not has_hint:
+        return None
+
+    first_line_index = min(option.line_index for option in parsed_options)
+    title_candidates = [line.strip() for line in tail[:first_line_index] if line.strip()]
+    title = title_candidates[-1] if title_candidates else "Select one option"
+    options = tuple(
+        ChoiceOption(
+            value=option.value,
+            label=option.label,
+            key=option.key,
+            index=option.index,
+            selected=option.selected,
+        )
+        for option in parsed_options[:12]
+    )
+    signature_source = "\n".join(
+        [
+            title,
+            *[
+                f"{option.value}:{option.label}:{option.key}:{int(option.selected)}"
+                for option in options
+            ],
+        ]
+    )
+    signature = hashlib.sha256(signature_source.encode("utf-8", errors="replace")).hexdigest()
+    return ChoicePrompt.create(
+        choice_id=signature,
+        source_head="codex_repl",
+        title=title,
+        options=options,
         ttl_seconds=ttl_seconds,
     )
 
@@ -869,6 +1152,80 @@ class TelegramPrompt:
     kind: str = "text"
 
 
+@dataclass(frozen=True)
+class ChoiceOption:
+    value: str
+    label: str
+    key: str = ""
+    index: int = 0
+    selected: bool = False
+
+    @property
+    def short_label(self) -> str:
+        label = self.label.strip()
+        return label[:40] or self.value
+
+
+@dataclass(frozen=True)
+class ChoicePrompt:
+    choice_id: str
+    source_head: str
+    title: str
+    options: tuple[ChoiceOption, ...]
+    expires_at: float
+    cancelled: bool = False
+
+    @classmethod
+    def create(
+        cls,
+        choice_id: str,
+        source_head: str,
+        title: str,
+        options: tuple[ChoiceOption, ...],
+        ttl_seconds: int,
+        now: float | None = None,
+    ) -> "ChoicePrompt":
+        base = time.time() if now is None else now
+        return cls(
+            choice_id=choice_id,
+            source_head=source_head,
+            title=title,
+            options=options,
+            expires_at=base + max(1, ttl_seconds),
+        )
+
+    @property
+    def short_signature(self) -> str:
+        return self.choice_id[:16]
+
+    def is_expired(self, now: float | None = None) -> bool:
+        current = time.time() if now is None else now
+        return current >= self.expires_at
+
+    def is_active(self, now: float | None = None) -> bool:
+        return not self.cancelled and not self.is_expired(now)
+
+    def cancel(self) -> "ChoicePrompt":
+        return replace(self, cancelled=True)
+
+    def option(self, value: str) -> ChoiceOption | None:
+        lowered = value.strip().lower()
+        for item in self.options:
+            if item.value.lower() == lowered or item.key.lower() == lowered:
+                return item
+        return None
+
+    def selected_option(self) -> ChoiceOption | None:
+        return next((item for item in self.options if item.selected), None)
+
+    def telegram_text(self) -> str:
+        lines = [f"{self.source_head} is waiting for a selection.", ""]
+        if self.title:
+            lines.extend(["Prompt:", self.title[:600], ""])
+        lines.append("Choose a button, or reply with the visible number/letter/shortcut.")
+        return "\n".join(lines)
+
+
 class Bridge:
     def __init__(self, config: Config, telegram: TelegramClient, repl: CodexRepl) -> None:
         self.config = config
@@ -881,11 +1238,15 @@ class Bridge:
         self.exec_lock = threading.Lock()
         self.typing_lock = threading.Lock()
         self.approval_lock = threading.Lock()
+        self.choice_lock = threading.Lock()
         self.repl_typing_stop: threading.Event | None = None
         self.pending_telegram: list[str] = []
         self.pending_approval: ApprovalRequest | None = None
         self.pending_approval_message_id: int | None = None
         self.resolved_approval_ids: set[str] = set()
+        self.pending_choice: ChoicePrompt | None = None
+        self.pending_choice_message_id: int | None = None
+        self.resolved_choice_ids: set[str] = set()
         self.stop_event = threading.Event()
         self.current_origin: str | None = None
         self.suppress_until_user = False
@@ -1032,12 +1393,30 @@ class Bridge:
     def approval_loop(self) -> None:
         while not self.stop_event.is_set():
             try:
+                screen = self.head.capture_pane()
                 prompt = parse_approval_prompt(
-                    self.head.capture_pane(),
+                    screen,
+                    ttl_seconds=self.config.approval_ttl_seconds,
+                )
+                choice_prompt = None if prompt else parse_choice_prompt(
+                    screen,
                     ttl_seconds=self.config.approval_ttl_seconds,
                 )
                 should_send = False
                 if prompt:
+                    with self.choice_lock:
+                        choice_to_clear = self.pending_choice
+                        choice_message_id = self.pending_choice_message_id
+                        if choice_to_clear is not None:
+                            log("CHOICE", "choice prompt cleared by approval")
+                            if choice_to_clear.choice_id not in self.resolved_choice_ids:
+                                self.telegram.update_choice_prompt(
+                                    choice_message_id,
+                                    choice_to_clear,
+                                    "Selection prompt is no longer active.",
+                                )
+                        self.pending_choice = None
+                        self.pending_choice_message_id = None
                     with self.approval_lock:
                         previous = self.pending_approval
                         if previous is None or previous.approval_id != prompt.approval_id:
@@ -1053,6 +1432,38 @@ class Bridge:
                                 and self.pending_approval.approval_id == prompt.approval_id
                             ):
                                 self.pending_approval_message_id = message_id
+                elif choice_prompt:
+                    with self.approval_lock:
+                        prompt_to_clear = self.pending_approval
+                        message_id = self.pending_approval_message_id
+                        if prompt_to_clear is not None:
+                            log("APPROV", "approval prompt cleared by choice")
+                            if prompt_to_clear.approval_id not in self.resolved_approval_ids:
+                                self.telegram.update_approval_prompt(
+                                    message_id,
+                                    prompt_to_clear,
+                                    "Approval prompt is no longer active.",
+                                )
+                        self.pending_approval = None
+                        self.pending_approval_message_id = None
+                    with self.choice_lock:
+                        previous_choice = self.pending_choice
+                        if (
+                            previous_choice is None
+                            or previous_choice.choice_id != choice_prompt.choice_id
+                        ):
+                            self.pending_choice = choice_prompt
+                            self.pending_choice_message_id = None
+                            should_send = True
+                    if should_send:
+                        log("CHOICE", f"choice prompt detected {choice_prompt.short_signature}")
+                        message_id = self.telegram.send_choice_prompt(choice_prompt)
+                        with self.choice_lock:
+                            if (
+                                self.pending_choice
+                                and self.pending_choice.choice_id == choice_prompt.choice_id
+                            ):
+                                self.pending_choice_message_id = message_id
                 else:
                     with self.approval_lock:
                         prompt_to_clear = self.pending_approval
@@ -1067,6 +1478,19 @@ class Bridge:
                                 )
                         self.pending_approval = None
                         self.pending_approval_message_id = None
+                    with self.choice_lock:
+                        choice_to_clear = self.pending_choice
+                        message_id = self.pending_choice_message_id
+                        if choice_to_clear is not None:
+                            log("CHOICE", "choice prompt cleared")
+                            if choice_to_clear.choice_id not in self.resolved_choice_ids:
+                                self.telegram.update_choice_prompt(
+                                    message_id,
+                                    choice_to_clear,
+                                    "Selection prompt is no longer active.",
+                                )
+                        self.pending_choice = None
+                        self.pending_choice_message_id = None
             except Exception as exc:  # noqa: BLE001
                 log("APPROV", f"watch error: {exc}")
             self.stop_event.wait(1.0)
@@ -1076,6 +1500,31 @@ class Bridge:
         if value.startswith("/approve"):
             parts = value.split(maxsplit=1)
             value = parts[1].strip() if len(parts) > 1 else ""
+        with self.approval_lock:
+            prompt = self.pending_approval
+        if prompt is not None:
+            aliases = {
+                "yes": "y",
+                "yep": "y",
+                "yeah": "y",
+                "no": "n",
+                "nope": "n",
+                "cancel": "esc",
+                "escape": "esc",
+            }
+            candidates = {value}
+            if value in aliases:
+                candidates.add(aliases[value])
+            if value in {"n", "no", "nope", "cancel", "esc", "escape"}:
+                candidates.add("esc")
+            for option in prompt.options:
+                values = {option.number.lower(), option.key.lower()}
+                if option.label:
+                    values.add(option.label.lower())
+                    if option.label.lower().startswith("no"):
+                        values.add("no")
+                if candidates & values:
+                    return option.number
         aliases = {
             "1": "1",
             "y": "1",
@@ -1182,6 +1631,8 @@ class Bridge:
 
     def handle_callback_query(self, callback: dict[str, Any]) -> bool:
         data = str(callback.get("data") or "")
+        if data.startswith(f"{CHOICE_CALLBACK_PREFIX}:"):
+            return self.handle_choice_callback_query(callback)
         if not data.startswith(f"{APPROVAL_CALLBACK_PREFIX}:"):
             return False
         message = callback.get("message") if isinstance(callback.get("message"), dict) else {}
@@ -1215,6 +1666,152 @@ class Bridge:
         if not choice:
             return False
         return self.handle_approval_choice(choice)
+
+    def choice_from_text(self, text: str, prompt: ChoicePrompt) -> str | None:
+        value = text.strip().lower()
+        if value.startswith("/choose"):
+            parts = value.split(maxsplit=1)
+            value = parts[1].strip() if len(parts) > 1 else ""
+        aliases = {
+            "yes": "y",
+            "yep": "y",
+            "yeah": "y",
+            "no": "n",
+            "nope": "n",
+            "cancel": "esc",
+            "escape": "esc",
+        }
+        candidates = {value}
+        if value in aliases:
+            candidates.add(aliases[value])
+        for option in prompt.options:
+            values = {option.value.lower(), option.key.lower()}
+            if option.label:
+                values.add(option.label.lower())
+            if candidates & values:
+                return option.value
+        return None
+
+    def handle_choice_choice(
+        self,
+        choice: str,
+        signature: str | None = None,
+        callback_query_id: str | None = None,
+    ) -> bool:
+        with self.choice_lock:
+            prompt = self.pending_choice
+            if prompt and not prompt.is_active():
+                self.pending_choice = prompt.cancel()
+            message_id = self.pending_choice_message_id
+        if not prompt:
+            if callback_query_id:
+                self.telegram.call(
+                    "answerCallbackQuery",
+                    callback_query_id=callback_query_id,
+                    text="No active Codex selection prompt.",
+                )
+            return False
+        if not prompt.is_active():
+            self.telegram.update_choice_prompt(
+                message_id,
+                prompt,
+                "⏳ Selection expired. Please trigger it again if you still need it.",
+            )
+            if callback_query_id:
+                self.telegram.call(
+                    "answerCallbackQuery",
+                    callback_query_id=callback_query_id,
+                    text="That selection prompt expired.",
+                )
+            return True
+        if signature and signature != prompt.short_signature:
+            if callback_query_id:
+                self.telegram.call(
+                    "answerCallbackQuery",
+                    callback_query_id=callback_query_id,
+                    text="That selection prompt is no longer active.",
+                )
+            return True
+        if prompt.choice_id in self.resolved_choice_ids:
+            if callback_query_id:
+                self.telegram.call(
+                    "answerCallbackQuery",
+                    callback_query_id=callback_query_id,
+                    text="This selection was already sent.",
+                )
+            return True
+
+        option = prompt.option(choice)
+        if option is None:
+            return False
+        try:
+            self.repl.send_choice_option(prompt, option)
+        except Exception as exc:  # noqa: BLE001
+            log("CHOICE", f"choice failed: {exc}")
+            self.telegram.send(f"Codex selection failed: {exc}")
+            if callback_query_id:
+                self.telegram.call(
+                    "answerCallbackQuery",
+                    callback_query_id=callback_query_id,
+                    text="Selection failed.",
+                )
+            return True
+
+        log("CHOICE", f"choice {choice} -> {option.key or option.value}")
+        self.telegram.update_choice_prompt(
+            message_id,
+            prompt,
+            f"✅ Selected {option.value}. {option.short_label}",
+            selected=option,
+        )
+        with self.choice_lock:
+            if self.pending_choice and self.pending_choice.choice_id == prompt.choice_id:
+                self.resolved_choice_ids.add(prompt.choice_id)
+                self.pending_choice = prompt.cancel()
+                self.pending_choice_message_id = None
+        if callback_query_id:
+            self.telegram.call(
+                "answerCallbackQuery",
+                callback_query_id=callback_query_id,
+                text=f"Sent choice {choice} to Codex.",
+            )
+        else:
+            self.telegram.send(f"Sent Codex selection {choice}: {option.short_label}")
+        return True
+
+    def handle_choice_callback_query(self, callback: dict[str, Any]) -> bool:
+        data = str(callback.get("data") or "")
+        message = callback.get("message") if isinstance(callback.get("message"), dict) else {}
+        chat = message.get("chat") if isinstance(message.get("chat"), dict) else {}
+        if str(chat.get("id")) != self.config.chat_id:
+            return True
+        parts = data.split(":")
+        if len(parts) != 3:
+            return True
+        _prefix, signature, choice = parts
+        if signature == "done":
+            if callback.get("id"):
+                self.telegram.call(
+                    "answerCallbackQuery",
+                    callback_query_id=str(callback.get("id") or ""),
+                    text="This selection was already sent.",
+                )
+            return True
+        return self.handle_choice_choice(
+            choice,
+            signature=signature,
+            callback_query_id=str(callback.get("id") or ""),
+        )
+
+    def handle_choice_text(self, text: str) -> bool:
+        with self.choice_lock:
+            prompt = self.pending_choice
+        if prompt is None:
+            return False
+        choice = self.choice_from_text(text, prompt)
+        if not choice:
+            return False
+        return self.handle_choice_choice(choice)
 
     def run_codex_image(self, prompt: str, image_path: Path) -> str:
         self.config.state_dir.mkdir(parents=True, exist_ok=True)
@@ -1770,6 +2367,8 @@ class Bridge:
                 if not prompt.text.strip():
                     continue
                 if self.handle_approval_text(prompt.text):
+                    continue
+                if self.handle_choice_text(prompt.text):
                     continue
                 if prompt.image_path and self.config.image_mode == "exec":
                     self.handle_image_prompt(prompt)
