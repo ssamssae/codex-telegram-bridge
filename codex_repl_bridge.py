@@ -20,6 +20,7 @@ import json
 import mimetypes
 import os
 import re
+import secrets
 import signal
 import shlex
 import shutil
@@ -38,10 +39,16 @@ from typing import Any
 HOME = Path.home()
 NODE_EMOJI_LINES = {"\U0001f34e", "\U0001f3ed", "\U0001fa9f", "\U0001f5a5", "\U0001f4bb", "\U0001f916"}
 IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".webp", ".gif"}
+IMAGE_ATTACHMENT_EXTENSIONS = IMAGE_EXTENSIONS | {".bmp", ".tif", ".tiff"}
 AUDIO_EXTENSIONS = {".ogg", ".oga", ".opus", ".mp3", ".m4a", ".aac", ".wav", ".flac", ".weba"}
 VIDEO_EXTENSIONS = {".mp4", ".mov", ".m4v", ".webm", ".avi", ".mkv"}
 APPROVAL_CALLBACK_PREFIX = "crb_approval"
 ANSI_RE = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]")
+MARKDOWN_LOCAL_PATH_RE = re.compile(r"!?\[[^\]]*]\((?P<path>[^)\n]+)\)")
+RAW_LOCAL_IMAGE_PATH_RE = re.compile(
+    r"(?P<path>(?:file://)?/(?:[^\s\])<>\"']+?)(?:\.png|\.jpe?g|\.webp|\.gif|\.bmp|\.tiff?))",
+    re.IGNORECASE,
+)
 
 
 def env(name: str, default: str | None = None) -> str | None:
@@ -55,6 +62,17 @@ def int_env(name: str, default: int, minimum: int = 0) -> int:
     except (TypeError, ValueError):
         return default
     return value if value >= minimum else default
+
+
+def path_env_list(raw: str | None, fallback: list[Path]) -> tuple[Path, ...]:
+    if not raw:
+        return tuple(path.expanduser().resolve() for path in fallback)
+    paths = []
+    for item in raw.split(os.pathsep):
+        item = item.strip()
+        if item:
+            paths.append(Path(item).expanduser().resolve())
+    return tuple(paths)
 
 
 def now_ts() -> str:
@@ -160,6 +178,8 @@ class Config:
     audio_transcribe_cmd: str | None
     video_frame_count: int
     typing_max_seconds: int
+    attachment_roots: tuple[Path, ...]
+    max_attachment_bytes: int
     telegram_chunk: int
     poll_timeout: int
     start_at_end: bool
@@ -172,15 +192,17 @@ class Config:
         chat_id = env("CRB_CHAT_ID") or env("TAB_CHAT_ID")
         if not chat_id:
             raise RuntimeError("TAB_CHAT_ID is required")
+        state_dir = Path(
+            env("CRB_STATE_DIR", env("TAB_STATE_DIR", "~/.local/state/telegram-agent-bridge") or "")
+            or ""
+        ).expanduser()
+        workdir = Path(env("TAB_WORKDIR", str(HOME)) or str(HOME)).expanduser()
         return cls(
             node=node,
             emoji=env("CRB_EMOJI", env("TAB_PREFIX", default_emoji) or default_emoji) or "",
             token_file=Path(token_file_raw).expanduser() if token_file_raw else None,
             chat_id=chat_id,
-            state_dir=Path(
-                env("CRB_STATE_DIR", env("TAB_STATE_DIR", "~/.local/state/telegram-agent-bridge") or "")
-                or ""
-            ).expanduser(),
+            state_dir=state_dir,
             tmux_bin=env("CRB_TMUX_BIN", "tmux") or "tmux",
             tmux_socket=env("CRB_TMUX_SOCKET", env("TAB_AGENT_TMUX_SOCKET", "codex") or "codex")
             or "codex",
@@ -197,6 +219,15 @@ class Config:
             audio_transcribe_cmd=env("CRB_AUDIO_TRANSCRIBE_CMD"),
             video_frame_count=int_env("CRB_VIDEO_FRAME_COUNT", 3, minimum=1),
             typing_max_seconds=int_env("CRB_TYPING_MAX_SECONDS", 1800, minimum=30),
+            attachment_roots=path_env_list(
+                env("CRB_ATTACHMENT_ROOTS"),
+                [state_dir, workdir, Path("/tmp")],
+            ),
+            max_attachment_bytes=int_env(
+                "CRB_MAX_ATTACHMENT_BYTES",
+                50 * 1024 * 1024,
+                minimum=1024,
+            ),
             telegram_chunk=int_env("CRB_TG_CHUNK", 4096, minimum=512),
             poll_timeout=int_env("CRB_TG_POLL_TIMEOUT", 2, minimum=1),
             start_at_end=(env("CRB_START_AT_END", "1") or "1").lower()
@@ -246,6 +277,52 @@ class TelegramClient:
             except Exception as exc:  # noqa: BLE001
                 if attempt == 2:
                     log("TGERR", f"{method} failed: {exc}")
+                    return None
+                time.sleep(2)
+        return None
+
+    def call_multipart(
+        self,
+        method: str,
+        fields: dict[str, str],
+        file_field: str,
+        file_path: Path,
+    ) -> dict[str, Any] | None:
+        boundary = "----crb" + secrets.token_hex(16)
+        parts: list[bytes] = []
+        for name, value in fields.items():
+            parts.append(f"--{boundary}\r\n".encode())
+            parts.append(f'Content-Disposition: form-data; name="{name}"\r\n\r\n'.encode())
+            parts.append(str(value).encode("utf-8"))
+            parts.append(b"\r\n")
+
+        filename = file_path.name
+        content_type = mimetypes.guess_type(filename)[0] or "application/octet-stream"
+        parts.append(f"--{boundary}\r\n".encode())
+        parts.append(
+            (
+                f'Content-Disposition: form-data; name="{file_field}"; '
+                f'filename="{filename}"\r\n'
+            ).encode()
+        )
+        parts.append(f"Content-Type: {content_type}\r\n\r\n".encode())
+        parts.append(file_path.read_bytes())
+        parts.append(b"\r\n")
+        parts.append(f"--{boundary}--\r\n".encode())
+
+        request = urllib.request.Request(
+            f"{self.api}/{method}",
+            data=b"".join(parts),
+            headers={"Content-Type": f"multipart/form-data; boundary={boundary}"},
+        )
+        for attempt in range(3):
+            try:
+                with urllib.request.urlopen(request, timeout=60) as response:
+                    payload = json.load(response)
+                return payload if isinstance(payload, dict) else None
+            except Exception as exc:  # noqa: BLE001
+                if attempt == 2:
+                    log("TGERR", f"{method} upload failed: {exc}")
                     return None
                 time.sleep(2)
         return None
@@ -305,6 +382,22 @@ class TelegramClient:
     def send(self, text: str) -> None:
         for chunk in self.chunks(text):
             self.call("sendMessage", chat_id=self.chat_id, text=chunk)
+
+    def send_local_attachment(self, path: Path, max_bytes: int) -> bool:
+        try:
+            size = path.stat().st_size
+        except OSError:
+            return False
+        if size > max_bytes:
+            log("ATTACH", f"skip {path}: file too large ({size} bytes)")
+            return False
+
+        suffix = path.suffix.lower()
+        if suffix in {".jpg", ".jpeg", ".png", ".webp"} and size <= 10 * 1024 * 1024:
+            payload = self.call_multipart("sendPhoto", {"chat_id": self.chat_id}, "photo", path)
+        else:
+            payload = self.call_multipart("sendDocument", {"chat_id": self.chat_id}, "document", path)
+        return bool(payload and payload.get("ok"))
 
     def send_approval_prompt(self, prompt: "ApprovalPrompt") -> None:
         buttons = [
@@ -481,6 +574,63 @@ def newest_codex_tui_session() -> Path | None:
 
 def normalize_prompt(text: str) -> str:
     return (text or "").replace("\r\n", "\n").strip()
+
+
+def is_relative_to(path: Path, root: Path) -> bool:
+    try:
+        path.relative_to(root)
+        return True
+    except ValueError:
+        return False
+
+
+def normalize_local_path_candidate(raw: str) -> Path | None:
+    value = raw.strip().strip("<>\"'")
+    if not value:
+        return None
+    if value.startswith("file://"):
+        value = urllib.parse.unquote(urllib.parse.urlparse(value).path)
+    else:
+        value = urllib.parse.unquote(value)
+    if " " in value and not Path(value).exists():
+        value = value.split(" ", 1)[0].strip()
+    path = Path(value).expanduser()
+    return path if path.is_absolute() else None
+
+
+def extract_local_image_paths(
+    text: str,
+    roots: tuple[Path, ...],
+    max_bytes: int,
+) -> list[Path]:
+    candidates: list[str] = []
+    for match in MARKDOWN_LOCAL_PATH_RE.finditer(text or ""):
+        candidates.append(match.group("path"))
+    for match in RAW_LOCAL_IMAGE_PATH_RE.finditer(text or ""):
+        candidates.append(match.group("path"))
+
+    out: list[Path] = []
+    seen: set[Path] = set()
+    resolved_roots = tuple(root.expanduser().resolve() for root in roots)
+    for raw in candidates:
+        path = normalize_local_path_candidate(raw)
+        if path is None or path.suffix.lower() not in IMAGE_ATTACHMENT_EXTENSIONS:
+            continue
+        try:
+            resolved = path.resolve()
+            stat = resolved.stat()
+        except OSError:
+            continue
+        if not resolved.is_file() or stat.st_size <= 0 or stat.st_size > max_bytes:
+            continue
+        if not any(is_relative_to(resolved, root) for root in resolved_roots):
+            log("ATTACH", f"skip outside allowed roots: {resolved}")
+            continue
+        if resolved in seen:
+            continue
+        seen.add(resolved)
+        out.append(resolved)
+    return out
 
 
 @dataclass(frozen=True)
@@ -698,9 +848,21 @@ class Bridge:
             return
         origin = self.current_origin or "terminal"
         log("SEND", f"Telegram mirror from {origin}")
-        self.telegram.send(answer)
+        self.send_answer(answer)
         self.current_origin = None
         self.suppress_until_user = True
+
+    def send_answer(self, answer: str) -> None:
+        self.telegram.send(answer)
+        attachments = extract_local_image_paths(
+            answer,
+            self.config.attachment_roots,
+            self.config.max_attachment_bytes,
+        )
+        for path in attachments:
+            log("ATTACH", f"send {path}")
+            if not self.telegram.send_local_attachment(path, self.config.max_attachment_bytes):
+                log("ATTACH", f"send failed: {path}")
 
     def process_line(self, line: str) -> None:
         try:
@@ -968,7 +1130,7 @@ class Bridge:
             return
         finally:
             stop_typing.set()
-        self.telegram.send(answer)
+        self.send_answer(answer)
 
     def image_prompt_text(self, caption_text: str, image_path: Path) -> str:
         header = (

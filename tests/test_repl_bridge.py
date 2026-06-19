@@ -27,6 +27,8 @@ def config(tmpdir, **overrides):
         "audio_transcribe_cmd": None,
         "video_frame_count": 3,
         "typing_max_seconds": 30,
+        "attachment_roots": (Path(tmpdir),),
+        "max_attachment_bytes": 50 * 1024 * 1024,
         "telegram_chunk": 4096,
         "poll_timeout": 2,
         "start_at_end": True,
@@ -40,6 +42,7 @@ class FakeTelegram:
         self.downloads = []
         self.sent = []
         self.calls = []
+        self.attachments = []
 
     def download_file(
         self,
@@ -64,6 +67,10 @@ class FakeTelegram:
     def call(self, method, **params):
         self.calls.append((method, params))
         return {"ok": True, "result": True}
+
+    def send_local_attachment(self, path, max_bytes):
+        self.attachments.append((path, max_bytes))
+        return True
 
 
 class FakeRepl:
@@ -240,6 +247,30 @@ Press enter to confirm or esc to cancel
             self.assertTrue(bridge.handle_callback_query(callback))
             self.assertEqual(fake_repl.approval_keys, ["esc"])
             self.assertEqual(telegram.calls[0][0], "answerCallbackQuery")
+
+    def test_extracts_and_sends_local_markdown_image_path(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            base = Path(tmpdir)
+            image = base / "screenshot.png"
+            image.write_bytes(b"fake-png")
+            telegram = FakeTelegram()
+            bridge = repl.Bridge(config(tmpdir), telegram, None)
+
+            bridge.send_answer(f"Here: [screenshot.png]({image})")
+
+            self.assertEqual(len(telegram.attachments), 1)
+            self.assertEqual(telegram.attachments[0][0], image)
+
+    def test_local_image_attachment_respects_allowed_roots(self):
+        with tempfile.TemporaryDirectory() as allowed, tempfile.TemporaryDirectory() as outside:
+            outside_image = Path(outside) / "screenshot.png"
+            outside_image.write_bytes(b"fake-png")
+            found = repl.extract_local_image_paths(
+                f"Here: [screenshot.png]({outside_image})",
+                (Path(allowed),),
+                50 * 1024 * 1024,
+            )
+            self.assertEqual(found, [])
 
 
 if __name__ == "__main__":

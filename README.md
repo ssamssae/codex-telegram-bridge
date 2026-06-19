@@ -11,7 +11,7 @@ mirrored back to Telegram.
 Install with `pipx`, then run the setup wizard:
 
 ```bash
-pipx install "git+https://github.com/ssamssae/codex-telegram-bridge.git@v0.2.3"
+pipx install "git+https://github.com/ssamssae/codex-telegram-bridge.git@v0.2.4"
 codex-telegram-bridge setup
 codex-telegram-bridge doctor
 ```
@@ -32,7 +32,7 @@ or normal prompts to your bot.
 Release: <https://github.com/ssamssae/codex-telegram-bridge/releases/latest>
 
 Promo video:
-<https://github.com/ssamssae/codex-telegram-bridge/releases/download/v0.2.3/codex-telegram-bridge-promo-v0.2.3.mp4>
+<https://github.com/ssamssae/codex-telegram-bridge/releases/download/v0.2.4/codex-telegram-bridge-promo-v0.2.4.mp4>
 
 The repo also includes a simpler one-shot `codex exec` mode. Generic one-shot
 command backends can adapt Claude Code, Aider, Gemini CLI, or your own terminal
@@ -57,6 +57,10 @@ Codex approval prompt
   -> detect "Would you like to run..." in the tmux pane
   -> send Telegram buttons for 1/2/3
   -> inject the selected key back into the Codex TUI
+
+Answer attachments
+  -> detect local image paths in final answers
+  -> send the actual image to Telegram with sendPhoto/sendDocument
 ```
 
 ## Quickstart
@@ -118,7 +122,9 @@ The wizard will:
 Default setup mode is `repl`, which supports the visible Codex CLI transcript,
 Telegram text, image prompts, video thumbnails/metadata, audio-file delivery,
 optional audio transcription, answer mirroring, Telegram `typing...`, and Codex
-approval prompts.
+approval prompts. If a final answer contains a local image path or markdown
+image/link to an allowed image file, the bridge also sends the actual image to
+Telegram.
 
 4. Check the installation:
 
@@ -256,6 +262,8 @@ Required settings are intentionally small and explicit.
 | `CRB_TMUX_SESSION` | repl only | `codex` | tmux session or target for the visible Codex TUI. |
 | `CRB_TMUX_SUBMIT_KEY` | repl only | `Tab` | key sent after pasting Telegram prompts into Codex. |
 | `CRB_AUDIO_TRANSCRIBE_CMD` | no | empty | Optional command template for audio transcription. Use `{path}` for the media file. |
+| `CRB_ATTACHMENT_ROOTS` | no | state dir, workdir, `/tmp` | `:`-separated roots where answer-referenced local image files may be uploaded from. |
+| `CRB_MAX_ATTACHMENT_BYTES` | no | `52428800` | Maximum size for local answer attachments. |
 
 ## REPL Mode Media Support
 
@@ -268,6 +276,7 @@ Required settings are intentionally small and explicit.
 - Telegram `typing...` while Codex is generating
 - terminal-origin Codex prompts mirrored back to Telegram
 - Codex command approval prompts mirrored to Telegram with 1/2/3 buttons
+- local image paths in final answers sent as Telegram attachments
 
 Images are saved under `TAB_STATE_DIR` and passed to Codex as local paths in the
 prompt. Video messages include the local video path, Telegram thumbnail when
@@ -304,6 +313,20 @@ Telegram message with buttons:
 
 You can also reply with `1`, `2`, `3`, `y`, `p`, `esc`, or `/approve 1`. The
 bridge injects the matching key back into the Codex TUI.
+
+## Answer Image Attachments
+
+If Codex answers with a local image path, the bridge sends the text answer and
+then uploads the actual image to Telegram. This works for raw paths and markdown
+links such as:
+
+```text
+Here is the screenshot: [screenshot.png](/home/user/project/screenshot.png)
+```
+
+For safety, only image files under `CRB_ATTACHMENT_ROOTS` are uploaded. By
+default those roots are the bridge state directory, `TAB_WORKDIR`, and `/tmp`.
+Large files are skipped according to `CRB_MAX_ATTACHMENT_BYTES`.
 
 ## Backends
 
