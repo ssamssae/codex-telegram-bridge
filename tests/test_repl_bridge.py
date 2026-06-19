@@ -181,13 +181,13 @@ class ReplBridgeTests(unittest.TestCase):
 
             self.assertEqual(codex.sent_keys(), ["Enter"])
 
-    def test_clear_composer_sends_ctrl_u(self):
+    def test_clear_composer_clears_both_sides_of_cursor(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             codex = RecordingCodexRepl(config(tmpdir))
 
             codex.clear_composer()
 
-            self.assertEqual(codex.sent_keys(), ["C-u"])
+            self.assertEqual(codex.sent_keys(), ["C-e", "C-u", "C-a", "C-k"])
 
     def test_slash_command_token_ignores_multiline_prompts(self):
         self.assertEqual(repl.slash_command_token("/model"), "/model")

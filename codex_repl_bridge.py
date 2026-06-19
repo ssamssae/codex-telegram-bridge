@@ -686,7 +686,11 @@ class CodexRepl:
 
     def clear_composer(self) -> None:
         self.verify()
-        self.tmux("send-keys", "-t", self.config.pane_target, "C-u")
+        # C-u only clears text before the cursor. After a rejected slash command,
+        # Codex can leave the cursor before stale text, so clear both sides.
+        for key in ("C-e", "C-u", "C-a", "C-k"):
+            self.tmux("send-keys", "-t", self.config.pane_target, key)
+            time.sleep(0.05)
         time.sleep(0.1)
 
     def capture_pane(self, lines: int = 80) -> str:
