@@ -110,8 +110,13 @@ class SetupWizardTests(unittest.TestCase):
         runner = Path("/tmp/telegram-agent-bridge-run")
         self.assertIn(str(runner), setup.systemd_unit_content(runner))
         self.assertIn(str(runner), setup.launchd_plist_content(runner))
+        self.assertIn("telegram-agent-bridge-watchdog.service", setup.watchdog_systemd_timer_content())
+        self.assertIn(str(setup.WATCHDOG_SCRIPT), setup.watchdog_systemd_service_content())
+        self.assertIn(str(setup.WATCHDOG_SCRIPT), setup.watchdog_launchd_plist_content())
         self.assertNotIn("TAB_BOT_TOKEN", setup.systemd_unit_content(runner))
         self.assertNotIn("TAB_BOT_TOKEN", setup.launchd_plist_content(runner))
+        self.assertNotIn("TAB_BOT_TOKEN", setup.watchdog_systemd_service_content())
+        self.assertNotIn("TAB_BOT_TOKEN", setup.watchdog_launchd_plist_content())
 
     def test_noninteractive_setup_writes_config_and_runner(self):
         with tempfile.TemporaryDirectory() as tmpdir:

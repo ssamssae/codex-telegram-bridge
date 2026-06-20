@@ -18,7 +18,7 @@ the remote control when you are away from the keyboard.
 Install with `pipx`, then run the setup wizard:
 
 ```bash
-pipx install "git+https://github.com/ssamssae/codex-telegram-bridge.git@v0.3.10"
+pipx install "git+https://github.com/ssamssae/codex-telegram-bridge.git@v0.3.11"
 codex-telegram-bridge setup
 codex-telegram-bridge doctor
 ```
@@ -38,7 +38,7 @@ or normal prompts to your bot.
 
 Release: <https://github.com/ssamssae/codex-telegram-bridge/releases/latest>
 
-Promo video:
+Promo video from the v0.3 demo release:
 <https://github.com/ssamssae/codex-telegram-bridge/releases/download/v0.3.10/codex-telegram-bridge-promo-v0.3.10.mp4>
 
 The repo also includes a simpler one-shot `codex exec` mode. Internally, the
@@ -85,6 +85,8 @@ Answer media attachments
   -> send the actual media with sendPhoto/sendVideo/sendVoice/sendAudio
 
 Service restart
+  -> run a local watchdog every 60 seconds when installed as a service
+  -> restart or kickstart the bridge if the user service is inactive
   -> load a persistent JSONL cursor and final-answer dedup ring
   -> resume from the cursor when it still matches the current session file
   -> otherwise tail-scan recent JSONL after the latest user event
@@ -159,6 +161,7 @@ The wizard will:
 - write a private `~/.config/telegram-agent-bridge.env` with mode `0600`
 - install `~/.local/bin/telegram-agent-bridge-run`
 - install and start a user service with systemd on Linux/WSL or launchd on macOS
+- install a watchdog timer/LaunchAgent that recovers an inactive bridge service
 - send a setup-complete test message
 
 Default setup mode is `repl`, which supports the visible Codex CLI transcript,
@@ -363,6 +366,32 @@ must be inside `CRB_BACKFILL_WINDOW_SEC` and absent from the dedup ring. This
 reduces the common failure mode where Codex finished while the Telegram bridge
 service was restarting.
 
+## Service Watchdog
+
+When the setup wizard installs a background service, it also installs a small
+watchdog.
+
+On Linux and WSL, the wizard writes:
+
+- `~/.config/systemd/user/telegram-agent-bridge-watchdog.service`
+- `~/.config/systemd/user/telegram-agent-bridge-watchdog.timer`
+
+The timer runs every 60 seconds. If `telegram-agent-bridge.service` is inactive,
+the watchdog starts it and writes a status file at
+`~/.local/state/telegram-agent-bridge/watchdog.status`.
+
+On macOS, the wizard writes:
+
+- `~/Library/LaunchAgents/com.user.telegram-agent-bridge-watchdog.plist`
+
+The LaunchAgent runs every 60 seconds. If
+`com.user.telegram-agent-bridge` is not running, the watchdog kickstarts it and
+writes the same status file.
+
+This covers the failure mode where the bridge was explicitly stopped or left
+inactive. The normal `Restart=always` and launchd `KeepAlive` settings still
+handle ordinary crashes.
+
 ## REPL Mode Approval Prompts
 
 When Codex is not running in a bypass/YOLO approval mode, it may pause inside the
@@ -483,7 +512,10 @@ To add a real resumable backend, create a class like `CodexBackend`, set `suppor
 Examples live in:
 
 - `examples/systemd/telegram-agent-bridge.service`
+- `examples/systemd/telegram-agent-bridge-watchdog.service`
+- `examples/systemd/telegram-agent-bridge-watchdog.timer`
 - `examples/launchd/com.user.telegram-agent-bridge.plist`
+- `examples/launchd/com.user.telegram-agent-bridge-watchdog.plist`
 
 Review the `PATH` in each file. Services often start with a smaller environment than your shell, so include the directory where `codex`, `claude`, `aider`, or `gemini` is installed.
 
@@ -495,8 +527,7 @@ These are product directions, not promises in the current release:
 - inline Telegram settings for mode and delivery preferences
 - richer Markdown fallback when Telegram rejects formatted messages
 - optional multi-user and topic allowlists for small private groups
-- stronger restart recovery for full process supervision, beyond final-answer
-  backfill
+- richer service supervision dashboards and remote health summaries
 - idle cleanup and maintenance commands for long-running bridge installs
 
 ## Security Notes

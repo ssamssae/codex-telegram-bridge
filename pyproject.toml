@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "codex-telegram-bridge"
-version = "0.3.10"
+version = "0.3.11"
 description = "Control a live Codex CLI session from Telegram, with an adapter foundation for other terminal AI agents."
 readme = "README.md"
 requires-python = ">=3.10"
@@ -37,6 +37,7 @@ Issues = "https://github.com/ssamssae/codex-telegram-bridge/issues"
 [project.scripts]
 codex-telegram-bridge = "bridge_setup:main"
 telegram-agent-bridge = "bridge_setup:main"
+codex-telegram-bridge-watchdog = "bridge_watchdog:main"
 
 [tool.setuptools]
 packages = [
@@ -45,6 +46,7 @@ packages = [
 ]
 py-modules = [
   "bridge_setup",
+  "bridge_watchdog",
   "telegram_agent_bridge",
   "codex_repl_bridge",
   "codex_audio_transcribe"

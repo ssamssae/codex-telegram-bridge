@@ -11,6 +11,7 @@ Why it is useful:
 - Mirror terminal-origin prompts too, so Telegram stays informed even when work starts locally.
 - Handle visible Codex approvals and selection prompts with Telegram buttons.
 - Backfill the latest eligible final answer after a bridge service restart.
+- Recover an inactive bridge service with a local watchdog timer.
 - Avoid webhooks and exposed ports; it uses Telegram polling.
 - Run the core bridge with only the Python standard library.
 
@@ -30,7 +31,7 @@ https://github.com/ssamssae/codex-telegram-bridge/releases/latest
 Install sketch:
 
 ```bash
-pipx install "git+https://github.com/ssamssae/codex-telegram-bridge.git@v0.3.10"
+pipx install "git+https://github.com/ssamssae/codex-telegram-bridge.git@v0.3.11"
 codex-telegram-bridge setup
 codex-telegram-bridge doctor
 ```

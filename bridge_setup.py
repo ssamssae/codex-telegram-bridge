@@ -24,10 +24,14 @@ from typing import Any, Callable
 APP_NAME = "telegram-agent-bridge"
 SERVICE_NAME = "telegram-agent-bridge.service"
 LAUNCHD_LABEL = "com.user.telegram-agent-bridge"
+WATCHDOG_SERVICE_NAME = "telegram-agent-bridge-watchdog.service"
+WATCHDOG_TIMER_NAME = "telegram-agent-bridge-watchdog.timer"
+WATCHDOG_LAUNCHD_LABEL = "com.user.telegram-agent-bridge-watchdog"
 REPO_DIR = Path(__file__).resolve().parent
 EXEC_BRIDGE_SCRIPT = REPO_DIR / "telegram_agent_bridge.py"
 REPL_BRIDGE_SCRIPT = REPO_DIR / "codex_repl_bridge.py"
 AUDIO_TRANSCRIBE_SCRIPT = REPO_DIR / "codex_audio_transcribe.py"
+WATCHDOG_SCRIPT = REPO_DIR / "bridge_watchdog.py"
 SETUP_TOTAL_STEPS = 6
 
 
@@ -55,8 +59,20 @@ def default_systemd_unit_file() -> Path:
     return Path.home() / ".config" / "systemd" / "user" / SERVICE_NAME
 
 
+def default_watchdog_systemd_service_file() -> Path:
+    return Path.home() / ".config" / "systemd" / "user" / WATCHDOG_SERVICE_NAME
+
+
+def default_watchdog_systemd_timer_file() -> Path:
+    return Path.home() / ".config" / "systemd" / "user" / WATCHDOG_TIMER_NAME
+
+
 def default_launchd_plist_file() -> Path:
     return Path.home() / "Library" / "LaunchAgents" / f"{LAUNCHD_LABEL}.plist"
+
+
+def default_watchdog_launchd_plist_file() -> Path:
+    return Path.home() / "Library" / "LaunchAgents" / f"{WATCHDOG_LAUNCHD_LABEL}.plist"
 
 
 def out(message: str = "") -> None:
@@ -450,6 +466,80 @@ def launchd_plist_content(runner_file: Path) -> str:
     )
 
 
+def watchdog_python_command() -> str:
+    python_bin = sys.executable or shutil.which("python3") or "python3"
+    return f"{shell_quote(python_bin)} {shell_quote(WATCHDOG_SCRIPT)}"
+
+
+def watchdog_systemd_service_content() -> str:
+    return "\n".join(
+        [
+            "[Unit]",
+            "Description=Telegram Agent Bridge watchdog",
+            "After=network-online.target",
+            "Wants=network-online.target",
+            "",
+            "[Service]",
+            "Type=oneshot",
+            "Environment=PYTHONUNBUFFERED=1",
+            "Environment=PATH=%h/.local/bin:%h/.npm-global/bin:/usr/local/bin:/opt/homebrew/bin:/usr/bin:/bin",
+            f"ExecStart={watchdog_python_command()}",
+            "",
+        ]
+    )
+
+
+def watchdog_systemd_timer_content() -> str:
+    return "\n".join(
+        [
+            "[Unit]",
+            "Description=Run Telegram Agent Bridge watchdog",
+            "",
+            "[Timer]",
+            "OnBootSec=30s",
+            "OnUnitActiveSec=60s",
+            "AccuracySec=15s",
+            f"Unit={WATCHDOG_SERVICE_NAME}",
+            "",
+            "[Install]",
+            "WantedBy=timers.target",
+            "",
+        ]
+    )
+
+
+def watchdog_launchd_plist_content() -> str:
+    log_file = Path("/tmp") / f"{APP_NAME}-watchdog.log"
+    python_bin = sys.executable or shutil.which("python3") or "python3"
+    return "\n".join(
+        [
+            '<?xml version="1.0" encoding="UTF-8"?>',
+            '<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" '
+            '"http://www.apple.com/DTDs/PropertyList-1.0.dtd">',
+            '<plist version="1.0">',
+            '<dict>',
+            '    <key>Label</key>',
+            f'    <string>{WATCHDOG_LAUNCHD_LABEL}</string>',
+            '    <key>ProgramArguments</key>',
+            '    <array>',
+            f'        <string>{python_bin}</string>',
+            f'        <string>{WATCHDOG_SCRIPT}</string>',
+            '    </array>',
+            '    <key>RunAtLoad</key>',
+            '    <true/>',
+            '    <key>StartInterval</key>',
+            '    <integer>60</integer>',
+            '    <key>StandardOutPath</key>',
+            f'    <string>{log_file}</string>',
+            '    <key>StandardErrorPath</key>',
+            f'    <string>{log_file}</string>',
+            '</dict>',
+            '</plist>',
+            '',
+        ]
+    )
+
+
 def run_command(cmd: list[str], check: bool = False) -> subprocess.CompletedProcess[str]:
     return subprocess.run(cmd, capture_output=True, text=True, check=check)
 
@@ -484,6 +574,38 @@ def install_service(
     return None
 
 
+def install_watchdog(
+    *,
+    start: bool = True,
+    os_name: str | None = None,
+    run: Callable[..., subprocess.CompletedProcess[str]] = run_command,
+) -> Path | None:
+    os_name = os_name or platform.system()
+    if os_name == "Linux":
+        service_file = default_watchdog_systemd_service_file()
+        timer_file = default_watchdog_systemd_timer_file()
+        write_text_atomic(service_file, watchdog_systemd_service_content(), mode=0o644)
+        write_text_atomic(timer_file, watchdog_systemd_timer_content(), mode=0o644)
+        run(["systemctl", "--user", "daemon-reload"])
+        run(["systemctl", "--user", "enable", WATCHDOG_TIMER_NAME])
+        if start:
+            run(["systemctl", "--user", "start", WATCHDOG_TIMER_NAME])
+            run(["systemctl", "--user", "start", WATCHDOG_SERVICE_NAME])
+        return timer_file
+
+    if os_name == "Darwin":
+        plist_file = default_watchdog_launchd_plist_file()
+        write_text_atomic(plist_file, watchdog_launchd_plist_content(), mode=0o644)
+        if start:
+            domain = f"gui/{os.getuid()}/{WATCHDOG_LAUNCHD_LABEL}"
+            run(["launchctl", "bootout", domain])
+            run(["launchctl", "bootstrap", f"gui/{os.getuid()}", str(plist_file)])
+        return plist_file
+
+    warn(f"watchdog install is not automated for {os_name}")
+    return None
+
+
 def uninstall_service(
     *,
     os_name: str | None = None,
@@ -512,6 +634,34 @@ def uninstall_service(
     warn(f"service uninstall is not automated for {os_name}")
 
 
+def uninstall_watchdog(
+    *,
+    os_name: str | None = None,
+    run: Callable[..., subprocess.CompletedProcess[str]] = run_command,
+) -> None:
+    os_name = os_name or platform.system()
+    if os_name == "Linux":
+        run(["systemctl", "--user", "disable", "--now", WATCHDOG_TIMER_NAME])
+        for path in (default_watchdog_systemd_service_file(), default_watchdog_systemd_timer_file()):
+            try:
+                path.unlink()
+            except OSError:
+                pass
+        run(["systemctl", "--user", "daemon-reload"])
+        return
+
+    if os_name == "Darwin":
+        domain = f"gui/{os.getuid()}/{WATCHDOG_LAUNCHD_LABEL}"
+        run(["launchctl", "bootout", domain])
+        try:
+            default_watchdog_launchd_plist_file().unlink()
+        except OSError:
+            pass
+        return
+
+    warn(f"watchdog uninstall is not automated for {os_name}")
+
+
 def service_status(
     *,
     os_name: str | None = None,
@@ -529,6 +679,29 @@ def service_status(
             if stripped.startswith("state = "):
                 return stripped.removeprefix("state = ").strip()
         return "unknown"
+    return "manual"
+
+
+def watchdog_status(
+    *,
+    os_name: str | None = None,
+    run: Callable[..., subprocess.CompletedProcess[str]] = run_command,
+) -> str:
+    os_name = os_name or platform.system()
+    if os_name == "Linux":
+        proc = run(["systemctl", "--user", "is-active", WATCHDOG_TIMER_NAME])
+        return (proc.stdout or proc.stderr or "unknown").strip()
+    if os_name == "Darwin":
+        proc = run(["launchctl", "print", f"gui/{os.getuid()}/{WATCHDOG_LAUNCHD_LABEL}"])
+        if proc.returncode != 0:
+            return "missing"
+        text = (proc.stdout or proc.stderr or "").splitlines()
+        for line in text:
+            stripped = line.strip()
+            if stripped.startswith("state = "):
+                state = stripped.removeprefix("state = ").strip()
+                return "loaded" if state == "not running" else state
+        return "loaded"
     return "manual"
 
 
@@ -700,6 +873,11 @@ def setup_bridge(options: SetupOptions, api_call: ApiCall = telegram_call) -> in
             ok(f"installed service: {installed}")
             if options.start_service:
                 ok(f"service status: {service_status()}")
+        watchdog = install_watchdog(start=options.start_service)
+        if watchdog:
+            ok(f"installed watchdog: {watchdog}")
+            if options.start_service:
+                ok(f"watchdog status: {watchdog_status()}")
     else:
         warn("service install skipped; run the runner manually")
         setup_command(str(options.runner_file))
@@ -810,6 +988,13 @@ def doctor(config_file: Path, runner_file: Path, api_call: ApiCall = telegram_ca
         warn(f"service status: {status}")
         warnings += 1
 
+    wd_status = watchdog_status()
+    if wd_status in {"active", "running", "loaded"}:
+        ok(f"watchdog status: {wd_status}")
+    else:
+        warn(f"watchdog status: {wd_status}")
+        warnings += 1
+
     out("")
     out(f"doctor complete: {failures} failure(s), {warnings} warning(s)")
     return 2 if failures else 0
@@ -824,6 +1009,8 @@ def uninstall(
 ) -> int:
     if not yes and not prompt_yes_no("Stop and remove telegram-agent-bridge service?", default=True):
         raise SetupError("uninstall cancelled")
+    uninstall_watchdog()
+    ok("watchdog removed or stopped")
     uninstall_service()
     ok("service removed or stopped")
 
