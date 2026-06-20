@@ -3,18 +3,22 @@
 [![Release](https://img.shields.io/github/v/release/ssamssae/codex-telegram-bridge)](https://github.com/ssamssae/codex-telegram-bridge/releases)
 [![License: MIT](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
 
-Run Codex from Telegram. Built to support other terminal AI agents.
+Control your live Codex CLI session from Telegram. Built to support other
+terminal AI agents.
 
-Codex Telegram Bridge is a phone remote for your local Codex CLI: send prompts,
-screenshots, videos, and voice notes from Telegram, then get Codex final answers
-and generated media back in Telegram. The default mode keeps your visible Codex
-CLI REPL and Telegram in sync, so the terminal transcript stays readable while
-the phone stays useful.
+Codex Telegram Bridge is a phone remote for your already-running Codex TUI. Send
+prompts, screenshots, videos, and voice notes from Telegram; the bridge pastes
+them into your visible tmux Codex session, watches Codex's structured JSONL
+session log, then mirrors final answers and generated media back to Telegram.
+
+Default `repl` mode is REPL sync, not a separate hidden chat. Your terminal
+stays the source of truth, the transcript remains readable, and Telegram becomes
+the remote control when you are away from the keyboard.
 
 Install with `pipx`, then run the setup wizard:
 
 ```bash
-pipx install "git+https://github.com/ssamssae/codex-telegram-bridge.git@v0.3.9"
+pipx install "git+https://github.com/ssamssae/codex-telegram-bridge.git@v0.3.10"
 codex-telegram-bridge setup
 codex-telegram-bridge doctor
 ```
@@ -35,7 +39,7 @@ or normal prompts to your bot.
 Release: <https://github.com/ssamssae/codex-telegram-bridge/releases/latest>
 
 Promo video:
-<https://github.com/ssamssae/codex-telegram-bridge/releases/download/v0.3.9/codex-telegram-bridge-promo-v0.3.9.mp4>
+<https://github.com/ssamssae/codex-telegram-bridge/releases/download/v0.3.10/codex-telegram-bridge-promo-v0.3.10.mp4>
 
 The repo also includes a simpler one-shot `codex exec` mode. Internally, the
 bridge now has an adapter foundation for future Claude Code, Aider, Gemini CLI,
@@ -79,7 +83,27 @@ Answer media attachments
   -> detect local image/video/audio paths in final answers
   -> hide the local path in Telegram
   -> send the actual media with sendPhoto/sendVideo/sendVoice/sendAudio
+
+Service restart
+  -> load a persistent JSONL cursor and final-answer dedup ring
+  -> resume from the cursor when it still matches the current session file
+  -> otherwise tail-scan recent JSONL after the latest user event
+  -> backfill the latest eligible final answer once, then resume live watching
 ```
+
+## Why REPL Sync
+
+- You can keep using the local Codex TUI normally while Telegram mirrors the
+  final answers.
+- Telegram-origin prompts are pasted into the same visible transcript instead of
+  disappearing into a separate hidden thread.
+- Terminal-origin prompts can still show Telegram `typing...` and final-answer
+  mirrors, so the phone stays informed even when the work started locally.
+- Approval and selection prompts remain real Codex TUI prompts; the bridge sends
+  Telegram buttons for the visible options and injects the selected key back
+  into tmux.
+- The daemon uses polling and a single `chat_id` allowlist, so no public webhook
+  or inbound port is required.
 
 ## Quickstart
 
@@ -140,9 +164,12 @@ The wizard will:
 Default setup mode is `repl`, which supports the visible Codex CLI transcript,
 Telegram text, image prompts, video thumbnails/metadata, audio-file delivery,
 optional audio transcription, answer mirroring, Telegram `typing...`, and Codex
-approval prompts. If a final answer contains a local image, video, or audio path
-or markdown link to an allowed media file, the bridge hides that local path from
-the Telegram text and sends the actual media attachment.
+approval prompts. It also stores a JSONL cursor so a daemon restart can resume
+watching the current Codex session and backfill the latest eligible final answer
+that was produced while the bridge was down. If a final answer contains a local
+image, video, or audio path or markdown link to an allowed media file, the
+bridge hides that local path from the Telegram text and sends the actual media
+attachment.
 
 4. Check the installation:
 
@@ -280,8 +307,16 @@ Required settings are intentionally small and explicit.
 | `CRB_TMUX_SOCKET` | repl only | `codex` | tmux socket for the visible Codex TUI. |
 | `CRB_TMUX_SESSION` | repl only | `codex` | tmux session or target for the visible Codex TUI. |
 | `CRB_TMUX_SUBMIT_KEY` | repl only | `Tab` | key sent after pasting Telegram prompts into Codex. |
+| `CRB_TYPING_MAX_SECONDS` | no | `7200` | Maximum lifetime for repeated Telegram `typing` actions during one visible Codex turn. |
 | `CRB_AUDIO_TRANSCRIBE_CMD` | no | empty | Optional command template for audio transcription. Use `{path}` for the media file. |
 | `CRB_APPROVAL_TTL_SECONDS` | no | `300` | Seconds before a Telegram approval button is treated as stale. |
+| `CRB_STATE_PATH` | no | `TAB_STATE_DIR/codex-repl-bridge-<node>.state.json` | Persistent JSONL cursor and final-answer dedup state for `repl` mode. |
+| `CRB_BACKFILL` | no | `1` | When enabled, startup without a valid cursor tail-scans the current session for a fresh missed final answer. |
+| `CRB_BACKFILL_MAX` | no | `1` | Maximum missed final answers to backfill on startup. Clamped to `1`-`3`. |
+| `CRB_BACKFILL_WINDOW_SEC` | no | `600` | Maximum age for startup backfill candidates. |
+| `CRB_TAIL_SCAN_BYTES` | no | `65536` | Bytes to scan from the end of the Codex JSONL session when cursorless backfill is needed. |
+| `CRB_STATE_RING_CAP` | no | `64` | Number of mirrored final-answer keys retained for deduplication. |
+| `CRB_KILL` | no | `0` | Emergency switch that blocks Telegram answer sends while keeping the process alive. |
 | `CRB_ATTACHMENT_ROOTS` | no | state dir, workdir, `/tmp` | `:`-separated roots where answer-referenced local media files may be uploaded from. |
 | `CRB_MAX_ATTACHMENT_BYTES` | no | `52428800` | Maximum size for local answer attachments. |
 
@@ -314,6 +349,19 @@ python3 bridge_setup.py setup --install-asr
 ```
 
 This is optional because it downloads Python packages and Whisper model files.
+
+## REPL Mode Restart Backfill
+
+In `repl` mode the bridge stores a JSONL cursor and a small final-answer dedup
+ring in `CRB_STATE_PATH`. On restart, if that cursor still matches the current
+Codex session file, the bridge resumes reading from the saved offset.
+
+If there is no valid cursor and `CRB_START_AT_END=1`, the bridge scans the tail
+of the current Codex JSONL session, finds the latest user event, and backfills
+up to `CRB_BACKFILL_MAX` fresh final answers after that user event. Candidates
+must be inside `CRB_BACKFILL_WINDOW_SEC` and absent from the dedup ring. This
+reduces the common failure mode where Codex finished while the Telegram bridge
+service was restarting.
 
 ## REPL Mode Approval Prompts
 
@@ -439,6 +487,18 @@ Examples live in:
 
 Review the `PATH` in each file. Services often start with a smaller environment than your shell, so include the directory where `codex`, `claude`, `aider`, or `gemini` is installed.
 
+## Roadmap
+
+These are product directions, not promises in the current release:
+
+- queue controls for safe queueing, interruption, and side tasks
+- inline Telegram settings for mode and delivery preferences
+- richer Markdown fallback when Telegram rejects formatted messages
+- optional multi-user and topic allowlists for small private groups
+- stronger restart recovery for full process supervision, beyond final-answer
+  backfill
+- idle cleanup and maintenance commands for long-running bridge installs
+
 ## Security Notes
 
 - Treat `TAB_BOT_TOKEN` like a password. Do not commit it, paste it into logs, or share it.
@@ -454,7 +514,8 @@ Review the `PATH` in each file. Services often start with a smaller environment 
 
 ## Development
 
-The runtime uses only the Python standard library.
+The core runtime uses only the Python standard library. The optional `asr`
+extra installs local audio transcription dependencies.
 
 ```bash
 python3 -m unittest discover -s tests

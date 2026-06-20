@@ -32,6 +32,7 @@ import time
 import urllib.parse
 import urllib.request
 from dataclasses import dataclass, replace
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -79,6 +80,15 @@ def int_env(name: str, default: int, minimum: int = 0) -> int:
     return value if value >= minimum else default
 
 
+def bool_env(name: str, default: bool = False) -> bool:
+    fallback = "1" if default else "0"
+    return (env(name, fallback) or fallback).lower() in {"1", "true", "yes", "on"}
+
+
+def clamp(value: int, minimum: int, maximum: int) -> int:
+    return max(minimum, min(maximum, value))
+
+
 def path_env_list(raw: str | None, fallback: list[Path]) -> tuple[Path, ...]:
     if not raw:
         return tuple(path.expanduser().resolve() for path in fallback)
@@ -111,11 +121,38 @@ def read_text(path: Path) -> str:
         return ""
 
 
+def read_json(path: Path) -> dict[str, Any] | None:
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    return payload if isinstance(payload, dict) else None
+
+
 def write_text_atomic(path: Path, value: str | int) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_name(path.name + ".tmp")
     tmp.write_text(str(value), encoding="utf-8")
     tmp.replace(path)
+
+
+def write_json_atomic(path: Path, payload: dict[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(path.name + ".tmp")
+    with tmp.open("w", encoding="utf-8") as handle:
+        json.dump(payload, handle, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+        handle.write("\n")
+        handle.flush()
+        os.fsync(handle.fileno())
+    tmp.replace(path)
+    try:
+        dir_fd = os.open(str(path.parent), os.O_RDONLY)
+    except OSError:
+        return
+    try:
+        os.fsync(dir_fd)
+    finally:
+        os.close(dir_fd)
 
 
 def safe_filename_part(value: str) -> str:
@@ -205,7 +242,7 @@ def extract_codex_context_text(screen: str) -> str:
     for line in status_text.splitlines():
         if line.startswith("Context window:"):
             return f"Codex context\n{line}"
-    return status_text
+    return "Codex context not visible yet."
 
 
 def extract_unrecognized_slash_error(screen: str, command: str) -> str:
@@ -271,6 +308,176 @@ def load_token(token_file: Path | None) -> str:
 
 
 @dataclass(frozen=True)
+class SessionIdentity:
+    path: str
+    dev: int
+    ino: int
+    size: int
+
+
+@dataclass(frozen=True)
+class JsonlEvent:
+    kind: str
+    text: str
+    timestamp: float
+    start: int
+    end: int
+    key: str
+
+
+def session_identity(path: Path) -> SessionIdentity:
+    stat = path.stat()
+    return SessionIdentity(
+        path=str(path),
+        dev=int(stat.st_dev),
+        ino=int(stat.st_ino),
+        size=int(stat.st_size),
+    )
+
+
+def parse_event_timestamp(record: dict[str, Any]) -> float:
+    raw = str(record.get("timestamp") or "")
+    if not raw:
+        return 0.0
+    try:
+        parsed = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+    except ValueError:
+        return 0.0
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.timestamp()
+
+
+def event_dedup_key(record: dict[str, Any], kind: str, text: str) -> str:
+    raw = "\0".join(
+        [
+            str(record.get("timestamp") or ""),
+            kind,
+            (text or "")[:512],
+        ]
+    )
+    return hashlib.sha256(raw.encode("utf-8", errors="replace")).hexdigest()
+
+
+def bridge_state_default(identity: SessionIdentity, offset: int = 0) -> dict[str, Any]:
+    return {
+        "session_path": identity.path,
+        "dev": identity.dev,
+        "ino": identity.ino,
+        "offset": offset,
+        "coord_ring": [],
+        "last_sent_ts": 0,
+    }
+
+
+def ring_values(state: dict[str, Any]) -> list[str]:
+    values = state.get("coord_ring")
+    if not isinstance(values, list):
+        return []
+    return [str(item) for item in values if isinstance(item, str)]
+
+
+def ring_contains(state: dict[str, Any], key: str) -> bool:
+    return key in set(ring_values(state))
+
+
+def ring_push(state: dict[str, Any], key: str, cap: int) -> None:
+    if not key:
+        return
+    ring = [item for item in ring_values(state) if item != key]
+    ring.append(key)
+    state["coord_ring"] = ring[-max(1, cap) :]
+    state["last_sent_ts"] = int(time.time())
+
+
+def cursor_offset_for_state(state: dict[str, Any] | None, identity: SessionIdentity) -> int | None:
+    if not state:
+        return None
+    try:
+        dev = int(state.get("dev"))
+        ino = int(state.get("ino"))
+        offset = int(state.get("offset"))
+    except (TypeError, ValueError):
+        return None
+    if dev != identity.dev or ino != identity.ino:
+        return None
+    if offset < 0 or offset > identity.size:
+        return None
+    return offset
+
+
+def parse_jsonl_event_line(line: str, start: int, end: int) -> JsonlEvent | None:
+    try:
+        record = json.loads(line)
+    except json.JSONDecodeError:
+        return None
+    event = extract_event(record)
+    if not event:
+        return None
+    kind, text = event
+    return JsonlEvent(
+        kind=kind,
+        text=text,
+        timestamp=parse_event_timestamp(record),
+        start=start,
+        end=end,
+        key=event_dedup_key(record, kind, text),
+    )
+
+
+def read_tail_jsonl_events(path: Path, max_bytes: int) -> list[JsonlEvent]:
+    size = path.stat().st_size
+    start = max(0, size - max(1, max_bytes))
+    events: list[JsonlEvent] = []
+    with path.open("r", encoding="utf-8", errors="replace") as handle:
+        handle.seek(start)
+        if start > 0:
+            handle.readline()
+        while True:
+            line_start = handle.tell()
+            line = handle.readline()
+            if not line:
+                break
+            line_end = handle.tell()
+            event = parse_jsonl_event_line(line, line_start, line_end)
+            if event:
+                events.append(event)
+    return events
+
+
+def eligible_backfill_events(
+    events: list[JsonlEvent],
+    state: dict[str, Any],
+    now_epoch: float,
+    window_seconds: int,
+    limit: int,
+) -> list[JsonlEvent]:
+    latest_user_index = None
+    for index, event in enumerate(events):
+        if event.kind == "user":
+            latest_user_index = index
+    if latest_user_index is None:
+        return []
+    after_user = [
+        event
+        for event in events[latest_user_index + 1 :]
+        if event.kind == "assistant" and event.text.strip()
+    ]
+    if not after_user:
+        return []
+    fresh = []
+    for event in after_user:
+        if ring_contains(state, event.key):
+            continue
+        if event.timestamp <= 0:
+            continue
+        age = max(0.0, now_epoch - event.timestamp)
+        if age <= window_seconds:
+            fresh.append(event)
+    return fresh[-max(1, limit) :]
+
+
+@dataclass(frozen=True)
 class Config:
     node: str
     emoji: str
@@ -297,6 +504,13 @@ class Config:
     telegram_chunk: int
     poll_timeout: int
     start_at_end: bool
+    state_path: Path
+    backfill_enabled: bool
+    backfill_max: int
+    backfill_window_sec: int
+    tail_scan_bytes: int
+    state_ring_cap: int
+    bridge_kill: bool
 
     @classmethod
     def from_env(cls) -> "Config":
@@ -311,6 +525,7 @@ class Config:
             or ""
         ).expanduser()
         workdir = Path(env("TAB_WORKDIR", str(HOME)) or str(HOME)).expanduser()
+        default_state_path = state_dir / f"codex-repl-bridge-{node}.state.json"
         return cls(
             node=node,
             emoji=env("CRB_EMOJI", env("TAB_PREFIX", default_emoji) or default_emoji) or "",
@@ -346,8 +561,14 @@ class Config:
             ),
             telegram_chunk=int_env("CRB_TG_CHUNK", 4096, minimum=512),
             poll_timeout=int_env("CRB_TG_POLL_TIMEOUT", 2, minimum=1),
-            start_at_end=(env("CRB_START_AT_END", "1") or "1").lower()
-            in {"1", "true", "yes", "on"},
+            start_at_end=bool_env("CRB_START_AT_END", True),
+            state_path=Path(env("CRB_STATE_PATH", str(default_state_path)) or "").expanduser(),
+            backfill_enabled=bool_env("CRB_BACKFILL", True),
+            backfill_max=clamp(int_env("CRB_BACKFILL_MAX", 1, minimum=1), 1, 3),
+            backfill_window_sec=int_env("CRB_BACKFILL_WINDOW_SEC", 600, minimum=1),
+            tail_scan_bytes=int_env("CRB_TAIL_SCAN_BYTES", 65536, minimum=1024),
+            state_ring_cap=int_env("CRB_STATE_RING_CAP", 64, minimum=1),
+            bridge_kill=bool_env("CRB_KILL", False),
         )
 
     @property
@@ -495,9 +716,12 @@ class TelegramClient:
             rest = rest[self.chunk_size :]
         return out
 
-    def send(self, text: str) -> None:
+    def send(self, text: str) -> bool:
+        ok = True
         for chunk in self.chunks(text):
-            self.call("sendMessage", chat_id=self.chat_id, text=chunk)
+            payload = self.call("sendMessage", chat_id=self.chat_id, text=chunk)
+            ok = ok and bool(payload and payload.get("ok"))
+        return ok
 
     def send_local_attachment(self, path: Path, max_bytes: int) -> bool:
         try:
@@ -1363,6 +1587,8 @@ class Bridge:
         self.suppress_until_user = False
         self.needs_composer_clear = False
         self.session_path: Path | None = None
+        self.session_identity: SessionIdentity | None = None
+        self.bridge_state: dict[str, Any] | None = None
         self.session_pos = 0
 
     def acquire_lock(self) -> None:
@@ -1404,52 +1630,145 @@ class Bridge:
             log("JSONL", "terminal-origin prompt")
             self.begin_repl_typing()
 
-    def handle_assistant_event(self, text: str) -> None:
+    def handle_assistant_event(self, text: str) -> bool:
         self.stop_repl_typing()
         if self.suppress_until_user:
-            return
+            return True
         answer = (text or "").strip()
         if not answer:
-            return
+            return True
         origin = self.current_origin or "terminal"
         log("SEND", f"Telegram mirror from {origin}")
-        self.send_answer(answer)
+        if not self.send_answer(answer):
+            return False
         self.current_origin = None
         self.suppress_until_user = True
+        return True
 
-    def send_answer(self, answer: str) -> None:
+    def send_answer(self, answer: str) -> bool:
+        if self.config.bridge_kill:
+            log("SEND", "blocked by CRB_KILL=1")
+            return False
         attachments = extract_local_attachment_paths(
             answer,
             self.config.attachment_roots,
             self.config.max_attachment_bytes,
         )
-        self.telegram.send(strip_sent_attachment_references(answer, attachments))
+        ok = self.telegram.send(strip_sent_attachment_references(answer, attachments))
+        if not ok:
+            return False
         for path in attachments:
             log("ATTACH", f"send {path}")
             if not self.telegram.send_local_attachment(path, self.config.max_attachment_bytes):
                 log("ATTACH", f"send failed: {path}")
+                ok = False
+        return ok
 
-    def process_line(self, line: str) -> None:
+    def persist_state(self, offset: int | None = None, event_key: str | None = None) -> None:
+        identity = self.session_identity
+        if identity is None:
+            return
+        state = self.bridge_state or bridge_state_default(identity, self.session_pos)
+        state["session_path"] = identity.path
+        state["dev"] = identity.dev
+        state["ino"] = identity.ino
+        if offset is not None:
+            state["offset"] = offset
+        if event_key:
+            ring_push(state, event_key, self.config.state_ring_cap)
+        write_json_atomic(self.config.state_path, state)
+        self.bridge_state = state
+
+    def process_line(
+        self,
+        line: str,
+        line_start: int | None = None,
+        line_end: int | None = None,
+    ) -> bool:
         try:
             record = json.loads(line)
         except json.JSONDecodeError:
-            return
+            return True
         event = extract_event(record)
         if not event:
-            return
+            if line_end is not None:
+                self.persist_state(line_end)
+            return True
         kind, text = event
         if kind == "user":
             self.handle_user_event(text)
+            if line_end is not None:
+                self.persist_state(line_end)
+            return True
         elif kind == "assistant":
-            self.handle_assistant_event(text)
+            key = event_dedup_key(record, kind, text)
+            if self.bridge_state and ring_contains(self.bridge_state, key):
+                log("SEND", "skip duplicate final_answer")
+                if line_end is not None:
+                    self.persist_state(line_end)
+                return True
+            if not self.handle_assistant_event(text):
+                return False
+            if line_end is not None:
+                self.persist_state(line_end, key)
+            return True
+        if line_end is not None:
+            self.persist_state(line_end)
+        return True
 
     def ensure_session_file(self) -> Path:
         path = self.head.session_file()
         if self.session_path != path:
+            identity = session_identity(path)
+            state = read_json(self.config.state_path)
+            cursor = cursor_offset_for_state(state, identity)
             self.session_path = path
-            self.session_pos = path.stat().st_size if self.config.start_at_end else 0
-            log("REPL", f"watching {path}")
+            self.session_identity = identity
+            if state:
+                state["coord_ring"] = ring_values(state)
+            self.bridge_state = state or bridge_state_default(identity)
+            if cursor is not None:
+                self.session_pos = cursor
+                log("REPL", f"watching {path} from cursor {cursor}")
+            else:
+                self.session_pos = identity.size if self.config.start_at_end else 0
+                log("REPL", f"watching {path}")
+                if self.config.start_at_end:
+                    self.backfill_cursorless_session(path, identity)
+                self.persist_state(self.session_pos)
         return path
+
+    def backfill_cursorless_session(self, path: Path, identity: SessionIdentity) -> None:
+        if not self.config.backfill_enabled:
+            log("BACKF", "disabled")
+            return
+        try:
+            events = read_tail_jsonl_events(path, self.config.tail_scan_bytes)
+        except OSError as exc:
+            log("BACKF", f"scan failed: {exc}")
+            return
+        state = self.bridge_state or bridge_state_default(identity)
+        candidates = eligible_backfill_events(
+            events,
+            state,
+            time.time(),
+            self.config.backfill_window_sec,
+            self.config.backfill_max,
+        )
+        if not candidates:
+            log("BACKF", "no eligible final_answer")
+            return
+        for event in candidates:
+            if ring_contains(state, event.key):
+                continue
+            log("BACKF", f"send final_answer at offset {event.start}")
+            if not self.send_answer(event.text):
+                self.session_pos = event.start
+                log("BACKF", "send failed; retry from candidate offset")
+                return
+            ring_push(state, event.key, self.config.state_ring_cap)
+        self.bridge_state = state
+        self.session_pos = identity.size
 
     def jsonl_loop(self) -> None:
         while not self.stop_event.is_set():
@@ -1458,11 +1777,15 @@ class Bridge:
                 with path.open("r", encoding="utf-8", errors="replace") as f:
                     f.seek(self.session_pos)
                     while True:
+                        line_start = f.tell()
                         line = f.readline()
                         if not line:
                             break
-                        self.session_pos = f.tell()
-                        self.process_line(line)
+                        line_end = f.tell()
+                        if not self.process_line(line, line_start, line_end):
+                            self.session_pos = line_start
+                            break
+                        self.session_pos = line_end
             except Exception as exc:  # noqa: BLE001
                 log("JSONL", f"watch error: {exc}")
             time.sleep(0.5)

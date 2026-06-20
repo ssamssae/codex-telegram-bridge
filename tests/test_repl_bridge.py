@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+import json
 import os
 import tempfile
 import unittest
@@ -34,6 +35,13 @@ def config(tmpdir, **overrides):
         "telegram_chunk": 4096,
         "poll_timeout": 2,
         "start_at_end": True,
+        "state_path": Path(tmpdir) / "bridge.state.json",
+        "backfill_enabled": True,
+        "backfill_max": 1,
+        "backfill_window_sec": 600,
+        "tail_scan_bytes": 65536,
+        "state_ring_cap": 64,
+        "bridge_kill": False,
     }
     base.update(overrides)
     return repl.Config(**base)
@@ -64,6 +72,10 @@ class FakeTelegram:
 
     def send(self, text):
         self.sent.append(text)
+        return True
+
+    def send_typing(self):
+        self.calls.append(("sendChatAction", {"action": "typing"}))
 
     def send_approval_prompt(self, prompt):
         self.sent.append(prompt.telegram_text())
@@ -86,6 +98,12 @@ class FakeTelegram:
     def send_local_attachment(self, path, max_bytes):
         self.attachments.append((path, max_bytes))
         return True
+
+
+class FailingAttachmentTelegram(FakeTelegram):
+    def send_local_attachment(self, path, max_bytes):
+        self.attachments.append((path, max_bytes))
+        return False
 
 
 class CaptureTelegram(repl.TelegramClient):
@@ -172,6 +190,10 @@ class ReplBridgeTests(unittest.TestCase):
             self.assertEqual(cfg.emoji, "BOT")
             self.assertEqual(cfg.state_dir, Path(tmpdir))
             self.assertIsNone(cfg.token_file)
+            self.assertEqual(cfg.state_path, Path(tmpdir) / "codex-repl-bridge-public-node.state.json")
+            self.assertTrue(cfg.backfill_enabled)
+            self.assertEqual(cfg.backfill_max, 1)
+            self.assertFalse(cfg.bridge_kill)
 
     def test_slash_command_uses_enter_submit_key(self):
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -283,6 +305,96 @@ class ReplBridgeTests(unittest.TestCase):
             self.assertEqual(fake_repl.cleared, 0)
             self.assertEqual(telegram.sent, [])
 
+    def test_backfill_events_after_latest_user_only(self):
+        now = 1_800_000_000.0
+        identity = repl.SessionIdentity("/tmp/rollout.jsonl", 1, 2, 100)
+        state = repl.bridge_state_default(identity)
+        repl.ring_push(state, "duplicate", 64)
+        events = [
+            repl.JsonlEvent("assistant", "old before user", now - 20, 0, 10, "old"),
+            repl.JsonlEvent("user", "latest prompt", now - 15, 10, 20, "user"),
+            repl.JsonlEvent("assistant", "stale", now - 700, 20, 30, "stale"),
+            repl.JsonlEvent("assistant", "already sent", now - 10, 30, 40, "duplicate"),
+            repl.JsonlEvent("assistant", "fresh", now - 5, 40, 50, "fresh"),
+        ]
+
+        candidates = repl.eligible_backfill_events(
+            events,
+            state,
+            now_epoch=now,
+            window_seconds=600,
+            limit=3,
+        )
+
+        self.assertEqual([event.text for event in candidates], ["fresh"])
+
+    def test_process_line_persists_assistant_dedup(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            cfg = config(tmpdir)
+            telegram = FakeTelegram()
+            bridge = repl.Bridge(cfg, telegram, FakeRepl())
+            identity = repl.SessionIdentity(str(Path(tmpdir) / "rollout.jsonl"), 1, 2, 100)
+            bridge.session_identity = identity
+            bridge.bridge_state = repl.bridge_state_default(identity)
+            record = {
+                "timestamp": "2026-06-20T00:00:00Z",
+                "type": "event_msg",
+                "payload": {
+                    "type": "agent_message",
+                    "phase": "final_answer",
+                    "message": "done",
+                },
+            }
+            line = json.dumps(record) + "\n"
+
+            self.assertTrue(bridge.process_line(line, 0, len(line)))
+            self.assertEqual(telegram.sent, ["done"])
+            state = repl.read_json(cfg.state_path)
+            self.assertIsNotNone(state)
+            assert state is not None
+            self.assertEqual(state["offset"], len(line))
+            self.assertEqual(len(state["coord_ring"]), 1)
+
+            self.assertTrue(bridge.process_line(line, 0, len(line)))
+            self.assertEqual(telegram.sent, ["done"])
+
+    def test_slash_command_answer_still_mirrors_without_pending_match(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            cfg = config(tmpdir)
+            telegram = FakeTelegram()
+            bridge = repl.Bridge(cfg, telegram, FakeRepl())
+            identity = repl.SessionIdentity(str(Path(tmpdir) / "rollout.jsonl"), 1, 2, 100)
+            bridge.session_identity = identity
+            bridge.bridge_state = repl.bridge_state_default(identity)
+            user = {
+                "timestamp": "2026-06-20T00:00:00Z",
+                "type": "event_msg",
+                "payload": {"type": "user_message", "message": "/goal"},
+            }
+            assistant = {
+                "timestamp": "2026-06-20T00:00:01Z",
+                "type": "event_msg",
+                "payload": {
+                    "type": "agent_message",
+                    "phase": "final_answer",
+                    "message": "goal updated",
+                },
+            }
+            user_line = json.dumps(user) + "\n"
+            assistant_line = json.dumps(assistant) + "\n"
+
+            self.assertTrue(bridge.process_line(user_line, 0, len(user_line)))
+            self.assertEqual(bridge.current_origin, "terminal")
+            self.assertTrue(
+                bridge.process_line(
+                    assistant_line,
+                    len(user_line),
+                    len(user_line) + len(assistant_line),
+                )
+            )
+
+            self.assertEqual(telegram.sent, ["goal updated"])
+
     def test_clear_composer_before_telegram_input_always_clears(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             fake_repl = FakeRepl()
@@ -321,6 +433,15 @@ class ReplBridgeTests(unittest.TestCase):
             context,
             "Codex context\nContext window:  45% left (147K used / 258K)",
         )
+
+    def test_extract_codex_context_text_reports_missing_context(self):
+        screen = """
+╭─────────────────────────────╮
+│  >_ OpenAI Codex (v0.141.0) │
+│  Model: gpt-5.5             │
+╰─────────────────────────────╯
+"""
+        self.assertEqual(repl.extract_codex_context_text(screen), "Codex context not visible yet.")
 
     def test_regular_prompt_keeps_configured_submit_key(self):
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -728,6 +849,19 @@ Overwrite existing file? [y/N]
 
             self.assertEqual(len(telegram.attachments), 1)
             self.assertEqual(telegram.sent, ["파일을 첨부했어요."])
+
+    def test_send_answer_returns_false_when_attachment_upload_fails(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            base = Path(tmpdir)
+            image = base / "screenshot.png"
+            image.write_bytes(b"fake-png")
+            telegram = FailingAttachmentTelegram()
+            bridge = repl.Bridge(config(tmpdir), telegram, None)
+
+            self.assertFalse(bridge.send_answer(f"Here: [screenshot.png]({image})"))
+
+            self.assertEqual(telegram.sent, ["Here:"])
+            self.assertEqual(len(telegram.attachments), 1)
 
     def test_hides_and_sends_local_video_path(self):
         with tempfile.TemporaryDirectory() as tmpdir:

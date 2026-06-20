@@ -1,17 +1,25 @@
-# Codex Telegram Bridge — Run Codex from Telegram
+# Codex Telegram Bridge - Control your live Codex CLI from Telegram
 
-Codex Telegram Bridge turns Telegram into a phone remote for your local Codex CLI.
+Codex Telegram Bridge turns Telegram into a phone remote for your already-running
+Codex TUI.
 
 Why it is useful:
 
-- Send a prompt from Telegram and get the final Codex answer back in Telegram.
+- Send a prompt from Telegram and get the final Codex answer back on your phone.
 - Send screenshots, videos, and voice notes without leaving Telegram.
-- Keep a local terminal input path too, so a prompt typed on the machine can be mirrored back to Telegram.
-- Keep the visible Codex REPL transcript readable while Telegram mirrors final answers.
+- Keep the visible tmux Codex transcript as the source of truth.
+- Mirror terminal-origin prompts too, so Telegram stays informed even when work starts locally.
+- Handle visible Codex approvals and selection prompts with Telegram buttons.
+- Backfill the latest eligible final answer after a bridge service restart.
 - Avoid webhooks and exposed ports; it uses Telegram polling.
-- Run with only the Python standard library.
+- Run the core bridge with only the Python standard library.
 
-The product is Codex-first today, with an adapter foundation for other terminal AI agents later. The safety boundary stays simple: one trusted chat id, one bot token, one local machine, and no public web server.
+This is REPL sync, not a separate hidden chat. Telegram controls the same Codex
+session you can see in the terminal.
+
+The product is Codex-first today, with an adapter foundation for other terminal
+AI agents later. The safety boundary stays simple: one trusted chat id, one bot
+token, one local machine, and no public web server.
 
 Repository:
 https://github.com/ssamssae/codex-telegram-bridge
@@ -22,7 +30,7 @@ https://github.com/ssamssae/codex-telegram-bridge/releases/latest
 Install sketch:
 
 ```bash
-pipx install "git+https://github.com/ssamssae/codex-telegram-bridge.git@v0.3.9"
+pipx install "git+https://github.com/ssamssae/codex-telegram-bridge.git@v0.3.10"
 codex-telegram-bridge setup
 codex-telegram-bridge doctor
 ```
