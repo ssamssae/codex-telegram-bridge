@@ -1,9 +1,10 @@
 # Codex Runtime Architecture
 
 This document is the stable contract for Codex Telegram Bridge runtime pieces.
-The project is intentionally Codex-only. Shared runtime modules exist to keep
-Codex REPL sync, approval handling, transport, and workdir locking separated,
-not to present a public multi-agent product surface.
+The project supports Codex only. Other AI CLIs should live in separate
+bridge-specific projects, not as shared modes in this repository. Shared runtime
+modules exist to keep Codex REPL sync, approval handling, transport, and workdir
+locking separated.
 
 ## Goals
 

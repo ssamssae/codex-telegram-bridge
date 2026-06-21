@@ -3,9 +3,9 @@
 [![Release](https://img.shields.io/github/v/release/ssamssae/codex-telegram-bridge)](https://github.com/ssamssae/codex-telegram-bridge/releases)
 [![License: MIT](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
 
-Control your live Codex CLI session from Telegram. This project is intentionally
-Codex-only: the runtime, setup flow, examples, and operational guidance are
-optimized for Codex instead of broad multi-backend relay use.
+Control your live Codex CLI session from Telegram. Only Codex is supported.
+Other AI CLIs are intentionally out of scope; a Claude bridge should be a
+separate Claude-specific program, not a shared mode in this repository.
 
 Codex Telegram Bridge is a phone remote for your already-running Codex TUI. Send
 prompts, screenshots, videos, and voice notes from Telegram; the bridge pastes
@@ -43,7 +43,7 @@ Promo video from the v0.3 demo release:
 <https://github.com/ssamssae/codex-telegram-bridge/releases/download/v0.3.10/codex-telegram-bridge-promo-v0.3.10.mp4>
 
 The repo also includes a simpler one-shot `codex exec` mode. Both modes are
-scoped to Codex so the product surface stays focused and predictable.
+Codex-only by design so maintenance stays focused and predictable.
 
 This is not MCP. It is a small standalone relay daemon. Default `repl` mode:
 
@@ -294,7 +294,7 @@ Required settings are intentionally small and explicit.
 | `TAB_BRIDGE_MODE` | no | `repl` | `repl` for visible Codex CLI sync, or `exec` for text-only one-shot mode. |
 | `TAB_BOT_TOKEN` | yes | none | Telegram bot token from BotFather. Keep it secret. |
 | `TAB_CHAT_ID` | yes | none | The only Telegram chat id allowed to control Codex. Other chats are ignored. |
-| `TAB_AGENT` | no | `codex` | Compatibility setting. Keep this set to `codex`. |
+| `TAB_AGENT` | no | `codex` | Compatibility setting. Only `codex` is supported; other values are rejected. |
 | `TAB_AGENT_CMD` | no | `codex` | Codex command or wrapper command. Split like shell arguments. |
 | `TAB_STATE_DIR` | no | `~/.local/state/telegram-agent-bridge` | Offset and thread-id state directory. |
 | `TAB_PREFIX` | no | empty | Prefix shown on the first Telegram reply chunk, for example an emoji or node label. |
