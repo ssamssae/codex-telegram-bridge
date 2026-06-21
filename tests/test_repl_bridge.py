@@ -2,6 +2,7 @@
 import json
 import os
 import tempfile
+import time
 import unittest
 from pathlib import Path
 
@@ -28,6 +29,7 @@ def config(tmpdir, **overrides):
         "audio_transcribe_cmd": None,
         "video_frame_count": 3,
         "typing_max_seconds": 30,
+        "long_running_progress_seconds": 0,
         "approval_ttl_seconds": 300,
         "workdir": Path(tmpdir),
         "attachment_roots": (Path(tmpdir),),
@@ -394,6 +396,25 @@ class ReplBridgeTests(unittest.TestCase):
             )
 
             self.assertEqual(telegram.sent, ["goal updated"])
+
+    def test_telegram_prompt_tracking_sends_periodic_progress_update(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            cfg = config(tmpdir, long_running_progress_seconds=1)
+            telegram = FakeTelegram()
+            bridge = repl.Bridge(cfg, telegram, FakeRepl())
+
+            try:
+                bridge.begin_telegram_prompt_tracking("run the longer task")
+                deadline = time.monotonic() + 2.5
+                while time.monotonic() < deadline and not telegram.sent:
+                    time.sleep(0.05)
+            finally:
+                bridge.stop_long_running_progress()
+
+            self.assertTrue(telegram.sent)
+            self.assertIn("Still working", telegram.sent[0])
+            self.assertIn("run the longer task", telegram.sent[0])
+            self.assertIn("final answer", telegram.sent[0])
 
     def test_clear_composer_before_telegram_input_always_clears(self):
         with tempfile.TemporaryDirectory() as tmpdir:

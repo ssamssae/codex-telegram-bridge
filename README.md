@@ -18,7 +18,7 @@ the remote control when you are away from the keyboard.
 Install with `pipx`, then run the setup wizard:
 
 ```bash
-pipx install "git+https://github.com/ssamssae/codex-telegram-bridge.git@v0.3.11"
+pipx install "git+https://github.com/ssamssae/codex-telegram-bridge.git@v0.3.12"
 codex-telegram-bridge setup
 codex-telegram-bridge doctor
 ```
@@ -58,6 +58,7 @@ Telegram message/media
 Codex CLI input
   -> JSONL user event
   -> Telegram "typing..." while Codex is working
+  -> periodic "still working" progress updates for long Telegram-origin turns
   -> final answer mirrored to Telegram
 
 Codex approval prompt
@@ -77,7 +78,7 @@ Codex slash command
   -> submit them with Enter instead of the normal queued prompt key
   -> mirror "Unrecognized command" errors back to Telegram
   -> clear the Codex composer before Telegram input so stale typo commands cannot be appended
-  -> keep Telegram typing active for long-running slash commands such as /goal
+  -> keep Telegram typing and progress updates active for long-running commands such as /goal
 
 Answer media attachments
   -> detect local image/video/audio paths in final answers
@@ -311,6 +312,7 @@ Required settings are intentionally small and explicit.
 | `CRB_TMUX_SESSION` | repl only | `codex` | tmux session or target for the visible Codex TUI. |
 | `CRB_TMUX_SUBMIT_KEY` | repl only | `Tab` | key sent after pasting Telegram prompts into Codex. |
 | `CRB_TYPING_MAX_SECONDS` | no | `7200` | Maximum lifetime for repeated Telegram `typing` actions during one visible Codex turn. |
+| `CRB_LONG_RUNNING_PROGRESS_SECONDS` | no | `1800` | Seconds between Telegram progress updates for long-running Telegram-origin REPL prompts. Set `0` to disable. |
 | `CRB_AUDIO_TRANSCRIBE_CMD` | no | empty | Optional command template for audio transcription. Use `{path}` for the media file. |
 | `CRB_APPROVAL_TTL_SECONDS` | no | `300` | Seconds before a Telegram approval button is treated as stale. |
 | `CRB_STATE_PATH` | no | `TAB_STATE_DIR/codex-repl-bridge-<node>.state.json` | Persistent JSONL cursor and final-answer dedup state for `repl` mode. |

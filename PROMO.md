@@ -9,6 +9,7 @@ Why it is useful:
 - Send screenshots, videos, and voice notes without leaving Telegram.
 - Keep the visible tmux Codex transcript as the source of truth.
 - Mirror terminal-origin prompts too, so Telegram stays informed even when work starts locally.
+- Send periodic progress updates for long Telegram-origin Codex turns.
 - Handle visible Codex approvals and selection prompts with Telegram buttons.
 - Backfill the latest eligible final answer after a bridge service restart.
 - Recover an inactive bridge service with a local watchdog timer.
@@ -31,7 +32,7 @@ https://github.com/ssamssae/codex-telegram-bridge/releases/latest
 Install sketch:
 
 ```bash
-pipx install "git+https://github.com/ssamssae/codex-telegram-bridge.git@v0.3.11"
+pipx install "git+https://github.com/ssamssae/codex-telegram-bridge.git@v0.3.12"
 codex-telegram-bridge setup
 codex-telegram-bridge doctor
 ```

@@ -279,6 +279,18 @@ def truncate_text(text: str, limit: int = 12000) -> str:
     return text[:limit].rstrip() + f"\n\n[truncated {len(text) - limit} chars]"
 
 
+def format_long_running_progress_message(prompt: str, elapsed_seconds: float) -> str:
+    label = " ".join((prompt or "").strip().split())
+    label = truncate_text(label, 160)
+    elapsed_minutes = max(1, int(elapsed_seconds // 60))
+    return (
+        "Still working on your Telegram request.\n"
+        f"Task: {label}\n"
+        f"Elapsed: about {elapsed_minutes} min\n"
+        "I will send the final answer when it is ready."
+    )
+
+
 def process_alive(pid: int) -> bool:
     if pid <= 0:
         return False
@@ -497,6 +509,7 @@ class Config:
     audio_transcribe_cmd: str | None
     video_frame_count: int
     typing_max_seconds: int
+    long_running_progress_seconds: int
     approval_ttl_seconds: int
     workdir: Path
     attachment_roots: tuple[Path, ...]
@@ -548,6 +561,11 @@ class Config:
             audio_transcribe_cmd=env("CRB_AUDIO_TRANSCRIBE_CMD"),
             video_frame_count=int_env("CRB_VIDEO_FRAME_COUNT", 3, minimum=1),
             typing_max_seconds=int_env("CRB_TYPING_MAX_SECONDS", 7200, minimum=30),
+            long_running_progress_seconds=int_env(
+                "CRB_LONG_RUNNING_PROGRESS_SECONDS",
+                1800,
+                minimum=0,
+            ),
             approval_ttl_seconds=int_env("CRB_APPROVAL_TTL_SECONDS", 300, minimum=30),
             workdir=workdir,
             attachment_roots=path_env_list(
@@ -1572,9 +1590,11 @@ class Bridge:
         self.lock = threading.Lock()
         self.exec_lock = threading.Lock()
         self.typing_lock = threading.Lock()
+        self.long_running_progress_lock = threading.Lock()
         self.approval_lock = threading.Lock()
         self.choice_lock = threading.Lock()
         self.repl_typing_stop: threading.Event | None = None
+        self.long_running_progress_stop: threading.Event | None = None
         self.pending_telegram: list[str] = []
         self.pending_approval: ApprovalRequest | None = None
         self.pending_approval_message_id: int | None = None
@@ -1632,6 +1652,7 @@ class Bridge:
 
     def handle_assistant_event(self, text: str) -> bool:
         self.stop_repl_typing()
+        self.stop_long_running_progress()
         if self.suppress_until_user:
             return True
         answer = (text or "").strip()
@@ -1824,6 +1845,40 @@ class Bridge:
                 self.repl_typing_stop.set()
                 self.repl_typing_stop = None
                 log("TYPE", "stop")
+
+    def begin_telegram_prompt_tracking(self, prompt: str) -> None:
+        self.add_pending_telegram(prompt)
+        with self.lock:
+            self.current_origin = "telegram"
+            self.suppress_until_user = False
+        self.start_long_running_progress(prompt)
+
+    def start_long_running_progress(self, prompt: str) -> None:
+        self.stop_long_running_progress()
+        interval = int(getattr(self.config, "long_running_progress_seconds", 0) or 0)
+        if interval <= 0:
+            return
+        stop_event = threading.Event()
+        started = time.monotonic()
+
+        def loop() -> None:
+            while not stop_event.wait(interval):
+                elapsed = time.monotonic() - started
+                log("PROG", f"send long-running update after {int(elapsed)}s")
+                if not self.telegram.send(format_long_running_progress_message(prompt, elapsed)):
+                    log("PROG", "send failed")
+
+        with self.long_running_progress_lock:
+            self.long_running_progress_stop = stop_event
+        threading.Thread(target=loop, daemon=True, name="crb-long-progress").start()
+
+    def stop_long_running_progress(self) -> None:
+        with self.long_running_progress_lock:
+            stop_event = self.long_running_progress_stop
+            self.long_running_progress_stop = None
+        if stop_event:
+            stop_event.set()
+            log("PROG", "stop")
 
     def handle_status_command(self, text: str) -> bool:
         context_only = is_context_command(text)
@@ -2868,8 +2923,7 @@ class Bridge:
                 log("TG", "prompt -> Codex REPL")
                 self.begin_repl_typing()
                 slash_command = is_codex_slash_command(prompt.text)
-                if not slash_command:
-                    self.add_pending_telegram(prompt.text)
+                self.begin_telegram_prompt_tracking(prompt.text)
                 try:
                     self.clear_composer_before_telegram_input("telegram prompt")
                     self.head.send(AgentMessage(prompt.text))
@@ -2878,8 +2932,10 @@ class Bridge:
                         had_slash_error = self.handle_slash_command_result(prompt.text)
                         if should_stop_typing_after_slash_command(prompt.text, had_slash_error):
                             self.stop_repl_typing()
+                            self.stop_long_running_progress()
                 except Exception as exc:  # noqa: BLE001
                     self.stop_repl_typing()
+                    self.stop_long_running_progress()
                     log("REPL", f"paste failed: {exc}")
                     self.telegram.send(f"codex REPL delivery failed: {exc}")
 
