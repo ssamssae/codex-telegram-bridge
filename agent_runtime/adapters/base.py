@@ -1,4 +1,4 @@
-"""Protocol implemented by terminal agent heads."""
+"""Protocol implemented by Codex runtime heads."""
 
 from __future__ import annotations
 

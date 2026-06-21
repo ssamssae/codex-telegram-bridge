@@ -1,4 +1,4 @@
-"""Capability declarations for terminal agent heads."""
+"""Capability declarations for Codex runtime heads."""
 
 from __future__ import annotations
 

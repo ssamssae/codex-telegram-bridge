@@ -603,7 +603,7 @@ Press enter to confirm or esc to cancel
         self.assertEqual([option.key for option in prompt.options], ["y", "esc"])
         self.assertIn("No, and tell Codex", prompt.options[1].label)
 
-    def test_parse_generic_numbered_choice_prompt(self):
+    def test_parse_general_numbered_choice_prompt(self):
         screen = """
 Select model
 

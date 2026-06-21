@@ -1,11 +1,13 @@
 #!/usr/bin/env python3
 import json
+import os
 import subprocess
 import stat
 import tempfile
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import patch
 
 import telegram_agent_bridge as tab
 
@@ -14,7 +16,6 @@ def config(tmpdir, **overrides):
     base = {
         "bot_token": "token",
         "chat_id": "1234",
-        "agent": "codex",
         "agent_cmd": ["/tmp/fake-codex"],
         "state_dir": Path(tmpdir),
         "prefix": "BOT",
@@ -84,22 +85,16 @@ class BridgeTests(unittest.TestCase):
             self.assertEqual(backend.parse_answer(events, "", ""), "final answer")
             backend.cleanup()
 
-    def test_generic_prompt_placeholder(self):
-        with tempfile.TemporaryDirectory() as tmpdir:
-            cfg = config(
-                tmpdir,
-                agent="generic",
-                agent_cmd=["agent", "--message", "{prompt}"],
-            )
-            self.assertEqual(
-                tab.GenericBackend(cfg).build_exec_cmd("hello world"),
-                ["agent", "--message", "hello world"],
-            )
+    def test_from_env_rejects_non_codex_agent(self):
+        env = {"TAB_BOT_TOKEN": "token", "TAB_CHAT_ID": "1234", "TAB_AGENT": "not-codex"}
+        with patch.dict(os.environ, env, clear=True):
+            with self.assertRaisesRegex(tab.BridgeError, "supports only 'codex'"):
+                tab.Config.from_env()
 
     def test_bridge_chunks_and_allowlist(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             cfg = config(tmpdir)
-            bridge = tab.Bridge(cfg, tab.GenericBackend(cfg), FakeTelegram())
+            bridge = tab.Bridge(cfg, tab.CodexBackend(cfg), FakeTelegram())
 
             self.assertEqual(
                 bridge.telegram_chunks("abcdefghijklmnopqrstuvwxy"),
@@ -114,14 +109,14 @@ class BridgeTests(unittest.TestCase):
     def test_bridge_prefix_can_use_own_line(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             cfg = config(tmpdir, prefix="BOT", prefix_line=True, telegram_chunk=12)
-            bridge = tab.Bridge(cfg, tab.GenericBackend(cfg), FakeTelegram())
+            bridge = tab.Bridge(cfg, tab.CodexBackend(cfg), FakeTelegram())
 
             self.assertEqual(bridge.telegram_chunks("answer"), ["BOT\nanswer"])
 
     def test_telegram_message_enqueues_without_running_agent(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             cfg = config(tmpdir)
-            bridge = CapturingBridge(cfg, tab.GenericBackend(cfg), FakeTelegram())
+            bridge = CapturingBridge(cfg, tab.CodexBackend(cfg), FakeTelegram())
 
             bridge.handle_update(
                 {"update_id": 1, "message": {"chat": {"id": "1234"}, "text": "hello"}}
@@ -134,7 +129,7 @@ class BridgeTests(unittest.TestCase):
     def test_local_job_mirrors_prompt_and_answer_to_both_sides(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             cfg = config(tmpdir, telegram_chunk=4096)
-            bridge = CapturingBridge(cfg, tab.GenericBackend(cfg), FakeTelegram())
+            bridge = CapturingBridge(cfg, tab.CodexBackend(cfg), FakeTelegram())
             bridge.execute_with_session = lambda prompt: f"answer to {prompt}"
 
             bridge.process_job(tab.BridgeJob(source="local", text="hello"))
@@ -145,12 +140,12 @@ class BridgeTests(unittest.TestCase):
                 if method == "sendMessage"
             ]
             self.assertEqual(sent, ["BOT local input:\nhello", "BOT answer to hello"])
-            self.assertIn("agent answer (local):\nanswer to hello", bridge.local_output)
+            self.assertIn("codex answer (local):\nanswer to hello", bridge.local_output)
 
     def test_telegram_job_mirrors_prompt_to_terminal_and_answer_to_telegram(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             cfg = config(tmpdir, telegram_chunk=4096)
-            bridge = CapturingBridge(cfg, tab.GenericBackend(cfg), FakeTelegram())
+            bridge = CapturingBridge(cfg, tab.CodexBackend(cfg), FakeTelegram())
             bridge.execute_with_session = lambda prompt: "done"
 
             bridge.process_job(tab.BridgeJob(source="telegram", text="from phone"))
@@ -162,13 +157,13 @@ class BridgeTests(unittest.TestCase):
             ]
             self.assertEqual(sent, ["BOT done"])
             self.assertIn("telegram input:\nfrom phone", bridge.local_output)
-            self.assertIn("agent answer (telegram):\ndone", bridge.local_output)
+            self.assertIn("codex answer (telegram):\ndone", bridge.local_output)
 
     def test_local_fifo_is_created(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             fifo_path = Path(tmpdir) / "input.fifo"
             cfg = config(tmpdir, local_input_path=fifo_path)
-            bridge = CapturingBridge(cfg, tab.GenericBackend(cfg), FakeTelegram())
+            bridge = CapturingBridge(cfg, tab.CodexBackend(cfg), FakeTelegram())
 
             bridge.ensure_local_fifo()
 
@@ -261,15 +256,15 @@ class BridgeTests(unittest.TestCase):
 
             try:
                 subprocess.run = fake_run
-                with self.assertRaisesRegex(tab.AgentExecError, "failed to start agent"):
+                with self.assertRaisesRegex(tab.AgentExecError, "failed to start codex"):
                     bridge.run_agent_turn("hello")
             finally:
                 subprocess.run = original_run
 
     def test_run_agent_turn_respects_workdir_lock(self):
         with tempfile.TemporaryDirectory() as tmpdir:
-            cfg = config(tmpdir, agent="generic", agent_cmd=["echo", "ok"])
-            bridge = tab.Bridge(cfg, tab.GenericBackend(cfg), FakeTelegram())
+            cfg = config(tmpdir, agent_cmd=["echo", "ok"])
+            bridge = tab.Bridge(cfg, tab.CodexBackend(cfg), FakeTelegram())
             held = tab.WorkdirLock(cfg.workdir, cfg.state_dir, "other-head")
             held.acquire()
             try:

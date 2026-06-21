@@ -1,12 +1,12 @@
 [Unit]
-Description=Telegram Agent Bridge
+Description=Codex Telegram Bridge
 After=network-online.target
 Wants=network-online.target
 
 [Service]
 Type=simple
 # Services do not inherit your interactive shell PATH. Add the directory that
-# contains codex, claude, aider, gemini, or your chosen agent command.
+# contains the codex command.
 Environment=PATH=%h/.local/bin:%h/.npm-global/bin:/usr/local/bin:/opt/homebrew/bin:/usr/bin:/bin
 # The setup wizard creates this runner. It reads the private env file.
 ExecStart=%h/.local/bin/telegram-agent-bridge-run

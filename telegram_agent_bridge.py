@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
-"""Telegram -> terminal AI agent bridge.
+"""Telegram -> Codex bridge.
 
 Polls one Telegram bot, accepts messages from one configured chat id, runs one
-terminal agent turn, and sends only the final answer back to Telegram.
+Codex turn, and sends only the final answer back to Telegram.
 """
 
 from __future__ import annotations
@@ -89,7 +89,6 @@ def write_text_atomic(path: Path, value: str | int) -> None:
 class Config:
     bot_token: str
     chat_id: str
-    agent: str
     agent_cmd: list[str]
     state_dir: Path
     prefix: str
@@ -114,12 +113,12 @@ class Config:
             raise BridgeError("TAB_CHAT_ID is required")
 
         agent = (env("TAB_AGENT", "codex") or "codex").strip().lower()
-        if agent not in {"codex", "generic"}:
-            raise BridgeError("TAB_AGENT must be either 'codex' or 'generic'")
+        if agent != "codex":
+            raise BridgeError("TAB_AGENT supports only 'codex'")
 
-        raw_cmd = env("TAB_AGENT_CMD", "codex" if agent == "codex" else None)
+        raw_cmd = env("TAB_AGENT_CMD", "codex")
         if not raw_cmd:
-            raise BridgeError("TAB_AGENT_CMD is required for TAB_AGENT=generic")
+            raise BridgeError("TAB_AGENT_CMD is required")
         try:
             agent_cmd = shlex.split(raw_cmd)
             codex_extra_args = shlex.split(env("TAB_CODEX_EXTRA_ARGS", "") or "")
@@ -137,7 +136,6 @@ class Config:
         return cls(
             bot_token=bot_token.strip(),
             chat_id=str(chat_id).strip(),
-            agent=agent,
             agent_cmd=agent_cmd,
             state_dir=expand_path(env("TAB_STATE_DIR", "~/.local/state/telegram-agent-bridge") or ""),
             prefix=env("TAB_PREFIX", "") or "",
@@ -203,7 +201,7 @@ class CodexBackend(AgentBackend):
         self.output_path: Path | None = None
 
     def _new_output_path(self) -> Path:
-        fd, path = tempfile.mkstemp(prefix="telegram-agent-bridge-", suffix=".answer")
+        fd, path = tempfile.mkstemp(prefix="codex-telegram-bridge-", suffix=".answer")
         os.close(fd)
         self.output_path = Path(path)
         return self.output_path
@@ -262,47 +260,8 @@ class CodexBackend(AgentBackend):
             self.output_path = None
 
 
-class GenericBackend(AgentBackend):
-    supports_resume = False
-    name = "generic"
-
-    def __init__(self, config: Config) -> None:
-        self.config = config
-
-    def _with_prompt(self, prompt: str) -> list[str]:
-        replaced = False
-        cmd: list[str] = []
-        for arg in self.config.agent_cmd:
-            if "{prompt}" in arg:
-                cmd.append(arg.replace("{prompt}", prompt))
-                replaced = True
-            else:
-                cmd.append(arg)
-        if not replaced:
-            cmd.append(prompt)
-        return cmd
-
-    def build_exec_cmd(self, prompt: str) -> list[str]:
-        return self._with_prompt(prompt)
-
-    def build_resume_cmd(self, thread_id: str, prompt: str) -> list[str]:
-        return self.build_exec_cmd(prompt)
-
-    def parse_answer(
-        self,
-        events: list[dict[str, Any]],
-        stdout: str,
-        stderr: str,
-    ) -> str:
-        return (stdout or "").strip()
-
-
 def make_backend(config: Config) -> AgentBackend:
-    if config.agent == "codex":
-        return CodexBackend(config)
-    if config.agent == "generic":
-        return GenericBackend(config)
-    raise BridgeError(f"unsupported TAB_AGENT: {config.agent}")
+    return CodexBackend(config)
 
 
 class TelegramClient:
@@ -380,11 +339,11 @@ class Bridge:
             self.print_local(f"telegram input:\n{job.text}")
 
     def mirror_answer(self, job: BridgeJob, text: str) -> None:
-        self.print_local(f"agent answer ({job.source}):\n{text}")
+        self.print_local(f"codex answer ({job.source}):\n{text}")
         self.send(text)
 
     def mirror_error(self, job: BridgeJob, text: str) -> None:
-        message = f"agent failed: {text}"
+        message = f"codex failed: {text}"
         self.print_local(f"{message} ({job.source})")
         self.send(message)
 
@@ -446,27 +405,27 @@ class Bridge:
             except WorkdirLockError as exc:
                 raise AgentExecError(str(exc)) from exc
             except subprocess.TimeoutExpired as exc:
-                raise AgentExecError(f"agent timed out after {self.config.timeout}s") from exc
+                raise AgentExecError(f"codex timed out after {self.config.timeout}s") from exc
             except OSError as exc:
-                raise AgentExecError(f"failed to start agent: {exc}") from exc
+                raise AgentExecError(f"failed to start codex: {exc}") from exc
 
             stdout = proc.stdout or ""
             stderr = proc.stderr or ""
             if proc.returncode != 0:
                 detail_lines = (stderr or stdout).strip().splitlines()
                 suffix = f": {detail_lines[-1][:160]}" if detail_lines else ""
-                raise AgentExecError(f"agent exited rc={proc.returncode}{suffix}")
+                raise AgentExecError(f"codex exited rc={proc.returncode}{suffix}")
 
             events = parse_json_lines(stdout)
             answer = self.backend.parse_answer(events, stdout, stderr).strip()
             if not answer:
-                raise AgentExecError("empty agent response")
+                raise AgentExecError("empty codex response")
 
             new_thread_id = ""
             if self.backend.supports_resume:
                 new_thread_id = self.backend.parse_thread_id(events) or thread_id
                 if not new_thread_id:
-                    raise AgentExecError("agent did not report a thread id")
+                    raise AgentExecError("codex did not report a thread id")
 
             return answer, new_thread_id
         finally:
@@ -524,7 +483,7 @@ class Bridge:
             return
 
         if text.lower() in {"/start", "/ping"}:
-            status = f"telegram-agent-bridge running (agent={self.backend.name})"
+            status = f"codex-telegram-bridge running (backend={self.backend.name})"
             self.print_local(status)
             self.send(status)
             return
@@ -541,7 +500,7 @@ class Bridge:
         text = message.get("text")
         if not isinstance(text, str):
             return
-        print(f">>> telegram-agent-bridge[{self.backend.name}]: {text.strip()}", flush=True)
+        print(f">>> codex-telegram-bridge[{self.backend.name}]: {text.strip()}", flush=True)
         self.handle_message_text(text, source="telegram")
 
     def ensure_local_fifo(self) -> None:
@@ -575,7 +534,7 @@ class Bridge:
             self.handle_message_text(line, source="local")
 
     def start(self) -> None:
-        threading.Thread(target=self.job_worker, daemon=True, name="tab-agent-worker").start()
+        threading.Thread(target=self.job_worker, daemon=True, name="tab-codex-worker").start()
         if self.config.local_input_path is not None:
             self.ensure_local_fifo()
             self.print_local(f"local input fifo: {self.config.local_input_path}")
@@ -613,8 +572,8 @@ def main() -> int:
         return 2
 
     print(
-        "telegram-agent-bridge start "
-        f"agent={backend.name} chat={config.chat_id} state={config.state_dir}",
+        "codex-telegram-bridge start "
+        f"backend={backend.name} chat={config.chat_id} state={config.state_dir}",
         flush=True,
     )
     try:

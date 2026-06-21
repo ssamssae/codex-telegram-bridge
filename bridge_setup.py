@@ -296,6 +296,8 @@ def write_env_config(
     submit_key: str,
     audio_transcribe_cmd: str,
 ) -> None:
+    if agent != "codex":
+        raise SetupError("agent supports only codex")
     lines = [
         "# telegram-agent-bridge private config",
         "# Keep this file out of git. It contains your Telegram bot token.",
@@ -759,6 +761,8 @@ def setup_bridge(options: SetupOptions, api_call: ApiCall = telegram_call) -> in
 
     if options.mode not in {"repl", "exec"}:
         raise SetupError("--mode must be repl or exec")
+    if options.agent != "codex":
+        raise SetupError("--agent supports only codex")
 
     setup_step(1, "Paste the BotFather token")
     token = (options.token or "").strip()
@@ -818,8 +822,8 @@ def setup_bridge(options: SetupOptions, api_call: ApiCall = telegram_call) -> in
         agent_binary = shlex.split(options.agent_cmd)[0]
     except (ValueError, IndexError):
         agent_binary = ""
-    if options.agent == "codex" and agent_binary and not shutil.which(agent_binary):
-        warn(f"agent command not found on PATH now: {options.agent_cmd}")
+    if agent_binary and not shutil.which(agent_binary):
+        warn(f"Codex command not found on PATH now: {options.agent_cmd}")
     if options.mode == "repl" and not shutil.which("tmux"):
         warn("tmux was not found on PATH. REPL mode requires an existing tmux Codex session.")
     if options.mode == "repl":
@@ -949,9 +953,9 @@ def doctor(config_file: Path, runner_file: Path, api_call: ApiCall = telegram_ca
         except (ValueError, IndexError):
             first = ""
         if first and shutil.which(first):
-            ok(f"agent command found: {first}")
+            ok(f"Codex command found: {first}")
         else:
-            warn(f"agent command not found on PATH: {agent_cmd}")
+            warn(f"Codex command not found on PATH: {agent_cmd}")
             warnings += 1
 
     if runner_file.exists():
@@ -1047,7 +1051,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     setup_parser.add_argument("--token")
     setup_parser.add_argument("--chat-id")
-    setup_parser.add_argument("--agent", choices=["codex", "generic"], default="codex")
+    setup_parser.add_argument("--agent", choices=["codex"], default="codex", help=argparse.SUPPRESS)
     setup_parser.add_argument("--agent-cmd", default="codex")
     setup_parser.add_argument("--workdir", type=expand_path, default=Path.home())
     setup_parser.add_argument("--prefix", default="BOT")

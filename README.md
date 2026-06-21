@@ -3,8 +3,9 @@
 [![Release](https://img.shields.io/github/v/release/ssamssae/codex-telegram-bridge)](https://github.com/ssamssae/codex-telegram-bridge/releases)
 [![License: MIT](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
 
-Control your live Codex CLI session from Telegram. Built to support other
-terminal AI agents.
+Control your live Codex CLI session from Telegram. This project is intentionally
+Codex-only: the runtime, setup flow, examples, and operational guidance are
+optimized for Codex instead of broad multi-backend relay use.
 
 Codex Telegram Bridge is a phone remote for your already-running Codex TUI. Send
 prompts, screenshots, videos, and voice notes from Telegram; the bridge pastes
@@ -41,9 +42,8 @@ Release: <https://github.com/ssamssae/codex-telegram-bridge/releases/latest>
 Promo video from the v0.3 demo release:
 <https://github.com/ssamssae/codex-telegram-bridge/releases/download/v0.3.10/codex-telegram-bridge-promo-v0.3.10.mp4>
 
-The repo also includes a simpler one-shot `codex exec` mode. Internally, the
-bridge now has an adapter foundation for future Claude Code, Aider, Gemini CLI,
-GLM, or custom terminal-agent heads. Codex remains the default product path.
+The repo also includes a simpler one-shot `codex exec` mode. Both modes are
+scoped to Codex so the product surface stays focused and predictable.
 
 This is not MCP. It is a small standalone relay daemon. Default `repl` mode:
 
@@ -189,7 +189,7 @@ Token safety rule: BotFather shows the token in Telegram, but you should copy it
 from BotFather and paste it into the local setup wizard in your terminal. In
 Telegram, send only `/start` or normal prompts to your bot.
 
-For local terminal input without scraping an agent TUI, either type into the
+For local terminal input without scraping the Codex TUI, either type into the
 foreground bridge process or write one prompt per line to the FIFO:
 
 ```bash
@@ -293,17 +293,17 @@ Required settings are intentionally small and explicit.
 | --- | --- | --- | --- |
 | `TAB_BRIDGE_MODE` | no | `repl` | `repl` for visible Codex CLI sync, or `exec` for text-only one-shot mode. |
 | `TAB_BOT_TOKEN` | yes | none | Telegram bot token from BotFather. Keep it secret. |
-| `TAB_CHAT_ID` | yes | none | The only Telegram chat id allowed to control the agent. Other chats are ignored. |
-| `TAB_AGENT` | no | `codex` | `codex` or `generic`. |
-| `TAB_AGENT_CMD` | depends | `codex` for Codex | Base command. Split like shell arguments. Required for `generic`. |
+| `TAB_CHAT_ID` | yes | none | The only Telegram chat id allowed to control Codex. Other chats are ignored. |
+| `TAB_AGENT` | no | `codex` | Compatibility setting. Keep this set to `codex`. |
+| `TAB_AGENT_CMD` | no | `codex` | Codex command or wrapper command. Split like shell arguments. |
 | `TAB_STATE_DIR` | no | `~/.local/state/telegram-agent-bridge` | Offset and thread-id state directory. |
 | `TAB_PREFIX` | no | empty | Prefix shown on the first Telegram reply chunk, for example an emoji or node label. |
 | `TAB_PREFIX_LINE` | no | `0` | When `1`, puts `TAB_PREFIX` on its own first line. |
-| `TAB_WORKDIR` | no | `~` | Working directory for the agent process. Codex also receives `-C TAB_WORKDIR`. |
-| `TAB_WORKDIR_LOCK` | no | `1` | Acquire a local workdir lock around one-shot agent turns. |
+| `TAB_WORKDIR` | no | `~` | Working directory for the Codex process. Codex also receives `-C TAB_WORKDIR`. |
+| `TAB_WORKDIR_LOCK` | no | `1` | Acquire a local workdir lock around one-shot Codex turns. |
 | `TAB_TIMEOUT` | no | `600` | Per-turn timeout in seconds. |
 | `TAB_TG_CHUNK` | no | `4096` | Telegram message chunk size. |
-| `TAB_TYPING_INTERVAL` | no | `4` | Seconds between repeated Telegram `typing` actions while the agent is running. |
+| `TAB_TYPING_INTERVAL` | no | `4` | Seconds between repeated Telegram `typing` actions while Codex is running. |
 | `TAB_LOCAL_INPUT` | no | `~/.local/state/telegram-agent-bridge/input.fifo` on POSIX | FIFO path for local terminal prompts. Set to `0`/`off` to disable. |
 | `TAB_STDIN_INPUT` | no | auto | Read local prompts from stdin. Defaults to on only when stdin is a TTY. |
 | `TAB_CODEX_DANGEROUS_BYPASS` | no | `0` | When `1`, adds `--dangerously-bypass-approvals-and-sandbox` to Codex. |
@@ -452,20 +452,7 @@ hidden from the Telegram text. By default those roots are the bridge state
 directory, `TAB_WORKDIR`, and `/tmp`. Large files are skipped according to
 `CRB_MAX_ATTACHMENT_BYTES`.
 
-## Backends
-
-Backends implement four methods:
-
-```python
-build_exec_cmd(prompt)
-build_resume_cmd(thread_id, prompt)
-parse_thread_id(json_events)
-parse_answer(json_events, stdout, stderr)
-```
-
-### Codex
-
-`TAB_AGENT=codex` is the full backend.
+## Codex Execution
 
 It runs:
 
@@ -475,39 +462,6 @@ codex exec --json -o <tmp-answer-file> -C <TAB_WORKDIR> resume <thread_id> <prom
 ```
 
 The bridge stores the first `thread.started.thread_id` and resumes it on later messages. If a stored thread id is stale, the bridge clears it and retries once as a fresh Codex thread.
-
-### Generic
-
-`TAB_AGENT=generic` is a no-session fallback for tools that can answer from one command.
-
-Examples:
-
-```bash
-TAB_AGENT=generic
-TAB_AGENT_CMD='my-agent --prompt {prompt}'
-```
-
-If `{prompt}` appears in any argument, it is replaced in place. Otherwise the prompt is appended as the final argument. Generic mode returns stdout as the answer and does not preserve context.
-
-### Stub templates for other agents
-
-These are command-shape starting points only. Verify each tool's current CLI before using it.
-
-```bash
-# Claude Code style one-shot
-TAB_AGENT=generic
-TAB_AGENT_CMD='claude -p {prompt}'
-
-# Aider style one-shot
-TAB_AGENT=generic
-TAB_AGENT_CMD='aider --message {prompt}'
-
-# Gemini CLI style one-shot
-TAB_AGENT=generic
-TAB_AGENT_CMD='gemini -p {prompt}'
-```
-
-To add a real resumable backend, create a class like `CodexBackend`, set `supports_resume = True`, and implement the four backend methods against that agent's machine-readable output.
 
 ## Service Examples
 
@@ -519,7 +473,7 @@ Examples live in:
 - `examples/launchd/com.user.telegram-agent-bridge.plist`
 - `examples/launchd/com.user.telegram-agent-bridge-watchdog.plist`
 
-Review the `PATH` in each file. Services often start with a smaller environment than your shell, so include the directory where `codex`, `claude`, `aider`, or `gemini` is installed.
+Review the `PATH` in each file. Services often start with a smaller environment than your shell, so include the directory where `codex` is installed.
 
 ## Roadmap
 
@@ -538,9 +492,9 @@ These are product directions, not promises in the current release:
 - Do not paste the BotFather token into your Telegram bot chat. Paste it only
   into the local terminal setup wizard. The only Telegram message needed during
   setup is `/start`.
-- Keep `TAB_CHAT_ID` set to your own chat id. This single-user allowlist is the main safety boundary.
-- Run this only on a trusted personal machine or trusted server. Telegram messages become terminal agent prompts.
-- Protect `TAB_LOCAL_INPUT`. Anyone who can write to the FIFO can send prompts to the agent.
+- Keep `TAB_CHAT_ID` set to the intended chat id. This single-user allowlist is the main safety boundary.
+- Run this only on a trusted personal machine or trusted server. Telegram messages become Codex prompts.
+- Protect `TAB_LOCAL_INPUT`. Anyone who can write to the FIFO can send prompts to Codex.
 - Be careful with `TAB_CODEX_DANGEROUS_BYPASS=1`. It adds `--dangerously-bypass-approvals-and-sandbox`, allowing Codex to act without normal approval and sandbox protections.
 - Prefer a limited working directory in `TAB_WORKDIR` when possible.
 - This daemon uses Telegram polling, not a public inbound webhook. You do not need to expose a local port.

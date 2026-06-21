@@ -1,4 +1,4 @@
-"""Shared runtime contracts for Telegram-controlled terminal agents."""
+"""Shared runtime contracts for Telegram-controlled Codex sessions."""
 
 from .approvals import ApprovalOption, ApprovalRequest
 from .capabilities import CapabilityRegistry, HeadCapabilities

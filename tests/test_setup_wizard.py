@@ -211,7 +211,7 @@ class SetupWizardTests(unittest.TestCase):
                 mode="exec",
                 token="token",
                 chat_id="12345",
-                agent="generic",
+                agent="codex",
                 agent_cmd="python3",
                 workdir=base,
                 prefix="BOT",
