@@ -19,7 +19,7 @@ the remote control when you are away from the keyboard.
 Install with `pipx`, then run the setup wizard:
 
 ```bash
-pipx install "git+https://github.com/ssamssae/codex-telegram-bridge.git@v0.3.14"
+pipx install "git+https://github.com/ssamssae/codex-telegram-bridge.git@v0.3.15"
 codex-telegram-bridge setup
 codex-telegram-bridge doctor
 ```
@@ -58,7 +58,7 @@ Telegram message/media
 Codex CLI input
   -> JSONL user event
   -> Telegram "typing..." while Codex is working
-  -> periodic "still working" progress updates for long Telegram-origin turns
+  -> periodic detailed progress updates for long Telegram-origin turns
   -> final answer mirrored to Telegram
 
 Codex approval prompt
@@ -102,6 +102,9 @@ Service restart
   disappearing into a separate hidden thread.
 - Terminal-origin prompts can still show Telegram `typing...` and final-answer
   mirrors, so the phone stays informed even when the work started locally.
+- Long-running Telegram-origin turns send progress reports with the task label,
+  optional task id, elapsed time, latest public progress note, next step, and
+  blocker status.
 - Approval and selection prompts remain real Codex TUI prompts; the bridge sends
   Telegram buttons for the visible options and injects the selected key back
   into tmux.

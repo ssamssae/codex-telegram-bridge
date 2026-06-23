@@ -74,6 +74,22 @@ class ConfigDefaultsTest(unittest.TestCase):
             "🏭\nㅎㅇ 아니키, 대기 중입니다.",
         )
 
+    def test_long_running_progress_message_includes_detail_fields(self):
+        message = repl.format_long_running_progress_message(
+            "T-260624-11 deploy bridge",
+            630,
+            task_id="T-260624-11",
+            recent_progress="code deployed, checks running",
+        )
+
+        self.assertIn("Task: T-260624-11 deploy bridge", message)
+        self.assertIn("Task ID: T-260624-11", message)
+        self.assertIn("Elapsed: about 10 min", message)
+        self.assertIn("Recent: code deployed, checks running", message)
+        self.assertIn("Current: waiting for the final answer", message)
+        self.assertIn("Next: I will send the final answer", message)
+        self.assertIn("Blocked: no blocker reported", message)
+
 
 class FakeTelegram:
     def __init__(self):
@@ -441,6 +457,27 @@ class ReplBridgeTests(unittest.TestCase):
             self.assertIn("Still working", telegram.sent[0])
             self.assertIn("run the longer task", telegram.sent[0])
             self.assertIn("final answer", telegram.sent[0])
+
+    def test_progress_update_includes_latest_public_progress_and_current_task(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            cfg = config(tmpdir, long_running_progress_seconds=1)
+            (Path(tmpdir) / "current-task").write_text("T-260624-11\n", encoding="utf-8")
+            telegram = FakeTelegram()
+            bridge = repl.Bridge(cfg, telegram, FakeRepl())
+
+            try:
+                bridge.begin_telegram_prompt_tracking("deploy bridge")
+                bridge.handle_progress_event("copied to nodes\nchecking services")
+                deadline = time.monotonic() + 2.5
+                while time.monotonic() < deadline and not telegram.sent:
+                    time.sleep(0.05)
+            finally:
+                bridge.stop_long_running_progress()
+
+            self.assertTrue(telegram.sent)
+            self.assertIn("Task ID: T-260624-11", telegram.sent[0])
+            self.assertIn("Recent: copied to nodes checking services", telegram.sent[0])
+            self.assertIn("Blocked: no blocker reported", telegram.sent[0])
 
     def test_clear_composer_before_telegram_input_always_clears(self):
         with tempfile.TemporaryDirectory() as tmpdir:

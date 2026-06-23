@@ -44,6 +44,7 @@ from agent_runtime.types import AgentMessage
 
 HOME = Path.home()
 NODE_EMOJI_LINES = {"\U0001f34e", "\U0001f3ed", "\U0001fa9f", "\U0001f5a5", "\U0001f4bb", "\U0001f916"}
+TASK_ID_RE = re.compile(r"\bT-\d{6}-\d+\b")
 IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".webp", ".gif"}
 IMAGE_ATTACHMENT_EXTENSIONS = IMAGE_EXTENSIONS | {".bmp", ".tif", ".tiff"}
 AUDIO_EXTENSIONS = {".ogg", ".oga", ".opus", ".mp3", ".m4a", ".aac", ".wav", ".flac", ".weba"}
@@ -279,16 +280,53 @@ def truncate_text(text: str, limit: int = 12000) -> str:
     return text[:limit].rstrip() + f"\n\n[truncated {len(text) - limit} chars]"
 
 
-def format_long_running_progress_message(prompt: str, elapsed_seconds: float) -> str:
+def strip_node_emoji_header(text: str) -> str:
+    lines = (text or "").strip().splitlines()
+    if not lines:
+        return ""
+    if lines[0].strip() in NODE_EMOJI_LINES:
+        return "\n".join(lines[1:]).strip()
+    return "\n".join(lines).strip()
+
+
+def format_progress_summary(text: str, limit: int = 180) -> str:
+    body = " ".join(strip_node_emoji_header(text).split())
+    return truncate_text(body, limit).strip()
+
+
+def extract_task_id(text: str) -> str:
+    match = TASK_ID_RE.search(text or "")
+    return match.group(0) if match else ""
+
+
+def format_long_running_progress_message(
+    prompt: str,
+    elapsed_seconds: float,
+    task_id: str = "",
+    recent_progress: str = "",
+) -> str:
     label = " ".join((prompt or "").strip().split())
-    label = truncate_text(label, 160)
+    label = truncate_text(label or "(empty request)", 160)
     elapsed_minutes = max(1, int(elapsed_seconds // 60))
-    return (
-        "Still working on your Telegram request.\n"
-        f"Task: {label}\n"
-        f"Elapsed: about {elapsed_minutes} min\n"
-        "I will send the final answer when it is ready."
+    lines = [
+        "Still working on your Telegram request.",
+        f"Task: {label}",
+    ]
+    if task_id:
+        lines.append(f"Task ID: {task_id}")
+    lines.append(f"Elapsed: about {elapsed_minutes} min")
+    if recent_progress:
+        lines.append(f"Recent: {format_progress_summary(recent_progress, 220)}")
+    else:
+        lines.append("Recent: no public progress note yet")
+    lines.extend(
+        [
+            "Current: waiting for the final answer",
+            "Next: I will send the final answer when it is ready.",
+            "Blocked: no blocker reported",
+        ]
     )
+    return "\n".join(lines)
 
 
 def strip_inline_node_emoji_header(text: str) -> str:
@@ -1472,13 +1510,23 @@ def extract_event(record: dict[str, Any]) -> tuple[str, str] | None:
         payload_type = payload.get("type")
         if payload_type == "user_message":
             return "user", str(payload.get("message") or "")
-        if payload_type == "agent_message" and payload.get("phase") == "final_answer":
-            return "assistant", str(payload.get("message") or "")
+        if payload_type == "agent_message":
+            if payload.get("phase") == "final_answer":
+                return "assistant", str(payload.get("message") or "")
+            return "progress", str(payload.get("message") or "")
 
     if kind == "response_item":
         if payload.get("type") == "message" and payload.get("role") == "assistant":
             phase = payload.get("phase") or payload.get("metadata", {}).get("phase")
             if phase != "final_answer":
+                content = payload.get("content")
+                if isinstance(content, list):
+                    parts = []
+                    for item in content:
+                        if isinstance(item, dict) and item.get("type") == "output_text":
+                            parts.append(str(item.get("text") or ""))
+                    if parts:
+                        return "progress", "\n".join(parts)
                 return None
             content = payload.get("content")
             if isinstance(content, list):
@@ -1621,6 +1669,7 @@ class Bridge:
         self.current_origin: str | None = None
         self.suppress_until_user = False
         self.needs_composer_clear = False
+        self.last_public_progress: str = ""
         self.session_path: Path | None = None
         self.session_identity: SessionIdentity | None = None
         self.bridge_state: dict[str, Any] | None = None
@@ -1656,6 +1705,7 @@ class Bridge:
 
     def handle_user_event(self, text: str) -> None:
         self.suppress_until_user = False
+        self.last_public_progress = ""
         if self.consume_pending_match(text):
             self.current_origin = "telegram"
             log("JSONL", "matched Telegram-origin prompt")
@@ -1664,6 +1714,13 @@ class Bridge:
             self.current_origin = "terminal"
             log("JSONL", "terminal-origin prompt")
             self.begin_repl_typing()
+
+    def handle_progress_event(self, text: str) -> None:
+        summary = format_progress_summary(text, 220)
+        if not summary:
+            return
+        with self.lock:
+            self.last_public_progress = summary
 
     def handle_assistant_event(self, text: str) -> bool:
         self.stop_repl_typing()
@@ -1733,6 +1790,11 @@ class Bridge:
         kind, text = event
         if kind == "user":
             self.handle_user_event(text)
+            if line_end is not None:
+                self.persist_state(line_end)
+            return True
+        elif kind == "progress":
+            self.handle_progress_event(text)
             if line_end is not None:
                 self.persist_state(line_end)
             return True
@@ -1866,6 +1928,7 @@ class Bridge:
         with self.lock:
             self.current_origin = "telegram"
             self.suppress_until_user = False
+            self.last_public_progress = ""
         self.start_long_running_progress(prompt)
 
     def start_long_running_progress(self, prompt: str) -> None:
@@ -1880,12 +1943,32 @@ class Bridge:
             while not stop_event.wait(interval):
                 elapsed = time.monotonic() - started
                 log("PROG", f"send long-running update after {int(elapsed)}s")
-                if not self.telegram.send(format_long_running_progress_message(prompt, elapsed)):
+                if not self.telegram.send(self.long_running_progress_message(prompt, elapsed)):
                     log("PROG", "send failed")
 
         with self.long_running_progress_lock:
             self.long_running_progress_stop = stop_event
         threading.Thread(target=loop, daemon=True, name="crb-long-progress").start()
+
+    def current_task_id(self, prompt: str) -> str:
+        task_id = extract_task_id(prompt)
+        if task_id:
+            return task_id
+        state_task = read_text(self.config.state_dir / "current-task").splitlines()
+        if not state_task:
+            return ""
+        candidate = state_task[0].strip()
+        return candidate if TASK_ID_RE.fullmatch(candidate) else ""
+
+    def long_running_progress_message(self, prompt: str, elapsed_seconds: float) -> str:
+        with self.lock:
+            recent_progress = self.last_public_progress
+        return format_long_running_progress_message(
+            prompt,
+            elapsed_seconds,
+            task_id=self.current_task_id(prompt),
+            recent_progress=recent_progress,
+        )
 
     def stop_long_running_progress(self) -> None:
         with self.long_running_progress_lock:
