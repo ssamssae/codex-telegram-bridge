@@ -563,7 +563,7 @@ class Config:
             typing_max_seconds=int_env("CRB_TYPING_MAX_SECONDS", 7200, minimum=30),
             long_running_progress_seconds=int_env(
                 "CRB_LONG_RUNNING_PROGRESS_SECONDS",
-                1800,
+                600,
                 minimum=0,
             ),
             approval_ttl_seconds=int_env("CRB_APPROVAL_TTL_SECONDS", 300, minimum=30),

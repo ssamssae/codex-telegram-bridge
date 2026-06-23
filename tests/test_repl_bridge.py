@@ -49,6 +49,24 @@ def config(tmpdir, **overrides):
     return repl.Config(**base)
 
 
+class ConfigDefaultsTest(unittest.TestCase):
+    def test_default_long_running_progress_interval_is_ten_minutes(self):
+        old_progress = os.environ.pop("CRB_LONG_RUNNING_PROGRESS_SECONDS", None)
+        old_chat_id = os.environ.get("TAB_CHAT_ID")
+        os.environ["TAB_CHAT_ID"] = "1234"
+        try:
+            cfg = repl.Config.from_env()
+        finally:
+            if old_progress is not None:
+                os.environ["CRB_LONG_RUNNING_PROGRESS_SECONDS"] = old_progress
+            if old_chat_id is None:
+                os.environ.pop("TAB_CHAT_ID", None)
+            else:
+                os.environ["TAB_CHAT_ID"] = old_chat_id
+
+        self.assertEqual(cfg.long_running_progress_seconds, 600)
+
+
 class FakeTelegram:
     def __init__(self):
         self.downloads = []
