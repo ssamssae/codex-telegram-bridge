@@ -66,6 +66,14 @@ class ConfigDefaultsTest(unittest.TestCase):
 
         self.assertEqual(cfg.long_running_progress_seconds, 600)
 
+    def test_emoji_prefix_strips_inline_node_emoji_from_answer_body(self):
+        telegram = repl.TelegramClient("token", "1234", "🏭", 4096)
+
+        self.assertEqual(
+            telegram.with_emoji_prefix("🏭 ㅎㅇ 아니키, 대기 중입니다."),
+            "🏭\nㅎㅇ 아니키, 대기 중입니다.",
+        )
+
 
 class FakeTelegram:
     def __init__(self):

@@ -291,6 +291,20 @@ def format_long_running_progress_message(prompt: str, elapsed_seconds: float) ->
     )
 
 
+def strip_inline_node_emoji_header(text: str) -> str:
+    lines = (text or "").splitlines()
+    if not lines:
+        return text
+    first = lines[0].lstrip()
+    for emoji in NODE_EMOJI_LINES:
+        if first.startswith(emoji):
+            rest = first[len(emoji) :]
+            if rest and rest[0].isspace():
+                lines[0] = rest.lstrip()
+                return "\n".join(lines).strip()
+    return text
+
+
 def process_alive(pid: int) -> bool:
     if pid <= 0:
         return False
@@ -722,6 +736,7 @@ class TelegramClient:
         first_line = text.splitlines()[0].strip() if text.splitlines() else ""
         if first_line in NODE_EMOJI_LINES:
             return text
+        text = strip_inline_node_emoji_header(text)
         return f"{self.emoji}\n{text}"
 
     def chunks(self, text: str) -> list[str]:
