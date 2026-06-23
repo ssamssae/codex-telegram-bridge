@@ -57,6 +57,10 @@ STATUS_COMMANDS = {"status", "/status"}
 CONTEXT_COMMANDS = {"context", "/context"}
 LONG_RUNNING_SLASH_COMMANDS = {"/goal"}
 ANSI_RE = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]")
+REPL_BUSY_RE = re.compile(
+    r"esc to interrupt|interrupt to stop|\bWorking\b|tokens used",
+    re.IGNORECASE,
+)
 UNRECOGNIZED_COMMAND_RE = re.compile(r"Unrecognized command ['\"](?P<command>/[^'\"]+)['\"]")
 MARKDOWN_LOCAL_PATH_RE = re.compile(r"!?\[[^\]]*]\((?P<path>[^)\n]+)\)")
 MEDIA_ATTACHMENT_SUFFIX_RE = "|".join(
@@ -561,6 +565,7 @@ class Config:
     audio_transcribe_cmd: str | None
     video_frame_count: int
     typing_max_seconds: int
+    typing_liveness_seconds: int
     long_running_progress_seconds: int
     approval_ttl_seconds: int
     workdir: Path
@@ -613,6 +618,7 @@ class Config:
             audio_transcribe_cmd=env("CRB_AUDIO_TRANSCRIBE_CMD"),
             video_frame_count=int_env("CRB_VIDEO_FRAME_COUNT", 3, minimum=1),
             typing_max_seconds=int_env("CRB_TYPING_MAX_SECONDS", 7200, minimum=30),
+            typing_liveness_seconds=int_env("CRB_TYPING_LIVENESS_SECONDS", 10, minimum=0),
             long_running_progress_seconds=int_env(
                 "CRB_LONG_RUNNING_PROGRESS_SECONDS",
                 600,
@@ -1228,6 +1234,18 @@ def clean_pane_lines(screen: str) -> list[str]:
     return [ANSI_RE.sub("", line).rstrip() for line in screen.splitlines()]
 
 
+def screen_has_repl_busy_marker(screen: str) -> bool:
+    for line in clean_pane_lines(screen)[-20:]:
+        cleaned = line.strip()
+        if not cleaned:
+            continue
+        if "clear to save" in cleaned.lower():
+            continue
+        if REPL_BUSY_RE.search(cleaned):
+            return True
+    return False
+
+
 @dataclass(frozen=True)
 class ParsedScreenOption:
     value: str
@@ -1669,6 +1687,7 @@ class Bridge:
         self.current_origin: str | None = None
         self.suppress_until_user = False
         self.needs_composer_clear = False
+        self.active_telegram_prompt = ""
         self.last_public_progress: str = ""
         self.session_path: Path | None = None
         self.session_identity: SessionIdentity | None = None
@@ -1734,6 +1753,7 @@ class Bridge:
         log("SEND", f"Telegram mirror from {origin}")
         if not self.send_answer(answer):
             return False
+        self.clear_active_telegram_prompt()
         self.current_origin = None
         self.suppress_until_user = True
         return True
@@ -1802,6 +1822,9 @@ class Bridge:
             key = event_dedup_key(record, kind, text)
             if self.bridge_state and ring_contains(self.bridge_state, key):
                 log("SEND", "skip duplicate final_answer")
+                self.stop_repl_typing()
+                self.stop_long_running_progress()
+                self.clear_active_telegram_prompt()
                 if line_end is not None:
                     self.persist_state(line_end)
                 return True
@@ -1825,6 +1848,10 @@ class Bridge:
             if state:
                 state["coord_ring"] = ring_values(state)
             self.bridge_state = state or bridge_state_default(identity)
+            with self.lock:
+                self.active_telegram_prompt = str(
+                    self.bridge_state.get("active_telegram_prompt") or ""
+                )
             if cursor is not None:
                 self.session_pos = cursor
                 log("REPL", f"watching {path} from cursor {cursor}")
@@ -1907,6 +1934,14 @@ class Bridge:
         threading.Thread(target=loop, daemon=True, name="crb-typing").start()
         return stop_event
 
+    def has_repl_typing(self) -> bool:
+        with self.typing_lock:
+            return self.repl_typing_stop is not None
+
+    def has_long_running_progress(self) -> bool:
+        with self.long_running_progress_lock:
+            return self.long_running_progress_stop is not None
+
     def begin_repl_typing(self) -> None:
         with self.typing_lock:
             if self.repl_typing_stop:
@@ -1923,12 +1958,34 @@ class Bridge:
                 self.repl_typing_stop = None
                 log("TYPE", "stop")
 
+    def set_active_telegram_prompt(self, prompt: str) -> None:
+        prompt = normalize_prompt(prompt)
+        with self.lock:
+            self.active_telegram_prompt = prompt
+            if self.bridge_state is not None:
+                if prompt:
+                    self.bridge_state["active_telegram_prompt"] = prompt
+                else:
+                    self.bridge_state.pop("active_telegram_prompt", None)
+        self.persist_state()
+
+    def clear_active_telegram_prompt(self) -> None:
+        self.set_active_telegram_prompt("")
+
+    def active_prompt_for_recovery(self) -> str:
+        with self.lock:
+            prompt = self.active_telegram_prompt
+            if not prompt and self.bridge_state is not None:
+                prompt = str(self.bridge_state.get("active_telegram_prompt") or "")
+        return normalize_prompt(prompt)
+
     def begin_telegram_prompt_tracking(self, prompt: str) -> None:
         self.add_pending_telegram(prompt)
         with self.lock:
             self.current_origin = "telegram"
             self.suppress_until_user = False
             self.last_public_progress = ""
+        self.set_active_telegram_prompt(prompt)
         self.start_long_running_progress(prompt)
 
     def start_long_running_progress(self, prompt: str) -> None:
@@ -1977,6 +2034,36 @@ class Bridge:
         if stop_event:
             stop_event.set()
             log("PROG", "stop")
+
+    def repl_is_working(self) -> bool:
+        try:
+            screen = self.head.capture_pane(60)
+        except Exception as exc:  # noqa: BLE001
+            log("LIVE", f"pane capture failed: {exc}")
+            return False
+        return screen_has_repl_busy_marker(screen)
+
+    def recover_repl_liveness(self, reason: str = "poll") -> bool:
+        if not self.repl_is_working():
+            return False
+        recovered = False
+        if not self.has_repl_typing():
+            log("LIVE", f"recover typing ({reason})")
+            self.begin_repl_typing()
+            recovered = True
+        prompt = self.active_prompt_for_recovery()
+        if prompt and not self.has_long_running_progress():
+            log("LIVE", f"recover progress ({reason})")
+            self.start_long_running_progress(prompt)
+            recovered = True
+        return recovered
+
+    def liveness_loop(self) -> None:
+        interval = int(getattr(self.config, "typing_liveness_seconds", 0) or 0)
+        if interval <= 0:
+            return
+        while not self.stop_event.wait(interval):
+            self.recover_repl_liveness()
 
     def handle_status_command(self, text: str) -> bool:
         context_only = is_context_command(text)
@@ -3031,9 +3118,11 @@ class Bridge:
                         if should_stop_typing_after_slash_command(prompt.text, had_slash_error):
                             self.stop_repl_typing()
                             self.stop_long_running_progress()
+                            self.clear_active_telegram_prompt()
                 except Exception as exc:  # noqa: BLE001
                     self.stop_repl_typing()
                     self.stop_long_running_progress()
+                    self.clear_active_telegram_prompt()
                     log("REPL", f"paste failed: {exc}")
                     self.telegram.send(f"codex REPL delivery failed: {exc}")
 
@@ -3045,6 +3134,9 @@ class Bridge:
         jsonl_thread.start()
         approval_thread = threading.Thread(target=self.approval_loop, daemon=True)
         approval_thread.start()
+        self.recover_repl_liveness("startup")
+        liveness_thread = threading.Thread(target=self.liveness_loop, daemon=True)
+        liveness_thread.start()
         try:
             self.telegram_loop()
         finally:

@@ -19,7 +19,7 @@ the remote control when you are away from the keyboard.
 Install with `pipx`, then run the setup wizard:
 
 ```bash
-pipx install "git+https://github.com/ssamssae/codex-telegram-bridge.git@v0.3.15"
+pipx install "git+https://github.com/ssamssae/codex-telegram-bridge.git@v0.3.16"
 codex-telegram-bridge setup
 codex-telegram-bridge doctor
 ```
@@ -58,6 +58,7 @@ Telegram message/media
 Codex CLI input
   -> JSONL user event
   -> Telegram "typing..." while Codex is working
+  -> recover Telegram "typing..." if the bridge restarts while the Codex pane is still busy
   -> periodic detailed progress updates for long Telegram-origin turns
   -> final answer mirrored to Telegram
 
@@ -105,6 +106,10 @@ Service restart
 - Long-running Telegram-origin turns send progress reports with the task label,
   optional task id, elapsed time, latest public progress note, next step, and
   blocker status.
+- If the daemon restarts or joins mid-turn, it checks the visible Codex pane
+  every 10 seconds by default and restarts Telegram `typing...` while Codex is
+  still working. Set `CRB_TYPING_LIVENESS_SECONDS=0` to disable this recovery
+  loop.
 - Approval and selection prompts remain real Codex TUI prompts; the bridge sends
   Telegram buttons for the visible options and injects the selected key back
   into tmux.

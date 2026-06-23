@@ -29,6 +29,7 @@ def config(tmpdir, **overrides):
         "audio_transcribe_cmd": None,
         "video_frame_count": 3,
         "typing_max_seconds": 30,
+        "typing_liveness_seconds": 10,
         "long_running_progress_seconds": 0,
         "approval_ttl_seconds": 300,
         "workdir": Path(tmpdir),
@@ -52,6 +53,7 @@ def config(tmpdir, **overrides):
 class ConfigDefaultsTest(unittest.TestCase):
     def test_default_long_running_progress_interval_is_ten_minutes(self):
         old_progress = os.environ.pop("CRB_LONG_RUNNING_PROGRESS_SECONDS", None)
+        old_liveness = os.environ.pop("CRB_TYPING_LIVENESS_SECONDS", None)
         old_chat_id = os.environ.get("TAB_CHAT_ID")
         os.environ["TAB_CHAT_ID"] = "1234"
         try:
@@ -59,12 +61,15 @@ class ConfigDefaultsTest(unittest.TestCase):
         finally:
             if old_progress is not None:
                 os.environ["CRB_LONG_RUNNING_PROGRESS_SECONDS"] = old_progress
+            if old_liveness is not None:
+                os.environ["CRB_TYPING_LIVENESS_SECONDS"] = old_liveness
             if old_chat_id is None:
                 os.environ.pop("TAB_CHAT_ID", None)
             else:
                 os.environ["TAB_CHAT_ID"] = old_chat_id
 
         self.assertEqual(cfg.long_running_progress_seconds, 600)
+        self.assertEqual(cfg.typing_liveness_seconds, 10)
 
     def test_emoji_prefix_strips_inline_node_emoji_from_answer_body(self):
         telegram = repl.TelegramClient("token", "1234", "🏭", 4096)
@@ -89,6 +94,14 @@ class ConfigDefaultsTest(unittest.TestCase):
         self.assertIn("Current: waiting for the final answer", message)
         self.assertIn("Next: I will send the final answer", message)
         self.assertIn("Blocked: no blocker reported", message)
+
+    def test_busy_screen_detects_working_footer(self):
+        self.assertTrue(
+            repl.screen_has_repl_busy_marker(
+                "ready\nWorking (5m 05s · esc to interrupt)\n"
+            )
+        )
+        self.assertFalse(repl.screen_has_repl_busy_marker("ready\nNo active task\n"))
 
 
 class FakeTelegram:
@@ -478,6 +491,50 @@ class ReplBridgeTests(unittest.TestCase):
             self.assertIn("Task ID: T-260624-11", telegram.sent[0])
             self.assertIn("Recent: copied to nodes checking services", telegram.sent[0])
             self.assertIn("Blocked: no blocker reported", telegram.sent[0])
+
+    def test_liveness_recovers_typing_when_repl_is_busy(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            telegram = FakeTelegram()
+            fake_repl = FakeRepl()
+            fake_repl.screen = "Working (5m 05s · esc to interrupt)\n"
+            bridge = repl.Bridge(config(tmpdir), telegram, fake_repl)
+
+            try:
+                self.assertTrue(bridge.recover_repl_liveness("test"))
+                deadline = time.monotonic() + 1.0
+                while time.monotonic() < deadline and not telegram.calls:
+                    time.sleep(0.02)
+                self.assertIn(("sendChatAction", {"action": "typing"}), telegram.calls)
+            finally:
+                bridge.stop_repl_typing()
+
+    def test_liveness_recovers_progress_for_active_telegram_prompt(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            fake_repl = FakeRepl()
+            fake_repl.screen = "Working (5m 05s · esc to interrupt)\n"
+            bridge = repl.Bridge(
+                config(tmpdir, long_running_progress_seconds=1),
+                FakeTelegram(),
+                fake_repl,
+            )
+            bridge.set_active_telegram_prompt("run the longer task")
+
+            try:
+                self.assertTrue(bridge.recover_repl_liveness("test"))
+                self.assertTrue(bridge.has_long_running_progress())
+            finally:
+                bridge.stop_repl_typing()
+                bridge.stop_long_running_progress()
+
+    def test_final_answer_clears_active_telegram_prompt(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            bridge = repl.Bridge(config(tmpdir), FakeTelegram(), FakeRepl())
+
+            bridge.begin_telegram_prompt_tracking("run the longer task")
+            self.assertEqual(bridge.active_prompt_for_recovery(), "run the longer task")
+
+            self.assertTrue(bridge.handle_assistant_event("done"))
+            self.assertEqual(bridge.active_prompt_for_recovery(), "")
 
     def test_clear_composer_before_telegram_input_always_clears(self):
         with tempfile.TemporaryDirectory() as tmpdir:
