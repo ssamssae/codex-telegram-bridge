@@ -20,7 +20,7 @@ the remote control when you are away from the keyboard.
 Install with `pipx`, then run the setup wizard:
 
 ```bash
-pipx install "git+https://github.com/ssamssae/codex-telegram-bridge.git@v0.3.23"
+pipx install "git+https://github.com/ssamssae/codex-telegram-bridge.git@v0.3.24"
 codex-telegram-bridge setup
 codex-telegram-bridge doctor
 ```

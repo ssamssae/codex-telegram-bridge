@@ -494,6 +494,48 @@ class ReplBridgeTests(unittest.TestCase):
 
             self.assertEqual(telegram.sent, [goal, spec])
 
+    def test_title_content_copy_payload_sends_plain_two_messages(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            cfg = config(tmpdir)
+            telegram = FakeTelegram()
+            bridge = repl.Bridge(cfg, telegram, FakeRepl())
+            identity = repl.SessionIdentity(str(Path(tmpdir) / "rollout.jsonl"), 1, 2, 100)
+            bridge.session_identity = identity
+            bridge.bridge_state = repl.bridge_state_default(identity)
+            prompt = "제목 내용 따로보내줘 두번"
+            title = "제목: 클로드를 텔레그램에 연결했다 | 폰에서 Claude Code 자동화 실행하기"
+            content = (
+                "내용: Claude Telegram Bridge로 Claude Code 세션을 텔레그램에서 직접 호출하고, "
+                "폰에서 작업 지시와 응답 확인까지 할 수 있게 만든 구조입니다."
+            )
+            records = [
+                {
+                    "timestamp": "2026-06-20T00:00:00Z",
+                    "type": "event_msg",
+                    "payload": {"type": "user_message", "message": prompt},
+                },
+                {
+                    "timestamp": "2026-06-20T00:00:01Z",
+                    "type": "event_msg",
+                    "payload": {"type": "agent_message", "phase": "commentary", "message": title},
+                },
+                {
+                    "timestamp": "2026-06-20T00:00:02Z",
+                    "type": "event_msg",
+                    "payload": {"type": "agent_message", "phase": "final_answer", "message": content},
+                },
+            ]
+            bridge.begin_telegram_prompt_tracking(prompt)
+            cursor = 0
+            for record in records:
+                line = json.dumps(record) + "\n"
+                self.assertTrue(bridge.process_line(line, cursor, cursor + len(line)))
+                cursor += len(line)
+
+            self.assertEqual(telegram.sent, [title, content])
+            state = json.loads(Path(cfg.state_path).read_text(encoding="utf-8"))
+            self.assertNotIn("copy_payload_pair_contract", state)
+
     def test_duplicate_goal_copy_payload_commentary_dedups_by_body(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             cfg = config(tmpdir)
@@ -773,12 +815,15 @@ class ReplBridgeTests(unittest.TestCase):
         self.assertTrue(repl.prompt_requires_copy_payload_pair("골 보내고 상세스펙 보내줘"))
         self.assertTrue(repl.prompt_requires_copy_payload_pair("/goal 상세스팩 2통"))
         self.assertTrue(repl.prompt_requires_copy_payload_pair("골명령어랑 상세설명 두 번 보내"))
+        self.assertTrue(repl.prompt_requires_copy_payload_pair("제목 내용 따로보내줘 두번"))
+        self.assertTrue(repl.prompt_requires_copy_payload_pair("제목이랑 본문을 두 통으로 보내줘"))
 
     def test_copy_payload_pair_classifier_rejects_false_positive_and_single_message(self):
         self.assertFalse(repl.prompt_requires_copy_payload_pair("해골 골라줘 상세설명 따로"))
         self.assertFalse(repl.prompt_requires_copy_payload_pair("골치 아픈 상세설명 따로"))
         self.assertFalse(repl.prompt_requires_copy_payload_pair("/goal 상세스펙 한 통에 같이"))
         self.assertFalse(repl.prompt_requires_copy_payload_pair("/goal 상세스펙 합쳐서 보내"))
+        self.assertFalse(repl.prompt_requires_copy_payload_pair("제목 내용 한 통에 같이"))
 
     def test_combined_goal_and_spec_final_answer_splits_into_two_messages(self):
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -1351,7 +1396,7 @@ Overwrite existing file? [y/N]
             bridge.send_answer(f"Here: [screenshot.png]({image})")
 
             self.assertEqual(len(telegram.attachments), 1)
-            self.assertEqual(telegram.attachments[0][0], image)
+            self.assertEqual(telegram.attachments[0][0].resolve(), image.resolve())
             self.assertEqual(telegram.sent, ["Here:"])
             self.assertNotIn(str(image), telegram.sent[0])
 
@@ -1366,7 +1411,7 @@ Overwrite existing file? [y/N]
             bridge.send_answer(f"스크린샷입니다: {image}")
 
             self.assertEqual(len(telegram.attachments), 1)
-            self.assertEqual(telegram.attachments[0][0], image)
+            self.assertEqual(telegram.attachments[0][0].resolve(), image.resolve())
             self.assertEqual(telegram.sent, ["스크린샷입니다:"])
             self.assertNotIn(str(image), telegram.sent[0])
 
@@ -1407,7 +1452,7 @@ Overwrite existing file? [y/N]
             bridge.send_answer(f"영상입니다: {video}")
 
             self.assertEqual(len(telegram.attachments), 1)
-            self.assertEqual(telegram.attachments[0][0], video)
+            self.assertEqual(telegram.attachments[0][0].resolve(), video.resolve())
             self.assertEqual(telegram.sent, ["영상입니다:"])
             self.assertNotIn(str(video), telegram.sent[0])
 
@@ -1422,7 +1467,7 @@ Overwrite existing file? [y/N]
             bridge.send_answer(f"음성입니다: [voice.oga]({audio})")
 
             self.assertEqual(len(telegram.attachments), 1)
-            self.assertEqual(telegram.attachments[0][0], audio)
+            self.assertEqual(telegram.attachments[0][0].resolve(), audio.resolve())
             self.assertEqual(telegram.sent, ["음성입니다:"])
             self.assertNotIn(str(audio), telegram.sent[0])
 

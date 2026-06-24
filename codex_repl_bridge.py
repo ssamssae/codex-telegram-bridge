@@ -305,6 +305,8 @@ def is_copy_payload_message(text: str) -> bool:
         or first_line.startswith("상세 스펙:")
         or first_line.startswith("상세설명:")
         or first_line.startswith("상세 설명:")
+        or re.match(r"^제목\s*:", first_line) is not None
+        or re.match(r"^(내용|본문)\s*:", first_line) is not None
     )
 
 
@@ -322,6 +324,10 @@ def copy_payload_kind(text: str) -> str:
         or first_line.startswith("상세 설명:")
     ):
         return "spec"
+    if re.match(r"^제목\s*:", first_line):
+        return "title"
+    if re.match(r"^(내용|본문)\s*:", first_line):
+        return "content"
     return ""
 
 
@@ -329,7 +335,9 @@ def split_copy_payload_messages(text: str) -> list[str]:
     body = strip_node_emoji_header(text).strip()
     if not is_copy_payload_message(body):
         return []
-    split_re = re.compile(r"\n(?=(?:/goal(?:\s|$)|상세\s*스펙:|상세\s*설명:))")
+    split_re = re.compile(
+        r"\n(?=(?:/goal(?:\s|$)|상세\s*스펙:|상세\s*설명:|제목\s*:|(?:내용|본문)\s*:))"
+    )
     starts = [0, *[match.start() + 1 for match in split_re.finditer(body)]]
     starts = sorted(set(starts))
     parts: list[str] = []
@@ -387,6 +395,8 @@ COPY_PAYLOAD_SPLIT_MARKERS = (
 )
 GOAL_INTENT_RE = re.compile(r"(^|[\s,+/(])골(\s*명령어)?(?=([\s,+/)]|랑|와|과|하고|및|$))")
 SPEC_INTENT_RE = re.compile(r"상세\s*(스[펙팩]|설명|프롬프트)")
+TITLE_INTENT_RE = re.compile(r"제목")
+CONTENT_INTENT_RE = re.compile(r"내용|본문")
 
 
 def copy_payload_goal_intent(prompt: str) -> bool:
@@ -404,6 +414,14 @@ def copy_payload_goal_intent(prompt: str) -> bool:
 
 def copy_payload_spec_intent(prompt: str) -> bool:
     return bool(SPEC_INTENT_RE.search(normalize_prompt(prompt)))
+
+
+def copy_payload_title_intent(prompt: str) -> bool:
+    return bool(TITLE_INTENT_RE.search(normalize_prompt(prompt)))
+
+
+def copy_payload_content_intent(prompt: str) -> bool:
+    return bool(CONTENT_INTENT_RE.search(normalize_prompt(prompt)))
 
 
 def copy_payload_single_message_intent(prompt: str) -> bool:
@@ -424,19 +442,24 @@ def copy_payload_split_intent(prompt: str) -> bool:
 
 def prompt_requires_copy_payload_pair(prompt: str) -> bool:
     return (
-        copy_payload_goal_intent(prompt)
-        and copy_payload_spec_intent(prompt)
-        and copy_payload_split_intent(prompt)
+        copy_payload_split_intent(prompt)
+        and (
+            (copy_payload_goal_intent(prompt) and copy_payload_spec_intent(prompt))
+            or (copy_payload_title_intent(prompt) and copy_payload_content_intent(prompt))
+        )
     )
 
 
 def copy_payload_pair_contract(prompt: str) -> dict[str, Any] | None:
     if not prompt_requires_copy_payload_pair(prompt):
         return None
+    required = ["goal", "spec"]
+    if copy_payload_title_intent(prompt) and copy_payload_content_intent(prompt):
+        required = ["title", "content"]
     digest = hashlib.sha256(normalize_prompt(prompt).encode("utf-8", errors="replace")).hexdigest()
     return {
         "prompt_sha256": digest,
-        "required": ["goal", "spec"],
+        "required": required,
         "sent": [],
         "notified_missing": False,
     }
@@ -454,8 +477,13 @@ def copy_payload_pair_missing(contract: dict[str, Any] | None) -> list[str]:
 
 
 def copy_payload_pair_missing_warning(missing: list[str]) -> str:
-    labels = {"goal": "/goal", "spec": "상세스펙/상세설명"}
+    labels = {"goal": "/goal", "spec": "상세스펙/상세설명", "title": "제목", "content": "내용"}
     missing_labels = ", ".join(labels.get(item, item) for item in missing)
+    if any(item in {"title", "content"} for item in missing):
+        return (
+            f"복붙용 2통 요청에서 {missing_labels} 메시지가 누락됐어요. "
+            "제목 한 통과 내용 한 통을 각각 따로 다시 보내 달라고 요청해 주세요."
+        )
     return (
         f"복붙용 2통 요청에서 {missing_labels} 메시지가 누락됐어요. "
         "/goal 한 통과 상세스펙 한 통을 각각 따로 다시 보내 달라고 요청해 주세요."
@@ -463,8 +491,22 @@ def copy_payload_pair_missing_warning(missing: list[str]) -> str:
 
 
 def copy_payload_pair_repair_prompt(missing: list[str]) -> str:
-    labels = {"goal": "/goal 명령어", "spec": "상세스펙 또는 상세설명"}
+    labels = {
+        "goal": "/goal 명령어",
+        "spec": "상세스펙 또는 상세설명",
+        "title": "제목",
+        "content": "내용 또는 본문",
+    }
     missing_labels = ", ".join(labels.get(item, item) for item in missing)
+    if any(item in {"title", "content"} for item in missing):
+        return (
+            "방금 텔레그램 사용자는 복붙용 메시지 2통을 따로 요청했습니다. "
+            f"아직 {missing_labels} 메시지가 누락됐습니다.\n"
+            "지금 누락된 복붙용 메시지만 텔레그램에 그대로 보낼 수 있게 출력하세요. "
+            "설명, 사과, 헤더, 구분선 없이 순수 복붙용 콘텐츠만 출력하세요.\n"
+            "누락이 제목이면 첫 줄은 제목: 으로 시작하세요. "
+            "누락이 내용이면 첫 줄은 내용: 으로 시작하세요."
+        )
     return (
         "방금 텔레그램 사용자는 복붙용 메시지 2통을 따로 요청했습니다. "
         f"아직 {missing_labels} 메시지가 누락됐습니다.\n"
