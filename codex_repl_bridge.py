@@ -301,6 +301,14 @@ def is_copy_payload_message(text: str) -> bool:
     return first_line == "/goal" or first_line.startswith("/goal ") or first_line.startswith("상세스펙:")
 
 
+def copy_payload_dedup_key(text: str) -> str:
+    body = strip_node_emoji_header(text).strip()
+    if not body:
+        return ""
+    digest = hashlib.sha256(body.encode("utf-8", errors="replace")).hexdigest()
+    return f"copy_payload:{digest}"
+
+
 def format_progress_summary(text: str, limit: int = 180) -> str:
     body = " ".join(strip_node_emoji_header(text).split())
     return truncate_text(body, limit).strip()
@@ -1834,7 +1842,7 @@ class Bridge:
                 self.persist_state(line_end)
             return True
         elif kind == "copy_payload":
-            key = event_dedup_key(record, kind, text)
+            key = copy_payload_dedup_key(text) or event_dedup_key(record, kind, text)
             if self.bridge_state and ring_contains(self.bridge_state, key):
                 log("SEND", "skip duplicate copy payload")
                 if line_end is not None:
@@ -1847,6 +1855,15 @@ class Bridge:
             return True
         elif kind == "assistant":
             key = event_dedup_key(record, kind, text)
+            copy_key = copy_payload_dedup_key(text) if is_copy_payload_message(text) else ""
+            if copy_key and self.bridge_state and ring_contains(self.bridge_state, copy_key):
+                log("SEND", "skip duplicate copy payload final_answer")
+                self.stop_repl_typing()
+                self.stop_long_running_progress()
+                self.clear_active_telegram_prompt()
+                if line_end is not None:
+                    self.persist_state(line_end)
+                return True
             if self.bridge_state and ring_contains(self.bridge_state, key):
                 log("SEND", "skip duplicate final_answer")
                 self.stop_repl_typing()
@@ -1857,6 +1874,8 @@ class Bridge:
                 return True
             if not self.handle_assistant_event(text):
                 return False
+            if copy_key:
+                self.persist_state(event_key=copy_key)
             if line_end is not None:
                 self.persist_state(line_end, key)
             return True
@@ -1911,6 +1930,10 @@ class Bridge:
             log("BACKF", "no eligible final_answer")
             return
         for event in candidates:
+            copy_key = copy_payload_dedup_key(event.text) if is_copy_payload_message(event.text) else ""
+            if copy_key and ring_contains(state, copy_key):
+                log("BACKF", "skip duplicate copy payload final_answer")
+                continue
             if ring_contains(state, event.key):
                 continue
             log("BACKF", f"send final_answer at offset {event.start}")
@@ -1918,6 +1941,8 @@ class Bridge:
                 self.session_pos = event.start
                 log("BACKF", "send failed; retry from candidate offset")
                 return
+            if copy_key:
+                ring_push(state, copy_key, self.config.state_ring_cap)
             ring_push(state, event.key, self.config.state_ring_cap)
         self.bridge_state = state
         self.session_pos = identity.size

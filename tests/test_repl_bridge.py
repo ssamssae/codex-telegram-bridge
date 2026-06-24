@@ -494,6 +494,88 @@ class ReplBridgeTests(unittest.TestCase):
 
             self.assertEqual(telegram.sent, [goal, spec])
 
+    def test_duplicate_goal_copy_payload_commentary_dedups_by_body(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            cfg = config(tmpdir)
+            telegram = FakeTelegram()
+            bridge = repl.Bridge(cfg, telegram, FakeRepl())
+            identity = repl.SessionIdentity(str(Path(tmpdir) / "rollout.jsonl"), 1, 2, 100)
+            bridge.session_identity = identity
+            bridge.bridge_state = repl.bridge_state_default(identity)
+            goal = "/goal Codex Telegram bridge와 Claude Telegram bridge의 완성도 격차를 줄인다."
+            first = {
+                "timestamp": "2026-06-20T00:00:01Z",
+                "type": "event_msg",
+                "payload": {
+                    "type": "agent_message",
+                    "phase": "commentary",
+                    "message": goal,
+                },
+            }
+            second = {
+                "timestamp": "2026-06-20T00:00:02Z",
+                "type": "event_msg",
+                "payload": {
+                    "type": "agent_message",
+                    "phase": "commentary",
+                    "message": goal,
+                },
+            }
+            first_line = json.dumps(first) + "\n"
+            second_line = json.dumps(second) + "\n"
+
+            self.assertTrue(bridge.process_line(first_line, 0, len(first_line)))
+            self.assertTrue(
+                bridge.process_line(
+                    second_line,
+                    len(first_line),
+                    len(first_line) + len(second_line),
+                )
+            )
+
+            self.assertEqual(telegram.sent, [goal])
+
+    def test_duplicate_goal_copy_payload_final_answer_is_skipped(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            cfg = config(tmpdir)
+            telegram = FakeTelegram()
+            bridge = repl.Bridge(cfg, telegram, FakeRepl())
+            identity = repl.SessionIdentity(str(Path(tmpdir) / "rollout.jsonl"), 1, 2, 100)
+            bridge.session_identity = identity
+            bridge.bridge_state = repl.bridge_state_default(identity)
+            goal = "/goal Codex Telegram bridge와 Claude Telegram bridge의 완성도 격차를 줄인다."
+            commentary = {
+                "timestamp": "2026-06-20T00:00:01Z",
+                "type": "event_msg",
+                "payload": {
+                    "type": "agent_message",
+                    "phase": "commentary",
+                    "message": goal,
+                },
+            }
+            assistant = {
+                "timestamp": "2026-06-20T00:00:02Z",
+                "type": "event_msg",
+                "payload": {
+                    "type": "agent_message",
+                    "phase": "final_answer",
+                    "message": goal,
+                },
+            }
+            commentary_line = json.dumps(commentary) + "\n"
+            assistant_line = json.dumps(assistant) + "\n"
+
+            self.assertTrue(bridge.process_line(commentary_line, 0, len(commentary_line)))
+            self.assertTrue(
+                bridge.process_line(
+                    assistant_line,
+                    len(commentary_line),
+                    len(commentary_line) + len(assistant_line),
+                )
+            )
+
+            self.assertEqual(telegram.sent, [goal])
+
     def test_telegram_prompt_tracking_sends_periodic_progress_update(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             cfg = config(tmpdir, long_running_progress_seconds=1)
