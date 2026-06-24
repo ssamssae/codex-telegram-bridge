@@ -576,6 +576,84 @@ class ReplBridgeTests(unittest.TestCase):
 
             self.assertEqual(telegram.sent, [goal])
 
+    def test_copy_payload_pair_contract_allows_goal_and_spec_two_messages(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            cfg = config(tmpdir)
+            telegram = FakeTelegram()
+            bridge = repl.Bridge(cfg, telegram, FakeRepl())
+            identity = repl.SessionIdentity(str(Path(tmpdir) / "rollout.jsonl"), 1, 2, 100)
+            bridge.session_identity = identity
+            bridge.bridge_state = repl.bridge_state_default(identity)
+            prompt = "골 명령어랑 상세스펙 두 통 따로 보내줘"
+            goal = "/goal Codex Telegram bridge recurrence guard를 구현한다."
+            spec = "상세스펙:\n\n- /goal 한 통과 상세스펙 한 통을 각각 보낸다."
+            user = {
+                "timestamp": "2026-06-20T00:00:00Z",
+                "type": "event_msg",
+                "payload": {"type": "user_message", "message": prompt},
+            }
+            commentary = {
+                "timestamp": "2026-06-20T00:00:01Z",
+                "type": "event_msg",
+                "payload": {"type": "agent_message", "phase": "commentary", "message": goal},
+            }
+            assistant = {
+                "timestamp": "2026-06-20T00:00:02Z",
+                "type": "event_msg",
+                "payload": {"type": "agent_message", "phase": "final_answer", "message": spec},
+            }
+            records = [user, commentary, assistant]
+            bridge.begin_telegram_prompt_tracking(prompt)
+            cursor = 0
+            for record in records:
+                line = json.dumps(record) + "\n"
+                self.assertTrue(bridge.process_line(line, cursor, cursor + len(line)))
+                cursor += len(line)
+
+            self.assertEqual(telegram.sent, [goal, spec])
+            state = json.loads(Path(cfg.state_path).read_text(encoding="utf-8"))
+            self.assertNotIn("copy_payload_pair_contract", state)
+            self.assertNotIn("last_copy_payload_pair_missing", state)
+
+    def test_copy_payload_pair_contract_warns_when_spec_is_missing(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            cfg = config(tmpdir)
+            telegram = FakeTelegram()
+            bridge = repl.Bridge(cfg, telegram, FakeRepl())
+            identity = repl.SessionIdentity(str(Path(tmpdir) / "rollout.jsonl"), 1, 2, 100)
+            bridge.session_identity = identity
+            bridge.bridge_state = repl.bridge_state_default(identity)
+            prompt = "그거 골 명령어 상세스펙 2개로 보내줘"
+            goal = "/goal Codex Telegram bridge recurrence guard를 구현한다."
+            user = {
+                "timestamp": "2026-06-20T00:00:00Z",
+                "type": "event_msg",
+                "payload": {"type": "user_message", "message": prompt},
+            }
+            assistant = {
+                "timestamp": "2026-06-20T00:00:01Z",
+                "type": "event_msg",
+                "payload": {"type": "agent_message", "phase": "final_answer", "message": goal},
+            }
+            bridge.begin_telegram_prompt_tracking(prompt)
+            user_line = json.dumps(user) + "\n"
+            assistant_line = json.dumps(assistant) + "\n"
+
+            self.assertTrue(bridge.process_line(user_line, 0, len(user_line)))
+            self.assertTrue(
+                bridge.process_line(
+                    assistant_line,
+                    len(user_line),
+                    len(user_line) + len(assistant_line),
+                )
+            )
+
+            self.assertEqual(telegram.sent[0], goal)
+            self.assertIn("상세스펙", telegram.sent[1])
+            self.assertIn("누락", telegram.sent[1])
+            state = json.loads(Path(cfg.state_path).read_text(encoding="utf-8"))
+            self.assertEqual(state["last_copy_payload_pair_missing"]["missing"], ["spec"])
+
     def test_telegram_prompt_tracking_sends_periodic_progress_update(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             cfg = config(tmpdir, long_running_progress_seconds=1)

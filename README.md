@@ -20,7 +20,7 @@ the remote control when you are away from the keyboard.
 Install with `pipx`, then run the setup wizard:
 
 ```bash
-pipx install "git+https://github.com/ssamssae/codex-telegram-bridge.git@v0.3.19"
+pipx install "git+https://github.com/ssamssae/codex-telegram-bridge.git@v0.3.20"
 codex-telegram-bridge setup
 codex-telegram-bridge doctor
 ```
@@ -81,6 +81,7 @@ Codex slash command
   -> mirror "Unrecognized command" errors back to Telegram
   -> clear the Codex composer before Telegram input so stale typo commands cannot be appended
   -> keep Telegram typing and progress updates active for long-running commands such as /goal
+  -> warn if a requested two-message /goal + 상세스펙 copy-paste payload is incomplete
 
 Answer media attachments
   -> detect local image/video/audio paths in final answers

@@ -301,12 +301,78 @@ def is_copy_payload_message(text: str) -> bool:
     return first_line == "/goal" or first_line.startswith("/goal ") or first_line.startswith("상세스펙:")
 
 
+def copy_payload_kind(text: str) -> str:
+    body = strip_node_emoji_header(text).strip()
+    if not body:
+        return ""
+    first_line = body.splitlines()[0].strip()
+    if first_line == "/goal" or first_line.startswith("/goal "):
+        return "goal"
+    if first_line.startswith("상세스펙:"):
+        return "spec"
+    return ""
+
+
 def copy_payload_dedup_key(text: str) -> str:
     body = strip_node_emoji_header(text).strip()
     if not body:
         return ""
     digest = hashlib.sha256(body.encode("utf-8", errors="replace")).hexdigest()
     return f"copy_payload:{digest}"
+
+
+def prompt_requires_copy_payload_pair(prompt: str) -> bool:
+    body = normalize_prompt(prompt)
+    if not body:
+        return False
+    lowered = body.lower()
+    has_goal = "/goal" in lowered or "골 명령어" in body or "goal 명령어" in lowered
+    has_spec = "상세스펙" in body
+    split_markers = (
+        "2통",
+        "두 통",
+        "2개",
+        "두개",
+        "따로",
+        "분리",
+        "나눠",
+        "별도",
+        "각각",
+    )
+    wants_split = any(marker in body for marker in split_markers) or ("먼저" in body and "다음" in body)
+    return has_goal and has_spec and wants_split
+
+
+def copy_payload_pair_contract(prompt: str) -> dict[str, Any] | None:
+    if not prompt_requires_copy_payload_pair(prompt):
+        return None
+    digest = hashlib.sha256(normalize_prompt(prompt).encode("utf-8", errors="replace")).hexdigest()
+    return {
+        "prompt_sha256": digest,
+        "required": ["goal", "spec"],
+        "sent": [],
+        "notified_missing": False,
+    }
+
+
+def copy_payload_pair_missing(contract: dict[str, Any] | None) -> list[str]:
+    if not isinstance(contract, dict):
+        return []
+    required = contract.get("required")
+    if not isinstance(required, list) or not required:
+        required = ["goal", "spec"]
+    sent = contract.get("sent")
+    sent_set = {str(item) for item in sent} if isinstance(sent, list) else set()
+    return [str(item) for item in required if str(item) not in sent_set]
+
+
+def copy_payload_pair_missing_warning(missing: list[str]) -> str:
+    labels = {"goal": "/goal", "spec": "상세스펙"}
+    missing_labels = ", ".join(labels.get(item, item) for item in missing)
+    return (
+        f"복붙용 2통 요청에서 {missing_labels} 메시지가 누락됐어요. "
+        "/goal 한 통과 상세스펙 한 통을 각각 따로 다시 보내 달라고 요청해 주세요."
+    )
 
 
 def format_progress_summary(text: str, limit: int = 180) -> str:
@@ -1762,7 +1828,10 @@ class Bridge:
         if not message:
             return True
         log("SEND", "Telegram copy payload from commentary")
-        return self.send_answer(message)
+        ok = self.send_answer(message)
+        if ok:
+            self.record_copy_payload_pair_part(message)
+        return ok
 
     def handle_assistant_event(self, text: str) -> bool:
         self.stop_repl_typing()
@@ -1776,6 +1845,9 @@ class Bridge:
         log("SEND", f"Telegram mirror from {origin}")
         if not self.send_answer(answer):
             return False
+        if is_copy_payload_message(answer):
+            self.record_copy_payload_pair_part(answer)
+        self.warn_incomplete_copy_payload_pair_if_needed()
         self.clear_active_telegram_prompt()
         self.current_origin = None
         self.suppress_until_user = True
@@ -1814,6 +1886,78 @@ class Bridge:
             ring_push(state, event_key, self.config.state_ring_cap)
         write_json_atomic(self.config.state_path, state)
         self.bridge_state = state
+
+    def set_copy_payload_pair_contract(self, prompt: str) -> None:
+        contract = copy_payload_pair_contract(prompt)
+        with self.lock:
+            if self.bridge_state is None:
+                return
+            if contract:
+                self.bridge_state["copy_payload_pair_contract"] = contract
+                self.bridge_state.pop("last_copy_payload_pair_missing", None)
+            else:
+                self.bridge_state.pop("copy_payload_pair_contract", None)
+        self.persist_state()
+
+    def copy_payload_pair_contract_state(self) -> dict[str, Any] | None:
+        with self.lock:
+            if self.bridge_state is None:
+                return None
+            contract = self.bridge_state.get("copy_payload_pair_contract")
+            return contract if isinstance(contract, dict) else None
+
+    def record_copy_payload_pair_part(self, message: str) -> None:
+        part = copy_payload_kind(message)
+        if not part:
+            return
+        with self.lock:
+            if self.bridge_state is None:
+                return
+            contract = self.bridge_state.get("copy_payload_pair_contract")
+            if not isinstance(contract, dict):
+                return
+            sent = contract.get("sent")
+            sent_list = [str(item) for item in sent] if isinstance(sent, list) else []
+            if part not in sent_list:
+                sent_list.append(part)
+            contract["sent"] = sent_list
+            self.bridge_state["copy_payload_pair_contract"] = contract
+        self.persist_state()
+
+    def warn_incomplete_copy_payload_pair_if_needed(self) -> None:
+        contract = self.copy_payload_pair_contract_state()
+        if not contract:
+            return
+        missing = copy_payload_pair_missing(contract)
+        if not missing:
+            with self.lock:
+                if self.bridge_state is not None:
+                    self.bridge_state.pop("copy_payload_pair_contract", None)
+                    self.bridge_state.pop("last_copy_payload_pair_missing", None)
+            self.persist_state()
+            return
+        if contract.get("notified_missing"):
+            return
+        warning = copy_payload_pair_missing_warning(missing)
+        if self.config.bridge_kill:
+            log("SEND", "copy payload pair warning blocked by CRB_KILL=1")
+            return
+        if not self.telegram.send(warning):
+            log("SEND", "copy payload pair warning failed")
+            return
+        with self.lock:
+            if self.bridge_state is None:
+                return
+            contract = self.bridge_state.get("copy_payload_pair_contract")
+            if isinstance(contract, dict):
+                contract["notified_missing"] = True
+                self.bridge_state["copy_payload_pair_contract"] = contract
+                self.bridge_state["last_copy_payload_pair_missing"] = {
+                    "missing": missing,
+                    "prompt_sha256": str(contract.get("prompt_sha256") or ""),
+                    "ts": int(time.time()),
+                }
+        self.persist_state()
 
     def process_line(
         self,
@@ -1860,6 +2004,8 @@ class Bridge:
                 log("SEND", "skip duplicate copy payload final_answer")
                 self.stop_repl_typing()
                 self.stop_long_running_progress()
+                self.record_copy_payload_pair_part(text)
+                self.warn_incomplete_copy_payload_pair_if_needed()
                 self.clear_active_telegram_prompt()
                 if line_end is not None:
                     self.persist_state(line_end)
@@ -2038,6 +2184,7 @@ class Bridge:
             self.suppress_until_user = False
             self.last_public_progress = ""
         self.set_active_telegram_prompt(prompt)
+        self.set_copy_payload_pair_contract(prompt)
         self.start_long_running_progress(prompt)
 
     def start_long_running_progress(self, prompt: str) -> None:
