@@ -354,42 +354,80 @@ def copy_payload_dedup_key(text: str, scope: str = "") -> str:
     return f"copy_payload:{digest}"
 
 
-def prompt_requires_copy_payload_pair(prompt: str) -> bool:
+COPY_PAYLOAD_SINGLE_MESSAGE_MARKERS = (
+    "한 통",
+    "한통",
+    "1통",
+    "한 메시지",
+    "한메시지",
+    "한 번에",
+    "한번에",
+    "같이",
+    "합쳐",
+    "합쳐서",
+    "묶어서",
+)
+COPY_PAYLOAD_SPLIT_MARKERS = (
+    "2통",
+    "두 통",
+    "두통",
+    "2개",
+    "두개",
+    "두 번",
+    "두번",
+    "따로",
+    "분리",
+    "나눠",
+    "나누",
+    "별도",
+    "각각",
+    "그 다음",
+    "그다음",
+    "다음에",
+)
+GOAL_INTENT_RE = re.compile(r"(^|[\s,+/(])골(\s*명령어)?(?=([\s,+/)]|랑|와|과|하고|및|$))")
+SPEC_INTENT_RE = re.compile(r"상세\s*(스[펙팩]|설명|프롬프트)")
+
+
+def copy_payload_goal_intent(prompt: str) -> bool:
     body = normalize_prompt(prompt)
     if not body:
         return False
     lowered = body.lower()
-    has_goal = (
+    return (
         "/goal" in lowered
-        or "골 명령어" in body
-        or "골명령어" in body
         or "goal 명령어" in lowered
         or "goal명령어" in lowered
+        or bool(GOAL_INTENT_RE.search(body))
     )
-    has_spec = any(
-        marker in body
-        for marker in (
-            "상세스펙",
-            "상세 스펙",
-            "상세설명",
-            "상세 설명",
-            "상세프롬프트",
-            "상세 프롬프트",
-        )
+
+
+def copy_payload_spec_intent(prompt: str) -> bool:
+    return bool(SPEC_INTENT_RE.search(normalize_prompt(prompt)))
+
+
+def copy_payload_single_message_intent(prompt: str) -> bool:
+    body = normalize_prompt(prompt)
+    return any(marker in body for marker in COPY_PAYLOAD_SINGLE_MESSAGE_MARKERS)
+
+
+def copy_payload_split_intent(prompt: str) -> bool:
+    body = normalize_prompt(prompt)
+    if not body or copy_payload_single_message_intent(body):
+        return False
+    return (
+        any(marker in body for marker in COPY_PAYLOAD_SPLIT_MARKERS)
+        or ("먼저" in body and "다음" in body)
+        or body.count("보내") >= 2
     )
-    split_markers = (
-        "2통",
-        "두 통",
-        "2개",
-        "두개",
-        "따로",
-        "분리",
-        "나눠",
-        "별도",
-        "각각",
+
+
+def prompt_requires_copy_payload_pair(prompt: str) -> bool:
+    return (
+        copy_payload_goal_intent(prompt)
+        and copy_payload_spec_intent(prompt)
+        and copy_payload_split_intent(prompt)
     )
-    wants_split = any(marker in body for marker in split_markers) or ("먼저" in body and "다음" in body)
-    return has_goal and has_spec and wants_split
 
 
 def copy_payload_pair_contract(prompt: str) -> dict[str, Any] | None:

@@ -727,6 +727,59 @@ class ReplBridgeTests(unittest.TestCase):
             self.assertEqual(telegram.sent, [goal, spec])
             self.assertEqual(fake_repl.prompts, [])
 
+    def test_copy_payload_pair_contract_repairs_bare_gol_dubeon_request(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            cfg = config(tmpdir)
+            telegram = FakeTelegram()
+            fake_repl = FakeRepl()
+            bridge = repl.Bridge(cfg, telegram, fake_repl)
+            identity = repl.SessionIdentity(str(Path(tmpdir) / "rollout.jsonl"), 1, 2, 100)
+            bridge.session_identity = identity
+            bridge.bridge_state = repl.bridge_state_default(identity)
+            prompt = "다시 그러면 아까 요청한 골 + 상세스펙 두번 보내줘"
+            goal = "/goal Codex Telegram bridge recurrence guard를 구현한다."
+            user = {
+                "timestamp": "2026-06-20T00:00:00Z",
+                "type": "event_msg",
+                "payload": {"type": "user_message", "message": prompt},
+            }
+            assistant = {
+                "timestamp": "2026-06-20T00:00:01Z",
+                "type": "event_msg",
+                "payload": {"type": "agent_message", "phase": "final_answer", "message": goal},
+            }
+            bridge.begin_telegram_prompt_tracking(prompt)
+            user_line = json.dumps(user) + "\n"
+            assistant_line = json.dumps(assistant) + "\n"
+
+            self.assertTrue(bridge.process_line(user_line, 0, len(user_line)))
+            self.assertTrue(
+                bridge.process_line(
+                    assistant_line,
+                    len(user_line),
+                    len(user_line) + len(assistant_line),
+                )
+            )
+
+            self.assertEqual(telegram.sent, [goal])
+            self.assertEqual(len(fake_repl.prompts), 1)
+            self.assertIn("상세스펙", fake_repl.prompts[0])
+            self.assertIn("누락", fake_repl.prompts[0])
+            state = json.loads(Path(cfg.state_path).read_text(encoding="utf-8"))
+            self.assertEqual(state["last_copy_payload_pair_missing"]["missing"], ["spec"])
+            self.assertTrue(state["last_copy_payload_pair_missing"]["auto_repair_requested"])
+
+    def test_copy_payload_pair_classifier_handles_korean_split_variants(self):
+        self.assertTrue(repl.prompt_requires_copy_payload_pair("골 보내고 상세스펙 보내줘"))
+        self.assertTrue(repl.prompt_requires_copy_payload_pair("/goal 상세스팩 2통"))
+        self.assertTrue(repl.prompt_requires_copy_payload_pair("골명령어랑 상세설명 두 번 보내"))
+
+    def test_copy_payload_pair_classifier_rejects_false_positive_and_single_message(self):
+        self.assertFalse(repl.prompt_requires_copy_payload_pair("해골 골라줘 상세설명 따로"))
+        self.assertFalse(repl.prompt_requires_copy_payload_pair("골치 아픈 상세설명 따로"))
+        self.assertFalse(repl.prompt_requires_copy_payload_pair("/goal 상세스펙 한 통에 같이"))
+        self.assertFalse(repl.prompt_requires_copy_payload_pair("/goal 상세스펙 합쳐서 보내"))
+
     def test_combined_goal_and_spec_final_answer_splits_into_two_messages(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             cfg = config(tmpdir)
