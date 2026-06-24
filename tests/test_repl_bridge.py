@@ -31,6 +31,7 @@ def config(tmpdir, **overrides):
         "typing_max_seconds": 30,
         "typing_liveness_seconds": 10,
         "long_running_progress_seconds": 0,
+        "telegram_fallback_seconds": 0,
         "approval_ttl_seconds": 300,
         "workdir": Path(tmpdir),
         "attachment_roots": (Path(tmpdir),),
@@ -53,6 +54,7 @@ def config(tmpdir, **overrides):
 class ConfigDefaultsTest(unittest.TestCase):
     def test_default_long_running_progress_interval_is_ten_minutes(self):
         old_progress = os.environ.pop("CRB_LONG_RUNNING_PROGRESS_SECONDS", None)
+        old_fallback = os.environ.pop("CRB_TELEGRAM_FALLBACK_SECONDS", None)
         old_liveness = os.environ.pop("CRB_TYPING_LIVENESS_SECONDS", None)
         old_chat_id = os.environ.get("TAB_CHAT_ID")
         os.environ["TAB_CHAT_ID"] = "1234"
@@ -61,6 +63,8 @@ class ConfigDefaultsTest(unittest.TestCase):
         finally:
             if old_progress is not None:
                 os.environ["CRB_LONG_RUNNING_PROGRESS_SECONDS"] = old_progress
+            if old_fallback is not None:
+                os.environ["CRB_TELEGRAM_FALLBACK_SECONDS"] = old_fallback
             if old_liveness is not None:
                 os.environ["CRB_TYPING_LIVENESS_SECONDS"] = old_liveness
             if old_chat_id is None:
@@ -69,6 +73,7 @@ class ConfigDefaultsTest(unittest.TestCase):
                 os.environ["TAB_CHAT_ID"] = old_chat_id
 
         self.assertEqual(cfg.long_running_progress_seconds, 600)
+        self.assertEqual(cfg.telegram_fallback_seconds, 90)
         self.assertEqual(cfg.typing_liveness_seconds, 10)
 
     def test_emoji_prefix_strips_inline_node_emoji_from_answer_body(self):
@@ -899,6 +904,35 @@ class ReplBridgeTests(unittest.TestCase):
             self.assertIn("Task ID: T-260624-11", telegram.sent[0])
             self.assertIn("Recent: copied to nodes checking services", telegram.sent[0])
             self.assertIn("Blocked: no blocker reported", telegram.sent[0])
+
+    def test_telegram_fallback_sends_once_before_delayed_final_answer(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            cfg = config(tmpdir, telegram_fallback_seconds=0)
+            telegram = FakeTelegram()
+            bridge = repl.Bridge(cfg, telegram, FakeRepl())
+
+            bridge.begin_telegram_prompt_tracking("why is desktop bridge silent")
+            bridge.handle_progress_event("checking logs\nwaiting for final_answer")
+            bridge.send_telegram_fallback("why is desktop bridge silent", 95)
+            bridge.send_telegram_fallback("why is desktop bridge silent", 120)
+
+            self.assertEqual(len(telegram.sent), 1)
+            self.assertIn("Still working", telegram.sent[0])
+            self.assertIn("Recent: checking logs waiting for final_answer", telegram.sent[0])
+
+            self.assertTrue(bridge.handle_assistant_event("final result"))
+            self.assertEqual(telegram.sent[-1], "final result")
+
+    def test_telegram_fallback_does_not_send_for_terminal_origin(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            cfg = config(tmpdir, telegram_fallback_seconds=0)
+            telegram = FakeTelegram()
+            bridge = repl.Bridge(cfg, telegram, FakeRepl())
+
+            bridge.handle_user_event("typed directly in terminal")
+            bridge.send_telegram_fallback("typed directly in terminal", 95)
+
+            self.assertEqual(telegram.sent, [])
 
     def test_liveness_recovers_typing_when_repl_is_busy(self):
         with tempfile.TemporaryDirectory() as tmpdir:

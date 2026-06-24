@@ -20,7 +20,7 @@ the remote control when you are away from the keyboard.
 Install with `pipx`, then run the setup wizard:
 
 ```bash
-pipx install "git+https://github.com/ssamssae/codex-telegram-bridge.git@v0.3.24"
+pipx install "git+https://github.com/ssamssae/codex-telegram-bridge.git@v0.3.25"
 codex-telegram-bridge setup
 codex-telegram-bridge doctor
 ```
@@ -60,6 +60,7 @@ Codex CLI input
   -> JSONL user event
   -> Telegram "typing..." while Codex is working
   -> recover Telegram "typing..." if the bridge restarts while the Codex pane is still busy
+  -> send a one-shot fallback progress reply if final_answer is delayed
   -> periodic detailed progress updates for long Telegram-origin turns
   -> final answer mirrored to Telegram
 
@@ -110,6 +111,9 @@ Service restart
 - Long-running Telegram-origin turns send progress reports with the task label,
   optional task id, elapsed time, latest public progress note, next step, and
   blocker status.
+- Telegram-origin turns also send one early fallback progress reply after 90
+  seconds by default, so a turn that is producing commentary/tool activity but
+  has not emitted `final_answer` yet does not look silent from Telegram.
 - If the daemon restarts or joins mid-turn, it checks the visible Codex pane
   every 10 seconds by default and restarts Telegram `typing...` while Codex is
   still working. Set `CRB_TYPING_LIVENESS_SECONDS=0` to disable this recovery
@@ -324,6 +328,7 @@ Required settings are intentionally small and explicit.
 | `CRB_TMUX_SESSION` | repl only | `codex` | tmux session or target for the visible Codex TUI. |
 | `CRB_TMUX_SUBMIT_KEY` | repl only | `Tab` | key sent after pasting Telegram prompts into Codex. |
 | `CRB_TYPING_MAX_SECONDS` | no | `7200` | Maximum lifetime for repeated Telegram `typing` actions during one visible Codex turn. |
+| `CRB_TELEGRAM_FALLBACK_SECONDS` | no | `90` | One-shot fallback progress reply delay for Telegram-origin REPL prompts when `final_answer` is delayed. Set `0` to disable. |
 | `CRB_LONG_RUNNING_PROGRESS_SECONDS` | no | `600` | Seconds between Telegram progress updates for long-running Telegram-origin REPL prompts. Set `0` to disable. |
 | `CRB_AUDIO_TRANSCRIBE_CMD` | no | empty | Optional command template for audio transcription. Use `{path}` for the media file. |
 | `CRB_APPROVAL_TTL_SECONDS` | no | `300` | Seconds before a Telegram approval button is treated as stale. |

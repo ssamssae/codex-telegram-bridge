@@ -791,6 +791,7 @@ class Config:
     typing_max_seconds: int
     typing_liveness_seconds: int
     long_running_progress_seconds: int
+    telegram_fallback_seconds: int
     approval_ttl_seconds: int
     workdir: Path
     attachment_roots: tuple[Path, ...]
@@ -846,6 +847,11 @@ class Config:
             long_running_progress_seconds=int_env(
                 "CRB_LONG_RUNNING_PROGRESS_SECONDS",
                 600,
+                minimum=0,
+            ),
+            telegram_fallback_seconds=int_env(
+                "CRB_TELEGRAM_FALLBACK_SECONDS",
+                90,
                 minimum=0,
             ),
             approval_ttl_seconds=int_env("CRB_APPROVAL_TTL_SECONDS", 300, minimum=30),
@@ -1896,10 +1902,12 @@ class Bridge:
         self.exec_lock = threading.Lock()
         self.typing_lock = threading.Lock()
         self.long_running_progress_lock = threading.Lock()
+        self.telegram_fallback_lock = threading.Lock()
         self.approval_lock = threading.Lock()
         self.choice_lock = threading.Lock()
         self.repl_typing_stop: threading.Event | None = None
         self.long_running_progress_stop: threading.Event | None = None
+        self.telegram_fallback_stop: threading.Event | None = None
         self.pending_telegram: list[str] = []
         self.pending_approval: ApprovalRequest | None = None
         self.pending_approval_message_id: int | None = None
@@ -1913,6 +1921,7 @@ class Bridge:
         self.needs_composer_clear = False
         self.active_telegram_prompt = ""
         self.last_public_progress: str = ""
+        self.telegram_fallback_sent = False
         self.session_path: Path | None = None
         self.session_identity: SessionIdentity | None = None
         self.bridge_state: dict[str, Any] | None = None
@@ -1955,6 +1964,7 @@ class Bridge:
             self.begin_repl_typing()
         else:
             self.current_origin = "terminal"
+            self.stop_telegram_fallback()
             log("JSONL", "terminal-origin prompt")
             self.begin_repl_typing()
 
@@ -1979,6 +1989,7 @@ class Bridge:
             ok = self.send_answer(message)
             if not ok:
                 return False
+            self.mark_telegram_fallback_sent()
             self.record_copy_payload_pair_part(message)
             if key:
                 self.persist_state(event_key=key)
@@ -1987,6 +1998,7 @@ class Bridge:
     def handle_assistant_event(self, text: str) -> bool:
         self.stop_repl_typing()
         self.stop_long_running_progress()
+        self.stop_telegram_fallback()
         if self.suppress_until_user:
             return True
         answer = (text or "").strip()
@@ -2199,6 +2211,7 @@ class Bridge:
                 log("SEND", "skip duplicate copy payload final_answer")
                 self.stop_repl_typing()
                 self.stop_long_running_progress()
+                self.stop_telegram_fallback()
                 for message in split_copy_payload_messages(text):
                     self.record_copy_payload_pair_part(message)
                 if self.request_incomplete_copy_payload_pair_repair_if_needed():
@@ -2214,6 +2227,7 @@ class Bridge:
                 log("SEND", "skip duplicate final_answer")
                 self.stop_repl_typing()
                 self.stop_long_running_progress()
+                self.stop_telegram_fallback()
                 self.clear_active_telegram_prompt()
                 if line_end is not None:
                     self.persist_state(line_end)
@@ -2386,8 +2400,10 @@ class Bridge:
             self.current_origin = "telegram"
             self.suppress_until_user = False
             self.last_public_progress = ""
+            self.telegram_fallback_sent = False
         self.set_active_telegram_prompt(prompt)
         self.set_copy_payload_pair_contract(prompt)
+        self.start_telegram_fallback(prompt)
         self.start_long_running_progress(prompt)
 
     def start_long_running_progress(self, prompt: str) -> None:
@@ -2408,6 +2424,47 @@ class Bridge:
         with self.long_running_progress_lock:
             self.long_running_progress_stop = stop_event
         threading.Thread(target=loop, daemon=True, name="crb-long-progress").start()
+
+    def start_telegram_fallback(self, prompt: str) -> None:
+        self.stop_telegram_fallback()
+        interval = int(getattr(self.config, "telegram_fallback_seconds", 0) or 0)
+        if interval <= 0:
+            return
+        stop_event = threading.Event()
+
+        def loop() -> None:
+            if stop_event.wait(interval):
+                return
+            self.send_telegram_fallback(prompt, float(interval))
+
+        with self.telegram_fallback_lock:
+            self.telegram_fallback_stop = stop_event
+        threading.Thread(target=loop, daemon=True, name="crb-telegram-fallback").start()
+
+    def mark_telegram_fallback_sent(self) -> None:
+        with self.lock:
+            self.telegram_fallback_sent = True
+        self.stop_telegram_fallback()
+
+    def send_telegram_fallback(self, prompt: str, elapsed_seconds: float) -> None:
+        prompt = normalize_prompt(prompt)
+        with self.lock:
+            active = normalize_prompt(self.active_telegram_prompt)
+            if (
+                self.telegram_fallback_sent
+                or self.suppress_until_user
+                or self.current_origin != "telegram"
+                or not active
+                or active != prompt
+            ):
+                return
+            self.telegram_fallback_sent = True
+        if self.config.bridge_kill:
+            log("PROG", "telegram fallback blocked by CRB_KILL=1")
+            return
+        log("PROG", f"send telegram fallback after {int(elapsed_seconds)}s")
+        if not self.telegram.send(self.long_running_progress_message(prompt, elapsed_seconds)):
+            log("PROG", "telegram fallback send failed")
 
     def current_task_id(self, prompt: str) -> str:
         task_id = extract_task_id(prompt)
@@ -2436,6 +2493,13 @@ class Bridge:
         if stop_event:
             stop_event.set()
             log("PROG", "stop")
+
+    def stop_telegram_fallback(self) -> None:
+        with self.telegram_fallback_lock:
+            stop_event = self.telegram_fallback_stop
+            self.telegram_fallback_stop = None
+        if stop_event:
+            stop_event.set()
 
     def repl_is_working(self) -> bool:
         try:
