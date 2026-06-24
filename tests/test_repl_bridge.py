@@ -576,6 +576,36 @@ class ReplBridgeTests(unittest.TestCase):
 
             self.assertEqual(telegram.sent, [goal])
 
+    def test_same_copy_payload_body_can_be_resent_for_new_telegram_prompt(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            cfg = config(tmpdir)
+            telegram = FakeTelegram()
+            bridge = repl.Bridge(cfg, telegram, FakeRepl())
+            identity = repl.SessionIdentity(str(Path(tmpdir) / "rollout.jsonl"), 1, 2, 100)
+            bridge.session_identity = identity
+            bridge.bridge_state = repl.bridge_state_default(identity)
+            goal = "/goal T-260624-19 Claude 텔레그램 브릿지 route-health 재발방지를 마무리한다."
+            first = {
+                "timestamp": "2026-06-20T00:00:01Z",
+                "type": "event_msg",
+                "payload": {"type": "agent_message", "phase": "final_answer", "message": goal},
+            }
+            second = {
+                "timestamp": "2026-06-20T00:00:02Z",
+                "type": "event_msg",
+                "payload": {"type": "agent_message", "phase": "final_answer", "message": goal},
+            }
+
+            bridge.begin_telegram_prompt_tracking("골 명령어 + 상세설명 나눠서 2개로 보내줘")
+            first_line = json.dumps(first) + "\n"
+            self.assertTrue(bridge.process_line(first_line, 0, len(first_line)))
+
+            bridge.begin_telegram_prompt_tracking("왜 안와? 골 명령어 다시 보내")
+            second_line = json.dumps(second) + "\n"
+            self.assertTrue(bridge.process_line(second_line, len(first_line), len(first_line) + len(second_line)))
+
+            self.assertEqual(telegram.sent, [goal, goal])
+
     def test_copy_payload_pair_contract_allows_goal_and_spec_two_messages(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             cfg = config(tmpdir)

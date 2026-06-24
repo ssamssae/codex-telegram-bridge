@@ -341,11 +341,16 @@ def split_copy_payload_messages(text: str) -> list[str]:
     return parts or [body]
 
 
-def copy_payload_dedup_key(text: str) -> str:
+def copy_payload_dedup_key(text: str, scope: str = "") -> str:
     body = strip_node_emoji_header(text).strip()
     if not body:
         return ""
     digest = hashlib.sha256(body.encode("utf-8", errors="replace")).hexdigest()
+    if scope:
+        scope_digest = hashlib.sha256(
+            normalize_prompt(scope).encode("utf-8", errors="replace")
+        ).hexdigest()[:16]
+        return f"copy_payload:{scope_digest}:{digest}"
     return f"copy_payload:{digest}"
 
 
@@ -1885,7 +1890,7 @@ class Bridge:
         if not messages:
             return True
         for message in messages:
-            key = copy_payload_dedup_key(message)
+            key = self.copy_payload_dedup_key_for_turn(message)
             if key and self.bridge_state and ring_contains(self.bridge_state, key):
                 log("SEND", "skip duplicate copy payload part")
                 self.record_copy_payload_pair_part(message)
@@ -2096,7 +2101,7 @@ class Bridge:
                 self.persist_state(line_end)
             return True
         elif kind == "copy_payload":
-            key = copy_payload_dedup_key(text) or event_dedup_key(record, kind, text)
+            key = self.copy_payload_dedup_key_for_turn(text) or event_dedup_key(record, kind, text)
             if self.bridge_state and ring_contains(self.bridge_state, key):
                 log("SEND", "skip duplicate copy payload")
                 if line_end is not None:
@@ -2109,7 +2114,7 @@ class Bridge:
             return True
         elif kind == "assistant":
             key = event_dedup_key(record, kind, text)
-            copy_key = copy_payload_dedup_key(text) if is_copy_payload_message(text) else ""
+            copy_key = self.copy_payload_dedup_key_for_turn(text) if is_copy_payload_message(text) else ""
             if copy_key and self.bridge_state and ring_contains(self.bridge_state, copy_key):
                 log("SEND", "skip duplicate copy payload final_answer")
                 self.stop_repl_typing()
@@ -2291,6 +2296,9 @@ class Bridge:
             if not prompt and self.bridge_state is not None:
                 prompt = str(self.bridge_state.get("active_telegram_prompt") or "")
         return normalize_prompt(prompt)
+
+    def copy_payload_dedup_key_for_turn(self, text: str) -> str:
+        return copy_payload_dedup_key(text, self.active_prompt_for_recovery())
 
     def begin_telegram_prompt_tracking(self, prompt: str) -> None:
         self.add_pending_telegram(prompt)
