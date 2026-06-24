@@ -298,7 +298,14 @@ def is_copy_payload_message(text: str) -> bool:
     if not body:
         return False
     first_line = body.splitlines()[0].strip()
-    return first_line == "/goal" or first_line.startswith("/goal ") or first_line.startswith("상세스펙:")
+    return (
+        first_line == "/goal"
+        or first_line.startswith("/goal ")
+        or first_line.startswith("상세스펙:")
+        or first_line.startswith("상세 스펙:")
+        or first_line.startswith("상세설명:")
+        or first_line.startswith("상세 설명:")
+    )
 
 
 def copy_payload_kind(text: str) -> str:
@@ -308,9 +315,30 @@ def copy_payload_kind(text: str) -> str:
     first_line = body.splitlines()[0].strip()
     if first_line == "/goal" or first_line.startswith("/goal "):
         return "goal"
-    if first_line.startswith("상세스펙:"):
+    if (
+        first_line.startswith("상세스펙:")
+        or first_line.startswith("상세 스펙:")
+        or first_line.startswith("상세설명:")
+        or first_line.startswith("상세 설명:")
+    ):
         return "spec"
     return ""
+
+
+def split_copy_payload_messages(text: str) -> list[str]:
+    body = strip_node_emoji_header(text).strip()
+    if not is_copy_payload_message(body):
+        return []
+    split_re = re.compile(r"\n(?=(?:/goal(?:\s|$)|상세\s*스펙:|상세\s*설명:))")
+    starts = [0, *[match.start() + 1 for match in split_re.finditer(body)]]
+    starts = sorted(set(starts))
+    parts: list[str] = []
+    for index, start in enumerate(starts):
+        end = starts[index + 1] if index + 1 < len(starts) else len(body)
+        part = body[start:end].strip()
+        if part and is_copy_payload_message(part):
+            parts.append(part)
+    return parts or [body]
 
 
 def copy_payload_dedup_key(text: str) -> str:
@@ -326,8 +354,24 @@ def prompt_requires_copy_payload_pair(prompt: str) -> bool:
     if not body:
         return False
     lowered = body.lower()
-    has_goal = "/goal" in lowered or "골 명령어" in body or "goal 명령어" in lowered
-    has_spec = "상세스펙" in body
+    has_goal = (
+        "/goal" in lowered
+        or "골 명령어" in body
+        or "골명령어" in body
+        or "goal 명령어" in lowered
+        or "goal명령어" in lowered
+    )
+    has_spec = any(
+        marker in body
+        for marker in (
+            "상세스펙",
+            "상세 스펙",
+            "상세설명",
+            "상세 설명",
+            "상세프롬프트",
+            "상세 프롬프트",
+        )
+    )
     split_markers = (
         "2통",
         "두 통",
@@ -367,11 +411,24 @@ def copy_payload_pair_missing(contract: dict[str, Any] | None) -> list[str]:
 
 
 def copy_payload_pair_missing_warning(missing: list[str]) -> str:
-    labels = {"goal": "/goal", "spec": "상세스펙"}
+    labels = {"goal": "/goal", "spec": "상세스펙/상세설명"}
     missing_labels = ", ".join(labels.get(item, item) for item in missing)
     return (
         f"복붙용 2통 요청에서 {missing_labels} 메시지가 누락됐어요. "
         "/goal 한 통과 상세스펙 한 통을 각각 따로 다시 보내 달라고 요청해 주세요."
+    )
+
+
+def copy_payload_pair_repair_prompt(missing: list[str]) -> str:
+    labels = {"goal": "/goal 명령어", "spec": "상세스펙 또는 상세설명"}
+    missing_labels = ", ".join(labels.get(item, item) for item in missing)
+    return (
+        "방금 텔레그램 사용자는 복붙용 메시지 2통을 따로 요청했습니다. "
+        f"아직 {missing_labels} 메시지가 누락됐습니다.\n"
+        "지금 누락된 복붙용 메시지만 텔레그램에 그대로 보낼 수 있게 출력하세요. "
+        "설명, 사과, 헤더, 구분선 없이 순수 복붙용 콘텐츠만 출력하세요.\n"
+        "누락이 /goal이면 첫 줄은 /goal 로 시작하세요. "
+        "누락이 상세 메시지이면 첫 줄은 상세스펙: 또는 상세설명: 으로 시작하세요."
     )
 
 
@@ -1824,14 +1881,23 @@ class Bridge:
             self.last_public_progress = summary
 
     def handle_copy_payload_event(self, text: str) -> bool:
-        message = strip_node_emoji_header(text).strip()
-        if not message:
+        messages = split_copy_payload_messages(text)
+        if not messages:
             return True
-        log("SEND", "Telegram copy payload from commentary")
-        ok = self.send_answer(message)
-        if ok:
+        for message in messages:
+            key = copy_payload_dedup_key(message)
+            if key and self.bridge_state and ring_contains(self.bridge_state, key):
+                log("SEND", "skip duplicate copy payload part")
+                self.record_copy_payload_pair_part(message)
+                continue
+            log("SEND", "Telegram copy payload from commentary")
+            ok = self.send_answer(message)
+            if not ok:
+                return False
             self.record_copy_payload_pair_part(message)
-        return ok
+            if key:
+                self.persist_state(event_key=key)
+        return True
 
     def handle_assistant_event(self, text: str) -> bool:
         self.stop_repl_typing()
@@ -1843,10 +1909,14 @@ class Bridge:
             return True
         origin = self.current_origin or "terminal"
         log("SEND", f"Telegram mirror from {origin}")
-        if not self.send_answer(answer):
-            return False
         if is_copy_payload_message(answer):
-            self.record_copy_payload_pair_part(answer)
+            if not self.handle_copy_payload_event(answer):
+                return False
+        else:
+            if not self.send_answer(answer):
+                return False
+        if self.request_incomplete_copy_payload_pair_repair_if_needed():
+            return True
         self.warn_incomplete_copy_payload_pair_if_needed()
         self.clear_active_telegram_prompt()
         self.current_origin = None
@@ -1923,6 +1993,46 @@ class Bridge:
             contract["sent"] = sent_list
             self.bridge_state["copy_payload_pair_contract"] = contract
         self.persist_state()
+
+    def request_incomplete_copy_payload_pair_repair_if_needed(self) -> bool:
+        contract = self.copy_payload_pair_contract_state()
+        if not contract:
+            return False
+        missing = copy_payload_pair_missing(contract)
+        if not missing:
+            with self.lock:
+                if self.bridge_state is not None:
+                    self.bridge_state.pop("copy_payload_pair_contract", None)
+                    self.bridge_state.pop("last_copy_payload_pair_missing", None)
+            self.persist_state()
+            return False
+        if contract.get("repair_requested"):
+            return False
+        if self.config.bridge_kill:
+            log("SEND", "copy payload pair repair blocked by CRB_KILL=1")
+            return False
+        repair_prompt = copy_payload_pair_repair_prompt(missing)
+        try:
+            self.repl.paste_prompt(repair_prompt)
+        except Exception as exc:  # noqa: BLE001
+            log("SEND", f"copy payload pair repair inject failed: {exc}")
+            return False
+        with self.lock:
+            if self.bridge_state is None:
+                return True
+            contract = self.bridge_state.get("copy_payload_pair_contract")
+            if isinstance(contract, dict):
+                contract["repair_requested"] = True
+                contract["repair_missing"] = missing
+                self.bridge_state["copy_payload_pair_contract"] = contract
+                self.bridge_state["last_copy_payload_pair_missing"] = {
+                    "missing": missing,
+                    "prompt_sha256": str(contract.get("prompt_sha256") or ""),
+                    "ts": int(time.time()),
+                    "auto_repair_requested": True,
+                }
+        self.persist_state()
+        return True
 
     def warn_incomplete_copy_payload_pair_if_needed(self) -> None:
         contract = self.copy_payload_pair_contract_state()
@@ -2004,7 +2114,12 @@ class Bridge:
                 log("SEND", "skip duplicate copy payload final_answer")
                 self.stop_repl_typing()
                 self.stop_long_running_progress()
-                self.record_copy_payload_pair_part(text)
+                for message in split_copy_payload_messages(text):
+                    self.record_copy_payload_pair_part(message)
+                if self.request_incomplete_copy_payload_pair_repair_if_needed():
+                    if line_end is not None:
+                        self.persist_state(line_end)
+                    return True
                 self.warn_incomplete_copy_payload_pair_if_needed()
                 self.clear_active_telegram_prompt()
                 if line_end is not None:

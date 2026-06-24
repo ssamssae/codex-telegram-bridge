@@ -619,7 +619,8 @@ class ReplBridgeTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmpdir:
             cfg = config(tmpdir)
             telegram = FakeTelegram()
-            bridge = repl.Bridge(cfg, telegram, FakeRepl())
+            fake_repl = FakeRepl()
+            bridge = repl.Bridge(cfg, telegram, fake_repl)
             identity = repl.SessionIdentity(str(Path(tmpdir) / "rollout.jsonl"), 1, 2, 100)
             bridge.session_identity = identity
             bridge.bridge_state = repl.bridge_state_default(identity)
@@ -649,10 +650,87 @@ class ReplBridgeTests(unittest.TestCase):
             )
 
             self.assertEqual(telegram.sent[0], goal)
-            self.assertIn("상세스펙", telegram.sent[1])
-            self.assertIn("누락", telegram.sent[1])
+            self.assertEqual(len(telegram.sent), 1)
+            self.assertEqual(len(fake_repl.prompts), 1)
+            self.assertIn("상세스펙", fake_repl.prompts[0])
+            self.assertIn("누락", fake_repl.prompts[0])
             state = json.loads(Path(cfg.state_path).read_text(encoding="utf-8"))
             self.assertEqual(state["last_copy_payload_pair_missing"]["missing"], ["spec"])
+            self.assertTrue(state["last_copy_payload_pair_missing"]["auto_repair_requested"])
+
+    def test_copy_payload_pair_contract_accepts_detail_description_synonym(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            cfg = config(tmpdir)
+            telegram = FakeTelegram()
+            fake_repl = FakeRepl()
+            bridge = repl.Bridge(cfg, telegram, fake_repl)
+            identity = repl.SessionIdentity(str(Path(tmpdir) / "rollout.jsonl"), 1, 2, 100)
+            bridge.session_identity = identity
+            bridge.bridge_state = repl.bridge_state_default(identity)
+            prompt = "골 명령어 + 상세설명 나눠서 2개로 보내줘"
+            goal = "/goal Codex Telegram bridge recurrence guard를 구현한다."
+            spec = "상세설명:\n\n- 두 번째 메시지는 상세 설명이다."
+            records = [
+                {
+                    "timestamp": "2026-06-20T00:00:00Z",
+                    "type": "event_msg",
+                    "payload": {"type": "user_message", "message": prompt},
+                },
+                {
+                    "timestamp": "2026-06-20T00:00:01Z",
+                    "type": "event_msg",
+                    "payload": {"type": "agent_message", "phase": "commentary", "message": goal},
+                },
+                {
+                    "timestamp": "2026-06-20T00:00:02Z",
+                    "type": "event_msg",
+                    "payload": {"type": "agent_message", "phase": "final_answer", "message": spec},
+                },
+            ]
+            bridge.begin_telegram_prompt_tracking(prompt)
+            cursor = 0
+            for record in records:
+                line = json.dumps(record) + "\n"
+                self.assertTrue(bridge.process_line(line, cursor, cursor + len(line)))
+                cursor += len(line)
+
+            self.assertEqual(telegram.sent, [goal, spec])
+            self.assertEqual(fake_repl.prompts, [])
+
+    def test_combined_goal_and_spec_final_answer_splits_into_two_messages(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            cfg = config(tmpdir)
+            telegram = FakeTelegram()
+            fake_repl = FakeRepl()
+            bridge = repl.Bridge(cfg, telegram, fake_repl)
+            identity = repl.SessionIdentity(str(Path(tmpdir) / "rollout.jsonl"), 1, 2, 100)
+            bridge.session_identity = identity
+            bridge.bridge_state = repl.bridge_state_default(identity)
+            prompt = "골 명령어랑 상세스펙 두 통 따로 보내줘"
+            goal = "/goal Codex Telegram bridge recurrence guard를 구현한다."
+            spec = "상세스펙:\n\n- 두 번째 메시지는 상세 스펙이다."
+            combined = f"{goal}\n\n{spec}"
+            records = [
+                {
+                    "timestamp": "2026-06-20T00:00:00Z",
+                    "type": "event_msg",
+                    "payload": {"type": "user_message", "message": prompt},
+                },
+                {
+                    "timestamp": "2026-06-20T00:00:01Z",
+                    "type": "event_msg",
+                    "payload": {"type": "agent_message", "phase": "final_answer", "message": combined},
+                },
+            ]
+            bridge.begin_telegram_prompt_tracking(prompt)
+            cursor = 0
+            for record in records:
+                line = json.dumps(record) + "\n"
+                self.assertTrue(bridge.process_line(line, cursor, cursor + len(line)))
+                cursor += len(line)
+
+            self.assertEqual(telegram.sent, [goal, spec])
+            self.assertEqual(fake_repl.prompts, [])
 
     def test_telegram_prompt_tracking_sends_periodic_progress_update(self):
         with tempfile.TemporaryDirectory() as tmpdir:
