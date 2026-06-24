@@ -659,6 +659,35 @@ class ReplBridgeTests(unittest.TestCase):
             self.assertIn("thumbnail_path:", prompt.text)
             self.assertIn("metadata: duration=5; mime_type=video/mp4; width=1280; height=720", prompt.text)
 
+    def test_generic_document_prompt_includes_local_path_caption_and_metadata(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            telegram = FakeTelegram()
+            bridge = repl.Bridge(config(tmpdir), telegram, None)
+            prompt = bridge.prompt_from_telegram_message(
+                {
+                    "caption": "please inspect",
+                    "document": {
+                        "file_id": "doc-file",
+                        "file_unique_id": "unique-doc",
+                        "file_name": "report.pdf",
+                        "mime_type": "application/pdf",
+                        "file_size": 4321,
+                    },
+                },
+                103,
+            )
+            self.assertEqual(prompt.kind, "document")
+            self.assertIn("[Telegram file received]", prompt.text)
+            self.assertIn("local_path:", prompt.text)
+            self.assertIn("media_kind: document", prompt.text)
+            self.assertIn("caption: please inspect", prompt.text)
+            self.assertIn(
+                "metadata: mime_type=application/pdf; file_name=report.pdf; file_size=4321",
+                prompt.text,
+            )
+            self.assertTrue(str(telegram.downloads[0][1]).endswith(".pdf"))
+            self.assertIsNone(telegram.downloads[0][2])
+
     def test_parse_codex_approval_prompt_from_tmux_screen(self):
         screen = """
 Would you like to run the following command?

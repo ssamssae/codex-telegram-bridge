@@ -2886,6 +2886,32 @@ class Bridge:
         )
         return "\n".join(lines)
 
+    def document_prompt_text(
+        self,
+        caption_text: str,
+        media_path: Path,
+        metadata: dict[str, Any],
+    ) -> str:
+        lines = [
+            "[Telegram file received]",
+            f"local_path: {media_path}",
+            "media_kind: document",
+        ]
+        if caption_text:
+            lines.append(f"caption: {caption_text}")
+        metadata_line = self.format_metadata(metadata)
+        if metadata_line:
+            lines.append(f"metadata: {metadata_line}")
+        lines.extend(
+            [
+                "",
+                "Answer the Telegram user in Korean. Use the local_path and metadata above. "
+                "If the file cannot be inspected directly, say that the file was received and "
+                "ask for the specific action needed.",
+            ]
+        )
+        return "\n".join(lines)
+
     def prompt_from_telegram_message(self, message: dict[str, Any], update_id: int) -> TelegramPrompt:
         text = message.get("text")
         if isinstance(text, str) and text.strip():
@@ -3056,6 +3082,30 @@ class Bridge:
                     probe_summary,
                 ),
                 kind=video_kind,
+            )
+
+        if isinstance(document, dict) and document.get("file_id"):
+            file_id = str(document.get("file_id") or "")
+            name_hint = f"telegram-{update_id}-{document.get('file_unique_id') or file_id}"
+            default_suffix = suffix_from_metadata(
+                str(document.get("file_name") or ""),
+                str(document.get("mime_type") or ""),
+                ".bin",
+            )
+            media_path = self.telegram.download_file(
+                file_id,
+                media_dir,
+                name_hint,
+                default_suffix=default_suffix,
+            )
+            metadata = {
+                "mime_type": document.get("mime_type"),
+                "file_name": document.get("file_name"),
+                "file_size": document.get("file_size"),
+            }
+            return TelegramPrompt(
+                text=self.document_prompt_text(caption_text, media_path, metadata),
+                kind="document",
             )
 
         return TelegramPrompt(text="")

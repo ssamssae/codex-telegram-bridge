@@ -8,9 +8,10 @@ Other AI CLIs are intentionally out of scope; a Claude bridge should be a
 separate Claude-specific program, not a shared mode in this repository.
 
 Codex Telegram Bridge is a phone remote for your already-running Codex TUI. Send
-prompts, screenshots, videos, and voice notes from Telegram; the bridge pastes
-them into your visible tmux Codex session, watches Codex's structured JSONL
-session log, then mirrors final answers and generated media back to Telegram.
+prompts, screenshots, videos, voice notes, and files from Telegram; the bridge
+pastes them into your visible tmux Codex session, watches Codex's structured
+JSONL session log, then mirrors final answers and generated media back to
+Telegram.
 
 Default `repl` mode is REPL sync, not a separate hidden chat. Your terminal
 stays the source of truth, the transcript remains readable, and Telegram becomes
@@ -19,7 +20,7 @@ the remote control when you are away from the keyboard.
 Install with `pipx`, then run the setup wizard:
 
 ```bash
-pipx install "git+https://github.com/ssamssae/codex-telegram-bridge.git@v0.3.16"
+pipx install "git+https://github.com/ssamssae/codex-telegram-bridge.git@v0.3.17"
 codex-telegram-bridge setup
 codex-telegram-bridge doctor
 ```
@@ -175,13 +176,13 @@ The wizard will:
 
 Default setup mode is `repl`, which supports the visible Codex CLI transcript,
 Telegram text, image prompts, video thumbnails/metadata, audio-file delivery,
-optional audio transcription, answer mirroring, Telegram `typing...`, and Codex
-approval prompts. It also stores a JSONL cursor so a daemon restart can resume
-watching the current Codex session and backfill the latest eligible final answer
-that was produced while the bridge was down. If a final answer contains a local
-image, video, or audio path or markdown link to an allowed media file, the
-bridge hides that local path from the Telegram text and sends the actual media
-attachment.
+generic file delivery, optional audio transcription, answer mirroring, Telegram
+`typing...`, and Codex approval prompts. It also stores a JSONL cursor so a
+daemon restart can resume watching the current Codex session and backfill the
+latest eligible final answer that was produced while the bridge was down. If a
+final answer contains a local image, video, or audio path or markdown link to an
+allowed media file, the bridge hides that local path from the Telegram text and
+sends the actual media attachment.
 
 4. Check the installation:
 
@@ -341,6 +342,7 @@ Required settings are intentionally small and explicit.
 - Telegram photos and image documents
 - Telegram videos, video notes, animations, and video documents
 - Telegram voice/audio files
+- generic Telegram document files
 - Telegram `typing...` while Codex is generating
 - terminal-origin Codex prompts mirrored back to Telegram
 - Codex command approval prompts mirrored to Telegram with buttons
@@ -353,7 +355,9 @@ Images are saved under `TAB_STATE_DIR` and passed to Codex as local paths in the
 prompt. Video messages include the local video path, Telegram thumbnail when
 available, and metadata. If `ffmpeg` is available, the bridge can extract video
 frames. Audio messages include the local audio path and, when
-`CRB_AUDIO_TRANSCRIBE_CMD` is configured, a transcript.
+`CRB_AUDIO_TRANSCRIBE_CMD` is configured, a transcript. Generic document files
+are saved under the same local media directory and passed to Codex with
+`local_path`, caption, MIME type, file name, and file size metadata.
 
 The setup wizard can install a local `faster-whisper` transcription environment:
 
