@@ -452,6 +452,48 @@ class ReplBridgeTests(unittest.TestCase):
 
             self.assertEqual(telegram.sent, ["goal updated"])
 
+    def test_goal_copy_payload_commentary_sends_plain_before_final(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            cfg = config(tmpdir)
+            telegram = FakeTelegram()
+            bridge = repl.Bridge(cfg, telegram, FakeRepl())
+            identity = repl.SessionIdentity(str(Path(tmpdir) / "rollout.jsonl"), 1, 2, 100)
+            bridge.session_identity = identity
+            bridge.bridge_state = repl.bridge_state_default(identity)
+            goal = "/goal Codex Telegram bridge와 Claude Telegram bridge의 완성도 격차를 줄인다."
+            spec = "상세스펙:\n\n문제:\n- 복붙용 메시지는 일반 메시지로 보내야 한다."
+            commentary = {
+                "timestamp": "2026-06-20T00:00:01Z",
+                "type": "event_msg",
+                "payload": {
+                    "type": "agent_message",
+                    "phase": "commentary",
+                    "message": goal,
+                },
+            }
+            assistant = {
+                "timestamp": "2026-06-20T00:00:02Z",
+                "type": "event_msg",
+                "payload": {
+                    "type": "agent_message",
+                    "phase": "final_answer",
+                    "message": spec,
+                },
+            }
+            commentary_line = json.dumps(commentary) + "\n"
+            assistant_line = json.dumps(assistant) + "\n"
+
+            self.assertTrue(bridge.process_line(commentary_line, 0, len(commentary_line)))
+            self.assertTrue(
+                bridge.process_line(
+                    assistant_line,
+                    len(commentary_line),
+                    len(commentary_line) + len(assistant_line),
+                )
+            )
+
+            self.assertEqual(telegram.sent, [goal, spec])
+
     def test_telegram_prompt_tracking_sends_periodic_progress_update(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             cfg = config(tmpdir, long_running_progress_seconds=1)

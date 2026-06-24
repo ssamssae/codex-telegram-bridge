@@ -293,6 +293,14 @@ def strip_node_emoji_header(text: str) -> str:
     return "\n".join(lines).strip()
 
 
+def is_copy_payload_message(text: str) -> bool:
+    body = strip_node_emoji_header(text).strip()
+    if not body:
+        return False
+    first_line = body.splitlines()[0].strip()
+    return first_line == "/goal" or first_line.startswith("/goal ") or first_line.startswith("상세스펙:")
+
+
 def format_progress_summary(text: str, limit: int = 180) -> str:
     body = " ".join(strip_node_emoji_header(text).split())
     return truncate_text(body, limit).strip()
@@ -1529,30 +1537,30 @@ def extract_event(record: dict[str, Any]) -> tuple[str, str] | None:
         if payload_type == "user_message":
             return "user", str(payload.get("message") or "")
         if payload_type == "agent_message":
+            message = str(payload.get("message") or "")
             if payload.get("phase") == "final_answer":
-                return "assistant", str(payload.get("message") or "")
-            return "progress", str(payload.get("message") or "")
+                return "assistant", message
+            if is_copy_payload_message(message):
+                return "copy_payload", message
+            return "progress", message
 
     if kind == "response_item":
         if payload.get("type") == "message" and payload.get("role") == "assistant":
             phase = payload.get("phase") or payload.get("metadata", {}).get("phase")
-            if phase != "final_answer":
-                content = payload.get("content")
-                if isinstance(content, list):
-                    parts = []
-                    for item in content:
-                        if isinstance(item, dict) and item.get("type") == "output_text":
-                            parts.append(str(item.get("text") or ""))
-                    if parts:
-                        return "progress", "\n".join(parts)
-                return None
             content = payload.get("content")
+            parts = []
             if isinstance(content, list):
-                parts = []
                 for item in content:
                     if isinstance(item, dict) and item.get("type") == "output_text":
                         parts.append(str(item.get("text") or ""))
-                return "assistant", "\n".join(parts)
+            text = "\n".join(parts)
+            if phase != "final_answer":
+                if text:
+                    if is_copy_payload_message(text):
+                        return "copy_payload", text
+                    return "progress", text
+                return None
+            return "assistant", text
     return None
 
 
@@ -1741,6 +1749,13 @@ class Bridge:
         with self.lock:
             self.last_public_progress = summary
 
+    def handle_copy_payload_event(self, text: str) -> bool:
+        message = strip_node_emoji_header(text).strip()
+        if not message:
+            return True
+        log("SEND", "Telegram copy payload from commentary")
+        return self.send_answer(message)
+
     def handle_assistant_event(self, text: str) -> bool:
         self.stop_repl_typing()
         self.stop_long_running_progress()
@@ -1817,6 +1832,18 @@ class Bridge:
             self.handle_progress_event(text)
             if line_end is not None:
                 self.persist_state(line_end)
+            return True
+        elif kind == "copy_payload":
+            key = event_dedup_key(record, kind, text)
+            if self.bridge_state and ring_contains(self.bridge_state, key):
+                log("SEND", "skip duplicate copy payload")
+                if line_end is not None:
+                    self.persist_state(line_end)
+                return True
+            if not self.handle_copy_payload_event(text):
+                return False
+            if line_end is not None:
+                self.persist_state(line_end, key)
             return True
         elif kind == "assistant":
             key = event_dedup_key(record, kind, text)
