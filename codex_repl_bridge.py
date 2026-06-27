@@ -44,6 +44,8 @@ from agent_runtime.types import AgentMessage
 
 HOME = Path.home()
 NODE_EMOJI_LINES = {"\U0001f34e", "\U0001f3ed", "\U0001fa9f", "\U0001f5a5", "\U0001f4bb", "\U0001f916"}
+FLOW_MIRROR_HEADER = "⚙️ 작업 흐름"
+FLOW_MIRROR_LIMIT = 1500
 TASK_ID_RE = re.compile(r"\bT-\d{6}-\d+\b")
 IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".webp", ".gif"}
 IMAGE_ATTACHMENT_EXTENSIONS = IMAGE_EXTENSIONS | {".bmp", ".tif", ".tiff"}
@@ -291,6 +293,11 @@ def strip_node_emoji_header(text: str) -> str:
     if lines[0].strip() in NODE_EMOJI_LINES:
         return "\n".join(lines[1:]).strip()
     return "\n".join(lines).strip()
+
+
+def format_flow_mirror(text: str) -> str:
+    body = truncate_text(strip_node_emoji_header(text), FLOW_MIRROR_LIMIT).strip()
+    return f"{FLOW_MIRROR_HEADER}\n{body}" if body else ""
 
 
 def is_copy_payload_message(text: str) -> bool:
@@ -806,6 +813,7 @@ class Config:
     tail_scan_bytes: int
     state_ring_cap: int
     bridge_kill: bool
+    flow_mirror: bool
 
     @classmethod
     def from_env(cls) -> "Config":
@@ -846,7 +854,7 @@ class Config:
             typing_liveness_seconds=int_env("CRB_TYPING_LIVENESS_SECONDS", 10, minimum=0),
             long_running_progress_seconds=int_env(
                 "CRB_LONG_RUNNING_PROGRESS_SECONDS",
-                600,
+                0,
                 minimum=0,
             ),
             telegram_fallback_seconds=int_env(
@@ -875,6 +883,7 @@ class Config:
             tail_scan_bytes=int_env("CRB_TAIL_SCAN_BYTES", 65536, minimum=1024),
             state_ring_cap=int_env("CRB_STATE_RING_CAP", 64, minimum=1),
             bridge_kill=bool_env("CRB_KILL", False),
+            flow_mirror=bool_env("CRB_FLOW_MIRROR", True),
         )
 
     @property
@@ -1968,12 +1977,29 @@ class Bridge:
             log("JSONL", "terminal-origin prompt")
             self.begin_repl_typing()
 
-    def handle_progress_event(self, text: str) -> None:
+    def handle_progress_event(self, text: str, key: str = "") -> bool:
         summary = format_progress_summary(text, 220)
         if not summary:
-            return
+            return True
         with self.lock:
             self.last_public_progress = summary
+        if not self.config.flow_mirror:
+            return True
+        if key and self.bridge_state and ring_contains(self.bridge_state, key):
+            log("SEND", "skip duplicate flow mirror")
+            return True
+        message = format_flow_mirror(text)
+        if not message:
+            return True
+        if self.config.bridge_kill:
+            log("SEND", "flow mirror blocked by CRB_KILL=1")
+            return True
+        if not self.telegram.send(message):
+            log("SEND", "flow mirror failed")
+            return False
+        if key:
+            self.persist_state(event_key=key)
+        return True
 
     def handle_copy_payload_event(self, text: str) -> bool:
         messages = split_copy_payload_messages(text)
@@ -2188,7 +2214,9 @@ class Bridge:
                 self.persist_state(line_end)
             return True
         elif kind == "progress":
-            self.handle_progress_event(text)
+            key = event_dedup_key(record, kind, text)
+            if not self.handle_progress_event(text, key):
+                return False
             if line_end is not None:
                 self.persist_state(line_end)
             return True

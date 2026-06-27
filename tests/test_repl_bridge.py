@@ -46,13 +46,14 @@ def config(tmpdir, **overrides):
         "tail_scan_bytes": 65536,
         "state_ring_cap": 64,
         "bridge_kill": False,
+        "flow_mirror": True,
     }
     base.update(overrides)
     return repl.Config(**base)
 
 
 class ConfigDefaultsTest(unittest.TestCase):
-    def test_default_long_running_progress_interval_is_ten_minutes(self):
+    def test_default_long_running_progress_interval_is_disabled(self):
         old_progress = os.environ.pop("CRB_LONG_RUNNING_PROGRESS_SECONDS", None)
         old_fallback = os.environ.pop("CRB_TELEGRAM_FALLBACK_SECONDS", None)
         old_liveness = os.environ.pop("CRB_TYPING_LIVENESS_SECONDS", None)
@@ -72,9 +73,10 @@ class ConfigDefaultsTest(unittest.TestCase):
             else:
                 os.environ["TAB_CHAT_ID"] = old_chat_id
 
-        self.assertEqual(cfg.long_running_progress_seconds, 600)
+        self.assertEqual(cfg.long_running_progress_seconds, 0)
         self.assertEqual(cfg.telegram_fallback_seconds, 90)
         self.assertEqual(cfg.typing_liveness_seconds, 10)
+        self.assertTrue(cfg.flow_mirror)
 
     def test_emoji_prefix_strips_inline_node_emoji_from_answer_body(self):
         telegram = repl.TelegramClient("token", "1234", "🏭", 4096)
@@ -865,9 +867,77 @@ class ReplBridgeTests(unittest.TestCase):
             self.assertEqual(telegram.sent, [goal, spec])
             self.assertEqual(fake_repl.prompts, [])
 
+    def test_progress_event_sends_flow_mirror_before_final_answer(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            cfg = config(tmpdir)
+            telegram = FakeTelegram()
+            bridge = repl.Bridge(cfg, telegram, FakeRepl())
+            identity = repl.SessionIdentity(str(Path(tmpdir) / "rollout.jsonl"), 1, 2, 100)
+            bridge.session_identity = identity
+            bridge.bridge_state = repl.bridge_state_default(identity)
+            records = [
+                {
+                    "timestamp": "2026-06-27T00:00:00Z",
+                    "type": "event_msg",
+                    "payload": {"type": "user_message", "message": "진행해"},
+                },
+                {
+                    "timestamp": "2026-06-27T00:00:01Z",
+                    "type": "event_msg",
+                    "payload": {"type": "agent_message", "message": "서비스 확인 중"},
+                },
+                {
+                    "timestamp": "2026-06-27T00:00:02Z",
+                    "type": "event_msg",
+                    "payload": {"type": "agent_message", "phase": "final_answer", "message": "완료"},
+                },
+            ]
+
+            cursor = 0
+            for record in records:
+                line = json.dumps(record, ensure_ascii=False) + "\n"
+                self.assertTrue(bridge.process_line(line, cursor, cursor + len(line)))
+                cursor += len(line)
+
+            self.assertEqual(telegram.sent, [f"{repl.FLOW_MIRROR_HEADER}\n서비스 확인 중", "완료"])
+
+    def test_progress_flow_mirror_can_be_disabled(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            cfg = config(tmpdir, flow_mirror=False)
+            telegram = FakeTelegram()
+            bridge = repl.Bridge(cfg, telegram, FakeRepl())
+            identity = repl.SessionIdentity(str(Path(tmpdir) / "rollout.jsonl"), 1, 2, 100)
+            bridge.session_identity = identity
+            bridge.bridge_state = repl.bridge_state_default(identity)
+            records = [
+                {
+                    "timestamp": "2026-06-27T00:00:00Z",
+                    "type": "event_msg",
+                    "payload": {"type": "user_message", "message": "진행해"},
+                },
+                {
+                    "timestamp": "2026-06-27T00:00:01Z",
+                    "type": "event_msg",
+                    "payload": {"type": "agent_message", "message": "서비스 확인 중"},
+                },
+                {
+                    "timestamp": "2026-06-27T00:00:02Z",
+                    "type": "event_msg",
+                    "payload": {"type": "agent_message", "phase": "final_answer", "message": "완료"},
+                },
+            ]
+
+            cursor = 0
+            for record in records:
+                line = json.dumps(record, ensure_ascii=False) + "\n"
+                self.assertTrue(bridge.process_line(line, cursor, cursor + len(line)))
+                cursor += len(line)
+
+            self.assertEqual(telegram.sent, ["완료"])
+
     def test_telegram_prompt_tracking_sends_periodic_progress_update(self):
         with tempfile.TemporaryDirectory() as tmpdir:
-            cfg = config(tmpdir, long_running_progress_seconds=1)
+            cfg = config(tmpdir, long_running_progress_seconds=1, flow_mirror=False)
             telegram = FakeTelegram()
             bridge = repl.Bridge(cfg, telegram, FakeRepl())
 
@@ -886,7 +956,7 @@ class ReplBridgeTests(unittest.TestCase):
 
     def test_progress_update_includes_latest_public_progress_and_current_task(self):
         with tempfile.TemporaryDirectory() as tmpdir:
-            cfg = config(tmpdir, long_running_progress_seconds=1)
+            cfg = config(tmpdir, long_running_progress_seconds=1, flow_mirror=False)
             (Path(tmpdir) / "current-task").write_text("T-260624-11\n", encoding="utf-8")
             telegram = FakeTelegram()
             bridge = repl.Bridge(cfg, telegram, FakeRepl())
@@ -907,7 +977,7 @@ class ReplBridgeTests(unittest.TestCase):
 
     def test_telegram_fallback_sends_once_before_delayed_final_answer(self):
         with tempfile.TemporaryDirectory() as tmpdir:
-            cfg = config(tmpdir, telegram_fallback_seconds=0)
+            cfg = config(tmpdir, telegram_fallback_seconds=0, flow_mirror=False)
             telegram = FakeTelegram()
             bridge = repl.Bridge(cfg, telegram, FakeRepl())
 

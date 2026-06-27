@@ -329,7 +329,8 @@ Required settings are intentionally small and explicit.
 | `CRB_TMUX_SUBMIT_KEY` | repl only | `Tab` | key sent after pasting Telegram prompts into Codex. |
 | `CRB_TYPING_MAX_SECONDS` | no | `7200` | Maximum lifetime for repeated Telegram `typing` actions during one visible Codex turn. |
 | `CRB_TELEGRAM_FALLBACK_SECONDS` | no | `90` | One-shot fallback progress reply delay for Telegram-origin REPL prompts when `final_answer` is delayed. Set `0` to disable. |
-| `CRB_LONG_RUNNING_PROGRESS_SECONDS` | no | `600` | Seconds between Telegram progress updates for long-running Telegram-origin REPL prompts. Set `0` to disable. |
+| `CRB_FLOW_MIRROR` | no | `1` | Mirror public Codex progress/commentary steps to Telegram with the `⚙️ 작업 흐름` header. |
+| `CRB_LONG_RUNNING_PROGRESS_SECONDS` | no | `0` | Legacy periodic progress interval for long-running Telegram-origin REPL prompts. The flow mirror replaces it by default; set a positive second value to re-enable. |
 | `CRB_AUDIO_TRANSCRIBE_CMD` | no | empty | Optional command template for audio transcription. Use `{path}` for the media file. |
 | `CRB_APPROVAL_TTL_SECONDS` | no | `300` | Seconds before a Telegram approval button is treated as stale. |
 | `CRB_STATE_PATH` | no | `TAB_STATE_DIR/codex-repl-bridge-<node>.state.json` | Persistent JSONL cursor and final-answer dedup state for `repl` mode. |
