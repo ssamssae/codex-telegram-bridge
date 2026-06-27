@@ -901,6 +901,49 @@ class ReplBridgeTests(unittest.TestCase):
 
             self.assertEqual(telegram.sent, [f"{repl.FLOW_MIRROR_HEADER}\n서비스 확인 중", "완료"])
 
+    def test_duplicate_progress_text_sends_flow_mirror_once_per_turn(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            cfg = config(tmpdir)
+            telegram = FakeTelegram()
+            bridge = repl.Bridge(cfg, telegram, FakeRepl())
+            identity = repl.SessionIdentity(str(Path(tmpdir) / "rollout.jsonl"), 1, 2, 100)
+            bridge.session_identity = identity
+            bridge.bridge_state = repl.bridge_state_default(identity)
+            progress = "스킬 제약 확인 완료했습니다. 이제 PR #231의 최신 커밋/diff/check만 다시 확인합니다."
+            records = [
+                {
+                    "timestamp": "2026-06-27T00:00:00Z",
+                    "type": "event_msg",
+                    "payload": {"type": "user_message", "message": "231 머지해"},
+                },
+                {
+                    "timestamp": "2026-06-27T00:00:01Z",
+                    "type": "event_msg",
+                    "payload": {"type": "agent_message", "message": progress},
+                },
+                {
+                    "timestamp": "2026-06-27T00:00:02Z",
+                    "type": "event_msg",
+                    "payload": {"type": "agent_message", "message": progress},
+                },
+                {
+                    "timestamp": "2026-06-27T00:00:03Z",
+                    "type": "event_msg",
+                    "payload": {"type": "agent_message", "phase": "final_answer", "message": "머지 라우팅 GO"},
+                },
+            ]
+
+            cursor = 0
+            for record in records:
+                line = json.dumps(record, ensure_ascii=False) + "\n"
+                self.assertTrue(bridge.process_line(line, cursor, cursor + len(line)))
+                cursor += len(line)
+
+            self.assertEqual(
+                telegram.sent,
+                [f"{repl.FLOW_MIRROR_HEADER}\n{progress}", "머지 라우팅 GO"],
+            )
+
     def test_progress_flow_mirror_can_be_disabled(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             cfg = config(tmpdir, flow_mirror=False)

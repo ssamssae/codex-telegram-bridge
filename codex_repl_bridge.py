@@ -300,6 +300,19 @@ def format_flow_mirror(text: str) -> str:
     return f"{FLOW_MIRROR_HEADER}\n{body}" if body else ""
 
 
+def flow_mirror_dedup_key(text: str, scope: str = "") -> str:
+    body = re.sub(r"\s+", " ", strip_node_emoji_header(text).strip())
+    if not body:
+        return ""
+    digest = hashlib.sha256(body.encode("utf-8", errors="replace")).hexdigest()
+    if scope:
+        scope_digest = hashlib.sha256(
+            normalize_prompt(scope).encode("utf-8", errors="replace")
+        ).hexdigest()[:16]
+        return f"flow_mirror:{scope_digest}:{digest}"
+    return f"flow_mirror:{digest}"
+
+
 def is_copy_payload_message(text: str) -> bool:
     body = strip_node_emoji_header(text).strip()
     if not body:
@@ -1926,6 +1939,7 @@ class Bridge:
         self.resolved_choice_ids: set[str] = set()
         self.stop_event = threading.Event()
         self.current_origin: str | None = None
+        self.current_flow_scope = ""
         self.suppress_until_user = False
         self.needs_composer_clear = False
         self.active_telegram_prompt = ""
@@ -1967,6 +1981,7 @@ class Bridge:
     def handle_user_event(self, text: str) -> None:
         self.suppress_until_user = False
         self.last_public_progress = ""
+        self.current_flow_scope = normalize_prompt(text)
         if self.consume_pending_match(text):
             self.current_origin = "telegram"
             log("JSONL", "matched Telegram-origin prompt")
@@ -1985,7 +2000,12 @@ class Bridge:
             self.last_public_progress = summary
         if not self.config.flow_mirror:
             return True
-        if key and self.bridge_state and ring_contains(self.bridge_state, key):
+        flow_key = flow_mirror_dedup_key(
+            text,
+            self.active_telegram_prompt or self.current_flow_scope,
+        )
+        dedup_key = flow_key or key
+        if self.bridge_state and ring_contains(self.bridge_state, dedup_key):
             log("SEND", "skip duplicate flow mirror")
             return True
         message = format_flow_mirror(text)
@@ -1997,8 +2017,7 @@ class Bridge:
         if not self.telegram.send(message):
             log("SEND", "flow mirror failed")
             return False
-        if key:
-            self.persist_state(event_key=key)
+        self.persist_state(event_key=dedup_key)
         return True
 
     def handle_copy_payload_event(self, text: str) -> bool:
@@ -2043,6 +2062,7 @@ class Bridge:
         self.warn_incomplete_copy_payload_pair_if_needed()
         self.clear_active_telegram_prompt()
         self.current_origin = None
+        self.current_flow_scope = ""
         self.suppress_until_user = True
         return True
 
