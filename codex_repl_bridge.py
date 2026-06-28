@@ -46,6 +46,11 @@ HOME = Path.home()
 NODE_EMOJI_LINES = {"\U0001f34e", "\U0001f3ed", "\U0001fa9f", "\U0001f5a5", "\U0001f4bb", "\U0001f916"}
 FLOW_MIRROR_HEADER = "⚙️ 작업 흐름"
 FLOW_MIRROR_LIMIT = 1500
+# Per-step line cap: each flow event is collapsed to ONE short line (claude
+# parity) instead of the full multi-line narration. Keeps many steps inside one
+# edit-in-place card instead of overflowing into many long messages.
+FLOW_MIRROR_LINE_LIMIT = 200
+FLOW_MIRROR_EDIT_MIN_SECONDS = 1.0
 TASK_ID_RE = re.compile(r"\bT-\d{6}-\d+\b")
 IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".webp", ".gif"}
 IMAGE_ATTACHMENT_EXTENSIONS = IMAGE_EXTENSIONS | {".bmp", ".tif", ".tiff"}
@@ -298,6 +303,20 @@ def strip_node_emoji_header(text: str) -> str:
 def format_flow_mirror(text: str) -> str:
     body = truncate_text(strip_node_emoji_header(text), FLOW_MIRROR_LIMIT).strip()
     return f"{FLOW_MIRROR_HEADER}\n{body}" if body else ""
+
+
+def flow_step_summary(text: str, limit: int = FLOW_MIRROR_LINE_LIMIT) -> str:
+    """One clean line for a single flow step (claude parity).
+
+    Collapse all whitespace into a single line, drop the node emoji header, and
+    hard-truncate with an ellipsis — NO multi-line ``[truncated]`` footer. This
+    keeps each accumulated step short so many fit inside one edit-in-place card
+    instead of overflowing FLOW_MIRROR_LIMIT into multiple long messages.
+    """
+    body = " ".join(strip_node_emoji_header(text).split())
+    if len(body) > limit:
+        body = body[:limit].rstrip() + "…"
+    return body.strip()
 
 
 def flow_mirror_dedup_key(text: str, scope: str = "") -> str:
@@ -1051,6 +1070,26 @@ class TelegramClient:
             payload = self.call("sendMessage", chat_id=self.chat_id, text=chunk)
             ok = ok and bool(payload and payload.get("ok"))
         return ok
+
+    def send_message_id(self, text: str) -> int | None:
+        payload = self.call(
+            "sendMessage",
+            chat_id=self.chat_id,
+            text=self.with_emoji_prefix(text),
+        )
+        result = payload.get("result") if isinstance(payload, dict) else None
+        if isinstance(result, dict) and isinstance(result.get("message_id"), int):
+            return int(result["message_id"])
+        return None
+
+    def edit(self, message_id: int, text: str) -> bool:
+        payload = self.call(
+            "editMessageText",
+            chat_id=self.chat_id,
+            message_id=message_id,
+            text=self.with_emoji_prefix(text),
+        )
+        return bool(payload and payload.get("ok"))
 
     def send_local_attachment(self, path: Path, max_bytes: int) -> bool:
         try:
@@ -1944,6 +1983,12 @@ class Bridge:
         self.needs_composer_clear = False
         self.active_telegram_prompt = ""
         self.last_public_progress: str = ""
+        # ⚙️ flow mirror edit-in-place state: accumulate a turn's steps into ONE
+        # growing card (edit the same message) instead of one message per step.
+        self.flow_message_id = 0
+        self.flow_body = ""
+        self.flow_scope = ""
+        self.flow_last_edit_at = 0.0
         self.telegram_fallback_sent = False
         self.session_path: Path | None = None
         self.session_identity: SessionIdentity | None = None
@@ -2008,17 +2053,54 @@ class Bridge:
         if self.bridge_state and ring_contains(self.bridge_state, dedup_key):
             log("SEND", "skip duplicate flow mirror")
             return True
-        message = format_flow_mirror(text)
-        if not message:
+        # Collapse each flow event to a single short line (claude parity). Full
+        # narration was overflowing FLOW_MIRROR_LIMIT after 1-2 steps and
+        # spilling into multiple long messages instead of one growing card.
+        summary = flow_step_summary(text)
+        if not summary:
             return True
         if self.config.bridge_kill:
             log("SEND", "flow mirror blocked by CRB_KILL=1")
             return True
-        if not self.telegram.send(message):
-            log("SEND", "flow mirror failed")
-            return False
+        # Edit-in-place: accumulate this turn's steps into ONE growing card
+        # (edit the same message) until it overflows FLOW_MIRROR_LIMIT.
+        scope = self.active_telegram_prompt or self.current_flow_scope
+        if self.flow_scope != scope:
+            self.reset_flow_card()
+            self.flow_scope = scope
+        candidate = f"{self.flow_body}\n{summary}".strip() if self.flow_body else summary
+        if not self.flow_message_id or len(candidate) > FLOW_MIRROR_LIMIT:
+            message_id = self.telegram.send_message_id(format_flow_mirror(summary))
+            if not message_id:
+                log("SEND", "flow mirror failed")
+                return False
+            self.flow_body = summary
+            self.flow_message_id = message_id
+            log("SEND", f"sent flow mirror mid={message_id}")
+        else:
+            self.wait_for_flow_edit_budget()
+            if not self.telegram.edit(self.flow_message_id, format_flow_mirror(candidate)):
+                log("SEND", "flow mirror edit failed")
+                return False
+            self.flow_body = candidate
+            self.flow_last_edit_at = time.monotonic()
+            log("SEND", f"edited flow mirror mid={self.flow_message_id}")
         self.persist_state(event_key=dedup_key)
         return True
+
+    def reset_flow_card(self) -> None:
+        self.flow_message_id = 0
+        self.flow_body = ""
+        self.flow_scope = ""
+        self.flow_last_edit_at = 0.0
+
+    def wait_for_flow_edit_budget(self) -> None:
+        if self.flow_last_edit_at <= 0:
+            return
+        elapsed = time.monotonic() - self.flow_last_edit_at
+        remaining = FLOW_MIRROR_EDIT_MIN_SECONDS - elapsed
+        if remaining > 0:
+            time.sleep(remaining)
 
     def handle_copy_payload_event(self, text: str) -> bool:
         messages = split_copy_payload_messages(text)

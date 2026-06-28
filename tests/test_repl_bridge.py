@@ -119,6 +119,8 @@ class FakeTelegram:
         self.attachments = []
         self.approval_updates = []
         self.choice_updates = []
+        self.message_ids = []
+        self.edits = []
 
     def download_file(
         self,
@@ -136,6 +138,16 @@ class FakeTelegram:
 
     def send(self, text):
         self.sent.append(text)
+        return True
+
+    def send_message_id(self, text):
+        self.sent.append(text)
+        message_id = 1000 + len(self.message_ids)
+        self.message_ids.append(message_id)
+        return message_id
+
+    def edit(self, message_id, text):
+        self.edits.append((message_id, text))
         return True
 
     def send_typing(self):
