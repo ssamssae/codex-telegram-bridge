@@ -47,6 +47,7 @@ def config(tmpdir, **overrides):
         "state_ring_cap": 64,
         "bridge_kill": False,
         "flow_mirror": True,
+        "reasoning_mirror": True,
     }
     base.update(overrides)
     return repl.Config(**base)
@@ -77,6 +78,7 @@ class ConfigDefaultsTest(unittest.TestCase):
         self.assertEqual(cfg.telegram_fallback_seconds, 90)
         self.assertEqual(cfg.typing_liveness_seconds, 10)
         self.assertTrue(cfg.flow_mirror)
+        self.assertTrue(cfg.reasoning_mirror)
 
     def test_emoji_prefix_strips_inline_node_emoji_from_answer_body(self):
         telegram = repl.TelegramClient("token", "1234", "🏭", 4096)
@@ -998,6 +1000,84 @@ class ReplBridgeTests(unittest.TestCase):
                 },
                 {
                     "timestamp": "2026-06-27T00:00:02Z",
+                    "type": "event_msg",
+                    "payload": {"type": "agent_message", "phase": "final_answer", "message": "완료"},
+                },
+            ]
+
+            cursor = 0
+            for record in records:
+                line = json.dumps(record, ensure_ascii=False) + "\n"
+                self.assertTrue(bridge.process_line(line, cursor, cursor + len(line)))
+                cursor += len(line)
+
+            self.assertEqual(telegram.sent, ["완료"])
+
+    def test_reasoning_summary_mirrors_after_final_answer(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            cfg = config(tmpdir)
+            telegram = FakeTelegram()
+            bridge = repl.Bridge(cfg, telegram, FakeRepl())
+            identity = repl.SessionIdentity(str(Path(tmpdir) / "rollout.jsonl"), 1, 2, 100)
+            bridge.session_identity = identity
+            bridge.bridge_state = repl.bridge_state_default(identity)
+            records = [
+                {
+                    "timestamp": "2026-06-28T00:00:00Z",
+                    "type": "event_msg",
+                    "payload": {"type": "user_message", "message": "진행해"},
+                },
+                {
+                    "timestamp": "2026-06-28T00:00:01Z",
+                    "type": "response_item",
+                    "payload": {
+                        "type": "reasoning",
+                        "summary": [{"type": "summary_text", "text": "옵션을 비교해 가장 빠른 경로를 택함"}],
+                    },
+                },
+                {
+                    "timestamp": "2026-06-28T00:00:02Z",
+                    "type": "event_msg",
+                    "payload": {"type": "agent_message", "phase": "final_answer", "message": "완료"},
+                },
+            ]
+
+            cursor = 0
+            for record in records:
+                line = json.dumps(record, ensure_ascii=False) + "\n"
+                self.assertTrue(bridge.process_line(line, cursor, cursor + len(line)))
+                cursor += len(line)
+
+            # Answer first, then the 🧠 reasoning mirror.
+            self.assertEqual(
+                telegram.sent,
+                ["완료", f"{repl.REASONING_HEADER}\n옵션을 비교해 가장 빠른 경로를 택함"],
+            )
+
+    def test_reasoning_mirror_can_be_disabled(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            cfg = config(tmpdir, reasoning_mirror=False)
+            telegram = FakeTelegram()
+            bridge = repl.Bridge(cfg, telegram, FakeRepl())
+            identity = repl.SessionIdentity(str(Path(tmpdir) / "rollout.jsonl"), 1, 2, 100)
+            bridge.session_identity = identity
+            bridge.bridge_state = repl.bridge_state_default(identity)
+            records = [
+                {
+                    "timestamp": "2026-06-28T00:00:00Z",
+                    "type": "event_msg",
+                    "payload": {"type": "user_message", "message": "진행해"},
+                },
+                {
+                    "timestamp": "2026-06-28T00:00:01Z",
+                    "type": "response_item",
+                    "payload": {
+                        "type": "reasoning",
+                        "summary": [{"type": "summary_text", "text": "내부 요약"}],
+                    },
+                },
+                {
+                    "timestamp": "2026-06-28T00:00:02Z",
                     "type": "event_msg",
                     "payload": {"type": "agent_message", "phase": "final_answer", "message": "완료"},
                 },

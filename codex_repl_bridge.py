@@ -53,6 +53,11 @@ FLOW_MIRROR_LIMIT = 1500
 # edit-in-place card instead of overflowing into many long messages.
 FLOW_MIRROR_LINE_LIMIT = 200
 FLOW_MIRROR_EDIT_MIN_SECONDS = 1.0
+# 🧠 reasoning mirror: Codex emits a runtime-PUBLIC reasoning summary (never the
+# raw chain-of-thought). We mirror only that summary to Telegram AFTER the final
+# answer is sent, for parity with the assistant's thinking mirror.
+REASONING_HEADER = "\U0001f9e0 코덱스 사고"
+REASONING_MIRROR_LIMIT = 3500
 TASK_ID_RE = re.compile(r"\bT-\d{6}-\d+\b")
 IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".webp", ".gif"}
 IMAGE_ATTACHMENT_EXTENSIONS = IMAGE_EXTENSIONS | {".bmp", ".tif", ".tiff"}
@@ -380,6 +385,11 @@ def strip_node_emoji_header(text: str) -> str:
 def format_flow_mirror(text: str) -> str:
     body = truncate_text(strip_node_emoji_header(text), FLOW_MIRROR_LIMIT).strip()
     return f"{FLOW_MIRROR_HEADER}\n{body}" if body else ""
+
+
+def format_reasoning_mirror(text: str) -> str:
+    body = truncate_text(strip_node_emoji_header(text), REASONING_MIRROR_LIMIT).strip()
+    return f"{REASONING_HEADER}\n{body}" if body else ""
 
 
 def flow_step_summary(text: str, limit: int = FLOW_MIRROR_LINE_LIMIT) -> str:
@@ -925,6 +935,7 @@ class Config:
     state_ring_cap: int
     bridge_kill: bool
     flow_mirror: bool
+    reasoning_mirror: bool
 
     @classmethod
     def from_env(cls) -> "Config":
@@ -995,6 +1006,7 @@ class Config:
             state_ring_cap=int_env("CRB_STATE_RING_CAP", 64, minimum=1),
             bridge_kill=bool_env("CRB_KILL", False),
             flow_mirror=bool_env("CRB_FLOW_MIRROR", True),
+            reasoning_mirror=bool_env("CRB_REASONING_MIRROR", True),
         )
 
     @property
@@ -1913,6 +1925,31 @@ def parse_choice_prompt(screen: str, ttl_seconds: int = 300) -> ChoicePrompt | N
     )
 
 
+def collect_reasoning_summary(value: Any, parts: list[str]) -> None:
+    if isinstance(value, str):
+        text = value.strip()
+        if text:
+            parts.append(text)
+        return
+    if isinstance(value, list):
+        for item in value:
+            collect_reasoning_summary(item, parts)
+        return
+    if not isinstance(value, dict):
+        return
+    for key in ("text", "summary", "content"):
+        if key in value:
+            collect_reasoning_summary(value.get(key), parts)
+
+
+def extract_reasoning_summary(payload: dict[str, Any]) -> str:
+    # Only the runtime-PUBLIC reasoning summary is read — never any raw
+    # chain-of-thought field. Codex carries the public summary under "summary".
+    parts: list[str] = []
+    collect_reasoning_summary(payload.get("summary"), parts)
+    return "\n".join(parts).strip()
+
+
 def extract_event(record: dict[str, Any]) -> tuple[str, str] | None:
     kind = record.get("type")
     payload = record.get("payload") if isinstance(record.get("payload"), dict) else {}
@@ -1930,6 +1967,13 @@ def extract_event(record: dict[str, Any]) -> tuple[str, str] | None:
             return "progress", message
 
     if kind == "response_item":
+        if payload.get("type") == "reasoning":
+            summary = extract_reasoning_summary(payload)
+            if summary:
+                if is_copy_payload_message(summary):
+                    return "copy_payload", summary
+                return "reasoning", summary
+            return None
         if payload.get("type") == "message" and payload.get("role") == "assistant":
             phase = payload.get("phase") or payload.get("metadata", {}).get("phase")
             content = payload.get("content")
@@ -2091,6 +2135,8 @@ class Bridge:
         self.flow_body = ""
         self.flow_scope = ""
         self.flow_last_edit_at = 0.0
+        # 🧠 reasoning mirror captured during the turn; sent AFTER the final answer.
+        self.pending_reasoning_mirror: tuple[str, str] | None = None
         self.telegram_fallback_sent = False
         self.session_path: Path | None = None
         self.session_identity: SessionIdentity | None = None
@@ -2128,6 +2174,7 @@ class Bridge:
     def handle_user_event(self, text: str) -> None:
         self.suppress_until_user = False
         self.last_public_progress = ""
+        self.pending_reasoning_mirror = None
         self.current_flow_scope = normalize_prompt(text)
         if self.consume_pending_match(text):
             self.current_origin = "telegram"
@@ -2204,7 +2251,49 @@ class Bridge:
         if remaining > 0:
             time.sleep(remaining)
 
+    def handle_reasoning_event(self, text: str, key: str) -> None:
+        # Capture this turn's public reasoning summary; it is mirrored AFTER the
+        # final answer is sent (see send_pending_reasoning_mirror). Copy-payload
+        # turns never emit a reasoning mirror. Non-fatal: failures here never
+        # block the answer.
+        if is_copy_payload_message(text):
+            self.handle_copy_payload_event(text)
+            return
+        if not self.config.reasoning_mirror:
+            return
+        message = format_reasoning_mirror(text)
+        if not message:
+            return
+        if self.bridge_state and ring_contains(self.bridge_state, key):
+            log("SEND", "skip duplicate reasoning mirror")
+            return
+        with self.lock:
+            self.last_public_progress = format_progress_summary(text, 220)
+        self.pending_reasoning_mirror = (message, key)
+
+    def send_pending_reasoning_mirror(self) -> None:
+        # Sent right after the final answer succeeds, mirroring the assistant's
+        # post-answer thinking. Dedup via the state ring; non-fatal.
+        pending = self.pending_reasoning_mirror
+        self.pending_reasoning_mirror = None
+        if not pending:
+            return
+        if not self.config.reasoning_mirror:
+            return
+        message, key = pending
+        if self.bridge_state and ring_contains(self.bridge_state, key):
+            return
+        if self.config.bridge_kill:
+            log("SEND", "reasoning mirror blocked by CRB_KILL=1")
+            return
+        if not self.telegram.send(message):
+            log("SEND", "reasoning mirror failed")
+            return
+        self.persist_state(event_key=key)
+
     def handle_copy_payload_event(self, text: str) -> bool:
+        # Copy-payload replies never carry a reasoning mirror.
+        self.pending_reasoning_mirror = None
         messages = split_copy_payload_messages(text)
         if not messages:
             return True
@@ -2241,6 +2330,9 @@ class Bridge:
         else:
             if not self.send_answer(answer):
                 return False
+            # 🧠 Mirror the public reasoning summary AFTER the final answer is
+            # sent (parity with the assistant's post-answer thinking mirror).
+            self.send_pending_reasoning_mirror()
         if self.request_incomplete_copy_payload_pair_repair_if_needed():
             return True
         self.warn_incomplete_copy_payload_pair_if_needed()
@@ -2417,6 +2509,12 @@ class Bridge:
             if line_end is not None:
                 self.persist_state(line_end)
             return True
+        elif kind == "reasoning":
+            key = event_dedup_key(record, kind, text)
+            self.handle_reasoning_event(text, key)
+            if line_end is not None:
+                self.persist_state(line_end)
+            return True
         elif kind == "progress":
             key = event_dedup_key(record, kind, text)
             if not self.handle_progress_event(text, key):
@@ -2444,6 +2542,7 @@ class Bridge:
                 self.stop_repl_typing()
                 self.stop_long_running_progress()
                 self.stop_telegram_fallback()
+                self.pending_reasoning_mirror = None
                 for message in split_copy_payload_messages(text):
                     self.record_copy_payload_pair_part(message)
                 if self.request_incomplete_copy_payload_pair_repair_if_needed():
@@ -2460,6 +2559,7 @@ class Bridge:
                 self.stop_repl_typing()
                 self.stop_long_running_progress()
                 self.stop_telegram_fallback()
+                self.pending_reasoning_mirror = None
                 self.clear_active_telegram_prompt()
                 if line_end is not None:
                     self.persist_state(line_end)
