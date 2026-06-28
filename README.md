@@ -459,9 +459,9 @@ that local path from the Telegram text and uploads the actual media. This works
 for raw paths and markdown links such as:
 
 ```text
-Here is the screenshot: [screenshot.png](/home/user/project/screenshot.png)
-Here is the clip: /home/user/project/demo.mp4
-Here is the audio: [voice.oga](/home/user/project/voice.oga)
+Here is the screenshot: [screenshot.png](/path/to/project/screenshot.png)
+Here is the clip: /path/to/project/demo.mp4
+Here is the audio: [voice.oga](/path/to/project/voice.oga)
 ```
 
 The bridge uses Telegram's media-specific upload methods when possible:

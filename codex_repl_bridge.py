@@ -14,6 +14,7 @@ input delivery uses tmux. Reply extraction uses the structured session log.
 
 from __future__ import annotations
 
+import fcntl
 import glob
 import hashlib
 import json
@@ -31,6 +32,7 @@ import threading
 import time
 import urllib.parse
 import urllib.request
+from contextlib import contextmanager
 from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from pathlib import Path
@@ -66,6 +68,12 @@ LONG_RUNNING_SLASH_COMMANDS = {"/goal"}
 ANSI_RE = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]")
 REPL_BUSY_RE = re.compile(
     r"esc to interrupt|interrupt to stop|\bWorking\b|tokens used",
+    re.IGNORECASE,
+)
+FOOTER_CONTEXT_RE = re.compile(r"\bContext\s+(?P<used>\d{1,3})%\s+used\b", re.IGNORECASE)
+FOOTER_FIVE_HOUR_RE = re.compile(r"\b5h\s+(?P<left>\d{1,3})%\s+left\b", re.IGNORECASE)
+FOOTER_WEEKLY_RE = re.compile(
+    r"\b(?:weekly|week|w)\w*\s+(?P<left>\d{1,3})%\s+left\b",
     re.IGNORECASE,
 )
 UNRECOGNIZED_COMMAND_RE = re.compile(r"Unrecognized command ['\"](?P<command>/[^'\"]+)['\"]")
@@ -255,6 +263,75 @@ def extract_codex_context_text(screen: str) -> str:
         if line.startswith("Context window:"):
             return f"Codex context\n{line}"
     return "Codex context not visible yet."
+
+
+def composer_lock_path() -> Path:
+    # Single-writer composer lock. Defaults under the same state dir the bridge
+    # already uses (CRB_STATE_DIR / TAB_STATE_DIR), overridable via env.
+    state_dir = env("CRB_STATE_DIR", env("TAB_STATE_DIR", "~/.local/state/telegram-agent-bridge"))
+    default = str(Path(state_dir or "~/.local/state/telegram-agent-bridge") / "composer.lock")
+    return Path(os.environ.get("CODEX_COMPOSER_LOCK", default)).expanduser()
+
+
+def extract_codex_footer_status_text(screen: str) -> str:
+    footer = parse_codex_footer_status(screen)
+    if not footer:
+        return ""
+    lines = ["Codex status"]
+    if footer.get("model"):
+        lines.append(f"Model: {footer['model']}")
+    if footer.get("path"):
+        lines.append(f"Path: {footer['path']}")
+    lines.append(f"Context: {footer['context_used']}% used")
+    if footer.get("five_hour_left"):
+        lines.append(f"5h: {footer['five_hour_left']}% left")
+    if footer.get("weekly_left"):
+        lines.append(f"Weekly: {footer['weekly_left']}% left")
+    return "\n".join(lines)
+
+
+def extract_codex_footer_context_text(screen: str) -> str:
+    footer = parse_codex_footer_status(screen)
+    if not footer:
+        return ""
+    return f"Codex context\nContext: {footer['context_used']}% used"
+
+
+def parse_codex_footer_status(screen: str) -> dict[str, str]:
+    for raw_line in reversed(clean_pane_lines(screen)[-20:]):
+        line = " ".join(raw_line.strip().split())
+        if not line or not FOOTER_CONTEXT_RE.search(line):
+            continue
+        parts = [part.strip() for part in line.split("·") if part.strip()]
+        context_index = next(
+            (index for index, part in enumerate(parts) if FOOTER_CONTEXT_RE.search(part)),
+            -1,
+        )
+        if context_index < 0:
+            continue
+        context_match = FOOTER_CONTEXT_RE.search(parts[context_index])
+        if not context_match:
+            continue
+        five_hour_left = ""
+        weekly_left = ""
+        for part in parts[context_index + 1 :]:
+            if not five_hour_left and (match := FOOTER_FIVE_HOUR_RE.search(part)):
+                five_hour_left = match.group("left")
+                continue
+            if not weekly_left and (match := FOOTER_WEEKLY_RE.search(part)):
+                weekly_left = match.group("left")
+                continue
+        prefix = parts[:context_index]
+        return {
+            "model": prefix[0] if prefix else "",
+            "path": prefix[1] if len(prefix) >= 2 else "",
+            "context_used": context_match.group("used"),
+            "five_hour_left": five_hour_left,
+            # 78-col panes can truncate the weekly segment to "w…"; omit it rather
+            # than touching the composer just to recover an optional value.
+            "weekly_left": weekly_left,
+        }
+    return {}
 
 
 def extract_unrecognized_slash_error(screen: str, command: str) -> str:
@@ -572,28 +649,30 @@ def format_long_running_progress_message(
     task_id: str = "",
     recent_progress: str = "",
 ) -> str:
+    # Prose-style progress update — NO fixed field labels
+    # (Task:/Task ID:/Elapsed:/Recent:/Current:/Next:/Blocked:). A "Progress
+    # update" header, a "✓ headline — summary" line, then 1~2 natural sentences
+    # with the task id / elapsed time / recent progress woven into the prose.
     label = " ".join((prompt or "").strip().split())
     label = truncate_text(label or "(empty request)", 160)
     elapsed_minutes = max(1, int(elapsed_seconds // 60))
-    lines = [
-        "Still working on your Telegram request.",
-        f"Task: {label}",
-    ]
-    if task_id:
-        lines.append(f"Task ID: {task_id}")
-    lines.append(f"Elapsed: about {elapsed_minutes} min")
-    if recent_progress:
-        lines.append(f"Recent: {format_progress_summary(recent_progress, 220)}")
+    recent = format_progress_summary(recent_progress, 220) if recent_progress else ""
+    task_clause = f"Working on {task_id}, " if task_id else ""
+    if recent:
+        headline = f"✓ Progress so far — {recent}"
+        body = (
+            f"{task_clause}still on '{label}', about {elapsed_minutes} min in. "
+            f'Latest progress reached "{recent}", and I will send the final answer '
+            "as soon as it is ready."
+        )
     else:
-        lines.append("Recent: no public progress note yet")
-    lines.extend(
-        [
-            "Current: waiting for the final answer",
-            "Next: I will send the final answer when it is ready.",
-            "Blocked: no blocker reported",
-        ]
-    )
-    return "\n".join(lines)
+        headline = "✓ Working — no shareable progress note yet"
+        body = (
+            f"{task_clause}still on '{label}', about {elapsed_minutes} min in. "
+            "There is no shareable progress note yet, and I am waiting on the "
+            "final answer."
+        )
+    return f"Progress update\n\n{headline}\n\n{body}"
 
 
 def strip_inline_node_emoji_header(text: str) -> str:
@@ -886,7 +965,7 @@ class Config:
             typing_liveness_seconds=int_env("CRB_TYPING_LIVENESS_SECONDS", 10, minimum=0),
             long_running_progress_seconds=int_env(
                 "CRB_LONG_RUNNING_PROGRESS_SECONDS",
-                0,
+                600,
                 minimum=0,
             ),
             telegram_fallback_seconds=int_env(
@@ -1243,6 +1322,21 @@ class CodexRepl:
     def __init__(self, config: Config) -> None:
         self.config = config
 
+    @contextmanager
+    def composer_lock(self):
+        path = composer_lock_path()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with path.open("a", encoding="utf-8") as lock_file:
+            # ⚠️ 제거 금지 (DO NOT REMOVE) — codex composer single-writer guard.
+            # Serializes every composer write (paste/clear) so concurrent
+            # Telegram inputs, status probes and recovery cannot interleave
+            # keystrokes into the live Codex TUI composer.
+            fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
+            try:
+                yield
+            finally:
+                fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+
     def tmux(self, *args: str, input_text: str | None = None) -> subprocess.CompletedProcess[str]:
         cmd = [self.config.tmux_bin, "-L", self.config.tmux_socket, *args]
         kwargs: dict[str, Any] = {
@@ -1270,7 +1364,7 @@ class CodexRepl:
             raise RuntimeError(f"could not resolve pane pid: {raw!r}")
         return int(raw)
 
-    def paste_prompt(self, prompt: str) -> None:
+    def _paste_prompt_unlocked(self, prompt: str) -> None:
         payload = prompt.rstrip("\n")
         if not payload:
             return
@@ -1286,7 +1380,11 @@ class CodexRepl:
             self.tmux("send-keys", "-t", self.config.pane_target, key)
             time.sleep(0.3)
 
-    def clear_composer(self) -> None:
+    def paste_prompt(self, prompt: str) -> None:
+        with self.composer_lock():
+            self._paste_prompt_unlocked(prompt)
+
+    def _clear_composer_unlocked(self) -> None:
         self.verify()
         # C-u only clears text before the cursor. After a rejected slash command,
         # Codex can leave the cursor before stale text, so clear both sides.
@@ -1294,6 +1392,10 @@ class CodexRepl:
             self.tmux("send-keys", "-t", self.config.pane_target, key)
             time.sleep(0.05)
         time.sleep(0.1)
+
+    def clear_composer(self) -> None:
+        with self.composer_lock():
+            self._clear_composer_unlocked()
 
     def capture_pane(self, lines: int = 80) -> str:
         out = self.tmux(
@@ -2238,7 +2340,7 @@ class Bridge:
             return False
         repair_prompt = copy_payload_pair_repair_prompt(missing)
         try:
-            self.repl.paste_prompt(repair_prompt)
+            self.clear_and_paste_prompt(repair_prompt, "copy payload repair")
         except Exception as exc:  # noqa: BLE001
             log("SEND", f"copy payload pair repair inject failed: {exc}")
             return False
@@ -2641,6 +2743,13 @@ class Bridge:
 
     def recover_repl_liveness(self, reason: str = "poll") -> bool:
         if not self.repl_is_working():
+            # Codex is idle. If typing was recovered earlier but there is no
+            # active prompt to wait on, stop the dangling typing indicator
+            # instead of leaving it pulsing forever.
+            if self.has_repl_typing() and not self.active_prompt_for_recovery():
+                log("LIVE", f"idle -> stop recovered typing ({reason})")
+                self.stop_repl_typing()
+                return True
             return False
         recovered = False
         if not self.has_repl_typing():
@@ -2666,14 +2775,28 @@ class Bridge:
         if not (context_only or is_status_command(text)):
             return False
         label = "context" if context_only else "status"
-        log("TG", f"{label} -> Codex REPL")
+        log("TG", f"{label} -> Codex footer")
         self.begin_repl_typing()
         try:
-            self.clear_composer_before_telegram_input(label)
-            self.head.send(AgentMessage("/status"))
-            time.sleep(1.0)
-            screen = self.head.capture_pane(120)
-            answer = extract_codex_context_text(screen) if context_only else extract_codex_status_text(screen)
+            # Prefer the always-visible footer so we do not touch the composer for
+            # a read-only status probe. Fall back to injecting /status only when
+            # the footer is not parseable.
+            screen = self.head.capture_pane(30)
+            answer = (
+                extract_codex_footer_context_text(screen)
+                if context_only
+                else extract_codex_footer_status_text(screen)
+            )
+            if not answer:
+                log("TG", f"{label} footer unavailable -> Codex REPL fallback")
+                self.clear_and_paste_prompt("/status", label)
+                time.sleep(1.0)
+                screen = self.head.capture_pane(120)
+                answer = (
+                    extract_codex_context_text(screen)
+                    if context_only
+                    else extract_codex_status_text(screen)
+                )
             self.telegram.send(answer)
         except Exception as exc:  # noqa: BLE001
             log("REPL", f"{label} failed: {exc}")
@@ -2681,6 +2804,23 @@ class Bridge:
         finally:
             self.stop_repl_typing()
         return True
+
+    def clear_and_paste_prompt(self, prompt: str, label: str = "telegram input") -> None:
+        # Hold the composer lock across BOTH clear and paste so no other writer
+        # (status probe, recovery, copy-payload repair) can interleave keystrokes
+        # between clearing stale text and pasting the new prompt.
+        composer_lock = getattr(self.repl, "composer_lock", None)
+        clear_unlocked = getattr(self.repl, "_clear_composer_unlocked", None)
+        paste_unlocked = getattr(self.repl, "_paste_prompt_unlocked", None)
+        if callable(composer_lock) and callable(clear_unlocked) and callable(paste_unlocked):
+            with composer_lock():
+                clear_unlocked()
+                log("REPL", f"cleared composer before {label}")
+                paste_unlocked(prompt)
+            self.needs_composer_clear = False
+            return
+        self.clear_composer_before_telegram_input(label)
+        self.repl.paste_prompt(prompt)
 
     def clear_composer_before_telegram_input(self, label: str = "telegram input") -> None:
         try:
@@ -3756,8 +3896,7 @@ class Bridge:
                 slash_command = is_codex_slash_command(prompt.text)
                 self.begin_telegram_prompt_tracking(prompt.text)
                 try:
-                    self.clear_composer_before_telegram_input("telegram prompt")
-                    self.head.send(AgentMessage(prompt.text))
+                    self.clear_and_paste_prompt(prompt.text, "telegram prompt")
                     if slash_command:
                         time.sleep(0.8)
                         had_slash_error = self.handle_slash_command_result(prompt.text)

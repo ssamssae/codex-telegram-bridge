@@ -53,7 +53,7 @@ def config(tmpdir, **overrides):
 
 
 class ConfigDefaultsTest(unittest.TestCase):
-    def test_default_long_running_progress_interval_is_disabled(self):
+    def test_default_long_running_progress_interval_is_enabled(self):
         old_progress = os.environ.pop("CRB_LONG_RUNNING_PROGRESS_SECONDS", None)
         old_fallback = os.environ.pop("CRB_TELEGRAM_FALLBACK_SECONDS", None)
         old_liveness = os.environ.pop("CRB_TYPING_LIVENESS_SECONDS", None)
@@ -73,7 +73,7 @@ class ConfigDefaultsTest(unittest.TestCase):
             else:
                 os.environ["TAB_CHAT_ID"] = old_chat_id
 
-        self.assertEqual(cfg.long_running_progress_seconds, 0)
+        self.assertEqual(cfg.long_running_progress_seconds, 600)
         self.assertEqual(cfg.telegram_fallback_seconds, 90)
         self.assertEqual(cfg.typing_liveness_seconds, 10)
         self.assertTrue(cfg.flow_mirror)
@@ -82,11 +82,11 @@ class ConfigDefaultsTest(unittest.TestCase):
         telegram = repl.TelegramClient("token", "1234", "🏭", 4096)
 
         self.assertEqual(
-            telegram.with_emoji_prefix("🏭 ㅎㅇ 아니키, 대기 중입니다."),
-            "🏭\nㅎㅇ 아니키, 대기 중입니다.",
+            telegram.with_emoji_prefix("🏭 ㅎㅇ 잘 지내, 대기 중입니다."),
+            "🏭\nㅎㅇ 잘 지내, 대기 중입니다.",
         )
 
-    def test_long_running_progress_message_includes_detail_fields(self):
+    def test_long_running_progress_message_is_prose_card(self):
         message = repl.format_long_running_progress_message(
             "T-260624-11 deploy bridge",
             630,
@@ -94,13 +94,14 @@ class ConfigDefaultsTest(unittest.TestCase):
             recent_progress="code deployed, checks running",
         )
 
-        self.assertIn("Task: T-260624-11 deploy bridge", message)
-        self.assertIn("Task ID: T-260624-11", message)
-        self.assertIn("Elapsed: about 10 min", message)
-        self.assertIn("Recent: code deployed, checks running", message)
-        self.assertIn("Current: waiting for the final answer", message)
-        self.assertIn("Next: I will send the final answer", message)
-        self.assertIn("Blocked: no blocker reported", message)
+        # Prose card, not a labelled status table.
+        self.assertTrue(message.startswith("Progress update\n\n✓ "))
+        self.assertIn("T-260624-11", message)
+        self.assertIn("deploy bridge", message)
+        self.assertIn("10 min", message)
+        self.assertIn("code deployed, checks running", message)
+        self.assertNotIn("Task ID:", message)
+        self.assertNotIn("Blocked:", message)
 
     def test_busy_screen_detects_working_footer(self):
         self.assertTrue(
@@ -109,6 +110,26 @@ class ConfigDefaultsTest(unittest.TestCase):
             )
         )
         self.assertFalse(repl.screen_has_repl_busy_marker("ready\nNo active task\n"))
+
+    def test_footer_status_parsed_without_touching_composer(self):
+        screen = (
+            "some output\n"
+            "  gpt-5.5 xhigh · ~/project · Context 54% used · 5h 81% left · w 92% left\n"
+        )
+        footer = repl.parse_codex_footer_status(screen)
+        self.assertEqual(footer["context_used"], "54")
+        self.assertEqual(footer["five_hour_left"], "81")
+        self.assertEqual(footer["weekly_left"], "92")
+
+        status_text = repl.extract_codex_footer_status_text(screen)
+        self.assertIn("Context: 54% used", status_text)
+        self.assertEqual(
+            repl.extract_codex_footer_context_text(screen),
+            "Codex context\nContext: 54% used",
+        )
+        # No footer -> empty so callers fall back to the /status injection path.
+        self.assertEqual(repl.parse_codex_footer_status("no footer here\n"), {})
+        self.assertEqual(repl.extract_codex_footer_context_text("no footer\n"), "")
 
 
 class FakeTelegram:
@@ -1005,7 +1026,7 @@ class ReplBridgeTests(unittest.TestCase):
                 bridge.stop_long_running_progress()
 
             self.assertTrue(telegram.sent)
-            self.assertIn("Still working", telegram.sent[0])
+            self.assertIn("Progress update", telegram.sent[0])
             self.assertIn("run the longer task", telegram.sent[0])
             self.assertIn("final answer", telegram.sent[0])
 
@@ -1026,9 +1047,9 @@ class ReplBridgeTests(unittest.TestCase):
                 bridge.stop_long_running_progress()
 
             self.assertTrue(telegram.sent)
-            self.assertIn("Task ID: T-260624-11", telegram.sent[0])
-            self.assertIn("Recent: copied to nodes checking services", telegram.sent[0])
-            self.assertIn("Blocked: no blocker reported", telegram.sent[0])
+            self.assertIn("Progress update", telegram.sent[0])
+            self.assertIn("T-260624-11", telegram.sent[0])
+            self.assertIn("copied to nodes checking services", telegram.sent[0])
 
     def test_telegram_fallback_sends_once_before_delayed_final_answer(self):
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -1042,8 +1063,8 @@ class ReplBridgeTests(unittest.TestCase):
             bridge.send_telegram_fallback("why is desktop bridge silent", 120)
 
             self.assertEqual(len(telegram.sent), 1)
-            self.assertIn("Still working", telegram.sent[0])
-            self.assertIn("Recent: checking logs waiting for final_answer", telegram.sent[0])
+            self.assertIn("Progress update", telegram.sent[0])
+            self.assertIn("checking logs waiting for final_answer", telegram.sent[0])
 
             self.assertTrue(bridge.handle_assistant_event("final result"))
             self.assertEqual(telegram.sent[-1], "final result")
@@ -1072,6 +1093,23 @@ class ReplBridgeTests(unittest.TestCase):
                 while time.monotonic() < deadline and not telegram.calls:
                     time.sleep(0.02)
                 self.assertIn(("sendChatAction", {"action": "typing"}), telegram.calls)
+            finally:
+                bridge.stop_repl_typing()
+
+    def test_liveness_stops_recovered_typing_when_repl_is_idle_without_active_prompt(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            telegram = FakeTelegram()
+            fake_repl = FakeRepl()
+            fake_repl.screen = "Working (5m 05s · esc to interrupt)\n"
+            bridge = repl.Bridge(config(tmpdir), telegram, fake_repl)
+
+            try:
+                self.assertTrue(bridge.recover_repl_liveness("test"))
+                self.assertTrue(bridge.has_repl_typing())
+
+                fake_repl.screen = "ready\nNo active task\n  model · ~ · Context 54% used\n"
+                self.assertTrue(bridge.recover_repl_liveness("test-idle"))
+                self.assertFalse(bridge.has_repl_typing())
             finally:
                 bridge.stop_repl_typing()
 
