@@ -133,6 +133,109 @@ def log(label: str, message: str) -> None:
     print(f"[{now_ts()}] {label:<5} {message}", flush=True)
 
 
+# ─ codex-CLI-style startup version check + button/auto self-update ─────────────
+# When a newer release exists on PyPI, offer a one-tap Telegram "update" button
+# (or fully auto-update with CRB_AUTO_UPDATE=1). Only active for pip-installed
+# copies — source/editable checkouts, offline state, errors, or opt-out all leave
+# the running version untouched. Requested 2026-06-29 (Seonyeob Rim feedback).
+SELF_UPDATE_PACKAGE = "codex-telegram-bridge"
+SELF_UPDATE_MODULE = "codex_repl_bridge"
+SELF_UPDATE_PREFIX = "CRB"
+SELF_UPDATE_CALLBACK = "crb_update"
+SELF_UPDATE_PYPI_TIMEOUT = 4
+
+
+def _self_update_installed_version() -> str | None:
+    try:
+        from importlib.metadata import version, PackageNotFoundError  # noqa: F401
+    except Exception:  # noqa: BLE001
+        return None
+    try:
+        return version(SELF_UPDATE_PACKAGE)
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def _self_update_is_pip_managed() -> bool:
+    path = str(Path(__file__).resolve())
+    return "site-packages" in path or "dist-packages" in path
+
+
+def _self_update_version_tuple(text: str) -> tuple[int, ...]:
+    parts: list[int] = []
+    for chunk in str(text).split("."):
+        digits = ""
+        for ch in chunk:
+            if ch.isdigit():
+                digits += ch
+            else:
+                break
+        parts.append(int(digits) if digits else 0)
+    return tuple(parts)
+
+
+def _self_update_latest() -> str | None:
+    try:
+        req = urllib.request.Request(
+            f"https://pypi.org/pypi/{SELF_UPDATE_PACKAGE}/json",
+            headers={"User-Agent": f"{SELF_UPDATE_PACKAGE}-bridge"},
+        )
+        with urllib.request.urlopen(req, timeout=SELF_UPDATE_PYPI_TIMEOUT) as resp:
+            info = json.loads(resp.read().decode("utf-8"))
+        latest = str((info.get("info") or {}).get("version") or "").strip()
+        return latest or None
+    except Exception as exc:  # noqa: BLE001 — offline / PyPI down is non-fatal
+        log("UPDATE", f"version check skipped: {exc}")
+        return None
+
+
+def self_update_available() -> str | None:
+    """Return the newer PyPI version string if an update should be offered, else None.
+    Returns None for opt-out, source checkouts, already-updated lineage, offline,
+    or when already current. Never raises."""
+    try:
+        if bool_env(f"{SELF_UPDATE_PREFIX}_NO_UPDATE_CHECK", False):
+            return None
+        if env(f"{SELF_UPDATE_PREFIX}_SELF_UPDATED"):
+            return None
+        if not _self_update_is_pip_managed():
+            return None
+        current = _self_update_installed_version()
+        if not current:
+            return None
+        latest = _self_update_latest()
+        if not latest:
+            return None
+        if _self_update_version_tuple(latest) <= _self_update_version_tuple(current):
+            return None
+        return latest
+    except Exception as exc:  # noqa: BLE001
+        log("UPDATE", f"version check error: {exc}")
+        return None
+
+
+def perform_self_update(latest: str) -> None:
+    """pip-upgrade to `latest` then re-exec so the new code runs. Fail-safe: any
+    error leaves the running version untouched."""
+    try:
+        log("UPDATE", f"upgrading {SELF_UPDATE_PACKAGE} -> {latest}")
+        proc = subprocess.run(
+            [sys.executable, "-m", "pip", "install", "--upgrade", f"{SELF_UPDATE_PACKAGE}=={latest}"],
+            capture_output=True,
+            text=True,
+            timeout=300,
+        )
+        if proc.returncode != 0:
+            detail = (proc.stderr or proc.stdout or "").strip()[:200]
+            log("UPDATE", f"pip upgrade failed (staying put): {detail}")
+            return
+        os.environ[f"{SELF_UPDATE_PREFIX}_SELF_UPDATED"] = latest
+        log("UPDATE", f"upgraded to {latest}; restarting")
+        os.execv(sys.executable, [sys.executable, "-m", SELF_UPDATE_MODULE] + sys.argv[1:])
+    except Exception as exc:  # noqa: BLE001
+        log("UPDATE", f"self-update error (new version active next restart): {exc}")
+
+
 def node_defaults() -> tuple[str, str]:
     hostname = os.uname().nodename
     cleaned = safe_filename_part(hostname).lower()
@@ -1161,6 +1264,13 @@ class TelegramClient:
             payload = self.call("sendMessage", chat_id=self.chat_id, text=chunk)
             ok = ok and bool(payload and payload.get("ok"))
         return ok
+
+    def send_update_button(self, text: str, callback_data: str) -> None:
+        reply_markup = json.dumps(
+            {"inline_keyboard": [[{"text": "\U0001f504 지금 업데이트", "callback_data": callback_data}]]},
+            ensure_ascii=False,
+        )
+        self.call("sendMessage", chat_id=self.chat_id, text=self.with_emoji_prefix(text), reply_markup=reply_markup)
 
     def send_message_id(self, text: str) -> int | None:
         payload = self.call(
@@ -3194,6 +3304,19 @@ class Bridge:
 
     def handle_callback_query(self, callback: dict[str, Any]) -> bool:
         data = str(callback.get("data") or "")
+        if data.startswith(f"{SELF_UPDATE_CALLBACK}::"):
+            message = callback.get("message") if isinstance(callback.get("message"), dict) else {}
+            chat = message.get("chat") if isinstance(message.get("chat"), dict) else {}
+            if str(chat.get("id")) != self.config.chat_id:
+                return True
+            if callback.get("id"):
+                self.telegram.call(
+                    "answerCallbackQuery",
+                    callback_query_id=str(callback.get("id") or ""),
+                    text="업데이트를 시작합니다…",
+                )
+            perform_self_update(data.split("::", 1)[1])
+            return True
         if data.startswith(f"{CHOICE_CALLBACK_PREFIX}:"):
             return self.handle_choice_callback_query(callback)
         if not data.startswith(f"{APPROVAL_CALLBACK_PREFIX}:"):
@@ -3946,9 +4069,26 @@ class Bridge:
 
         return TelegramPrompt(text="")
 
+    def offer_update_if_available(self) -> None:
+        latest = self_update_available()
+        if not latest:
+            return
+        if bool_env(f"{SELF_UPDATE_PREFIX}_AUTO_UPDATE", False):
+            perform_self_update(latest)
+            return
+        current = _self_update_installed_version() or "?"
+        try:
+            self.telegram.send_update_button(
+                f"\U0001f195 새 버전 v{latest} 가 출시됐어요! (현재 v{current})\n업데이트하려면 아래 버튼을 누르세요.",
+                f"{SELF_UPDATE_CALLBACK}::{latest}",
+            )
+        except Exception as exc:  # noqa: BLE001
+            log("UPDATE", f"update offer failed: {exc}")
+
     def telegram_loop(self) -> None:
         offset_raw = read_text(self.config.offset_file)
         offset = int(offset_raw) if offset_raw.isdigit() else 0
+        self.offer_update_if_available()
         while not self.stop_event.is_set():
             response = self.telegram.call("getUpdates", offset=offset, timeout=self.config.poll_timeout)
             if not response or not response.get("ok"):
