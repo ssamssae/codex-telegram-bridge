@@ -324,6 +324,8 @@ def write_env_config(
                 "",
                 "# REPL mode: paste Telegram prompts into an existing Codex TUI tmux session",
                 "# and mirror final answers from Codex JSONL session logs.",
+                "# BYO signal: local FIFO for cron/webhook/task-queue prompt injection.",
+                f"CRB_SIGNAL_PATH={shell_quote(local_input)}",
                 f"CRB_TMUX_SOCKET={shell_quote(tmux_socket)}",
                 f"CRB_TMUX_SESSION={shell_quote(tmux_session)}",
                 f"CRB_TMUX_SUBMIT_KEY={shell_quote(submit_key)}",

@@ -48,6 +48,7 @@ def config(tmpdir, **overrides):
         "bridge_kill": False,
         "flow_mirror": True,
         "reasoning_mirror": True,
+        "signal_path": None,
     }
     base.update(overrides)
     return repl.Config(**base)
@@ -293,6 +294,107 @@ class ReplBridgeTests(unittest.TestCase):
             self.assertTrue(cfg.backfill_enabled)
             self.assertEqual(cfg.backfill_max, 1)
             self.assertFalse(cfg.bridge_kill)
+            self.assertIsNone(cfg.signal_path)
+
+    def test_config_from_env_accepts_signal_path(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            old_env = os.environ.copy()
+            try:
+                os.environ.clear()
+                os.environ.update(
+                    {
+                        "TAB_CHAT_ID": "1234",
+                        "TAB_BOT_TOKEN": "token",
+                        "TAB_STATE_DIR": tmpdir,
+                        "CRB_SIGNAL_PATH": str(Path(tmpdir) / "signals.fifo"),
+                    }
+                )
+                cfg = repl.Config.from_env()
+            finally:
+                os.environ.clear()
+                os.environ.update(old_env)
+
+            self.assertEqual(cfg.signal_path, Path(tmpdir) / "signals.fifo")
+
+    def test_config_from_env_uses_tab_local_input_as_signal_fallback(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            old_env = os.environ.copy()
+            try:
+                os.environ.clear()
+                os.environ.update(
+                    {
+                        "TAB_CHAT_ID": "1234",
+                        "TAB_BOT_TOKEN": "token",
+                        "TAB_STATE_DIR": tmpdir,
+                        "TAB_LOCAL_INPUT": str(Path(tmpdir) / "input.fifo"),
+                    }
+                )
+                cfg = repl.Config.from_env()
+            finally:
+                os.environ.clear()
+                os.environ.update(old_env)
+
+            self.assertEqual(cfg.signal_path, Path(tmpdir) / "input.fifo")
+
+    def test_config_from_env_signal_off_disables_tab_local_input_fallback(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            old_env = os.environ.copy()
+            try:
+                os.environ.clear()
+                os.environ.update(
+                    {
+                        "TAB_CHAT_ID": "1234",
+                        "TAB_BOT_TOKEN": "token",
+                        "TAB_STATE_DIR": tmpdir,
+                        "TAB_LOCAL_INPUT": str(Path(tmpdir) / "input.fifo"),
+                        "CRB_SIGNAL_PATH": "off",
+                    }
+                )
+                cfg = repl.Config.from_env()
+            finally:
+                os.environ.clear()
+                os.environ.update(old_env)
+
+            self.assertIsNone(cfg.signal_path)
+
+    def test_parse_signal_prompt_accepts_plain_text_and_json(self):
+        self.assertEqual(repl.parse_signal_prompt("ship this\n"), "ship this")
+        self.assertEqual(repl.parse_signal_prompt('{"prompt":"run audit"}'), "run audit")
+        self.assertEqual(repl.parse_signal_prompt('{"text":"run tests"}'), "run tests")
+        self.assertEqual(repl.parse_signal_prompt('{"message":"summarize"}'), "summarize")
+        self.assertEqual(repl.parse_signal_prompt('{"other":"ignored"}'), "")
+
+    def test_signal_prompt_injects_through_repl_path(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            fake_repl = FakeRepl()
+            bridge = repl.Bridge(
+                config(
+                    tmpdir,
+                    signal_path=Path(tmpdir) / "signal.fifo",
+                    telegram_fallback_seconds=0,
+                    long_running_progress_seconds=0,
+                ),
+                FakeTelegram(),
+                fake_repl,
+            )
+
+            self.assertTrue(bridge.process_signal_text('{"prompt":"T-260630-99 do work"}\n'))
+            bridge.stop_repl_typing()
+            bridge.stop_event.set()
+
+            self.assertEqual(fake_repl.prompts, ["T-260630-99 do work"])
+            self.assertEqual(fake_repl.cleared, 1)
+            self.assertEqual(bridge.current_origin, "telegram")
+            self.assertEqual(bridge.active_prompt_for_recovery(), "T-260630-99 do work")
+
+    def test_signal_fifo_is_created_private(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir) / "signal.fifo"
+            bridge = repl.Bridge(config(tmpdir, signal_path=path), FakeTelegram(), FakeRepl())
+
+            bridge.ensure_signal_fifo()
+
+            self.assertTrue(path.is_fifo())
 
     def test_slash_command_uses_enter_submit_key(self):
         with tempfile.TemporaryDirectory() as tmpdir:

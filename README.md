@@ -20,7 +20,7 @@ the remote control when you are away from the keyboard.
 Install with `pipx`, then run the setup wizard:
 
 ```bash
-pipx install "git+https://github.com/ssamssae/codex-telegram-bridge.git@v0.3.25"
+pipx install "git+https://github.com/ssamssae/codex-telegram-bridge.git@v0.5.0"
 codex-telegram-bridge setup
 codex-telegram-bridge doctor
 ```
@@ -214,6 +214,46 @@ printf '%s\n' 'continue from the terminal' > ~/.local/state/telegram-agent-bridg
 
 Prompts and final answers are mirrored to both Telegram and terminal output.
 
+## BYO Signal Contract
+
+Do not copy another operator's private trigger scripts into your setup. Scripts
+that push work into a live agent usually contain local SSH aliases, node names,
+chat ids, token paths, and tmux assumptions. This project only needs a small
+local input contract: write one UTF-8 line to the configured signal FIFO.
+
+Enable a signal FIFO for `repl` mode:
+
+```bash
+export CRB_SIGNAL_PATH="$HOME/.local/state/telegram-agent-bridge/input.fifo"
+codex-telegram-bridge
+```
+
+The bridge creates the FIFO if it does not already exist. Any local process that
+can write to this path can inject a prompt into Codex, so keep it under your
+private state directory and do not expose it through a network share.
+
+Signal payloads can be plain text:
+
+```bash
+printf '%s\n' 'review the latest failing test' > "$CRB_SIGNAL_PATH"
+```
+
+Or one JSON object per line with `prompt`, `text`, or `message`:
+
+```bash
+printf '%s\n' '{"prompt":"run the smoke checks and summarize failures"}' > "$CRB_SIGNAL_PATH"
+```
+
+A minimal generic trigger wrapper is included:
+
+```bash
+examples/triggers/byo-signal-submit.sh "summarize the current git diff"
+```
+
+Use this as the boundary for your own cron job, webhook receiver, task queue, or
+multi-node orchestrator. Keep site-specific dispatch logic outside this repo;
+the public bridge only owns the local signal contract and Codex/Telegram flow.
+
 ## Setup Commands
 
 Interactive install:
@@ -320,7 +360,8 @@ Required settings are intentionally small and explicit.
 | `TAB_TIMEOUT` | no | `600` | Per-turn timeout in seconds. |
 | `TAB_TG_CHUNK` | no | `4096` | Telegram message chunk size. |
 | `TAB_TYPING_INTERVAL` | no | `4` | Seconds between repeated Telegram `typing` actions while Codex is running. |
-| `TAB_LOCAL_INPUT` | no | `~/.local/state/telegram-agent-bridge/input.fifo` on POSIX | FIFO path for local terminal prompts. Set to `0`/`off` to disable. |
+| `CRB_SIGNAL_PATH` | no | `TAB_LOCAL_INPUT` when set | FIFO path for external/local signal prompts in `repl` mode. Set to `0`/`off` to disable. |
+| `TAB_LOCAL_INPUT` | no | `~/.local/state/telegram-agent-bridge/input.fifo` on POSIX | Compatibility FIFO path for local terminal prompts and `CRB_SIGNAL_PATH` fallback. Set to `0`/`off` to disable. |
 | `TAB_STDIN_INPUT` | no | auto | Read local prompts from stdin. Defaults to on only when stdin is a TTY. |
 | `TAB_CODEX_DANGEROUS_BYPASS` | no | `0` | When `1`, adds `--dangerously-bypass-approvals-and-sandbox` to Codex. |
 | `TAB_CODEX_EXTRA_ARGS` | no | empty | Extra arguments inserted after `codex exec --json -o <tmp>`. |
@@ -516,7 +557,7 @@ These are product directions, not promises in the current release:
   setup is `/start`.
 - Keep `TAB_CHAT_ID` set to the intended chat id. This single-user allowlist is the main safety boundary.
 - Run this only on a trusted personal machine or trusted server. Telegram messages become Codex prompts.
-- Protect `TAB_LOCAL_INPUT`. Anyone who can write to the FIFO can send prompts to Codex.
+- Protect `CRB_SIGNAL_PATH`/`TAB_LOCAL_INPUT`. Anyone who can write to the FIFO can send prompts to Codex.
 - Be careful with `TAB_CODEX_DANGEROUS_BYPASS=1`. It adds `--dangerously-bypass-approvals-and-sandbox`, allowing Codex to act without normal approval and sandbox protections.
 - Prefer a limited working directory in `TAB_WORKDIR` when possible.
 - This daemon uses Telegram polling, not a public inbound webhook. You do not need to expose a local port.

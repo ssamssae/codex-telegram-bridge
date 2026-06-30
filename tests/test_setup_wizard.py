@@ -91,6 +91,7 @@ class SetupWizardTests(unittest.TestCase):
             self.assertEqual(values["TAB_CHAT_ID"], "12345")
             self.assertEqual(values["TAB_BRIDGE_MODE"], "repl")
             self.assertEqual(values["TAB_PREFIX_LINE"], "1")
+            self.assertEqual(values["CRB_SIGNAL_PATH"], str(state_dir / "input.fifo"))
             self.assertEqual(values["CRB_TMUX_SOCKET"], "codex")
 
     def test_install_runner_sources_private_env(self):

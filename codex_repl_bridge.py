@@ -110,6 +110,16 @@ def bool_env(name: str, default: bool = False) -> bool:
     return (env(name, fallback) or fallback).lower() in {"1", "true", "yes", "on"}
 
 
+def path_env(name: str, fallback: str | None = None) -> Path | None:
+    raw = env(name, fallback)
+    if raw is None:
+        return None
+    raw = raw.strip()
+    if not raw or raw.lower() in {"0", "off", "false", "no", "none", "disabled"}:
+        return None
+    return Path(raw).expanduser()
+
+
 def clamp(value: int, minimum: int, maximum: int) -> int:
     return max(minimum, min(maximum, value))
 
@@ -281,6 +291,25 @@ def write_json_atomic(path: Path, payload: dict[str, Any]) -> None:
         os.fsync(dir_fd)
     finally:
         os.close(dir_fd)
+
+
+def parse_signal_prompt(raw: str) -> str:
+    raw = (raw or "").strip()
+    if not raw:
+        return ""
+    if not raw.startswith("{"):
+        return raw
+    try:
+        payload = json.loads(raw)
+    except json.JSONDecodeError:
+        return raw
+    if not isinstance(payload, dict):
+        return raw
+    for key in ("prompt", "text", "message"):
+        value = payload.get(key)
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    return ""
 
 
 def safe_filename_part(value: str) -> str:
@@ -1039,6 +1068,7 @@ class Config:
     bridge_kill: bool
     flow_mirror: bool
     reasoning_mirror: bool
+    signal_path: Path | None
 
     @classmethod
     def from_env(cls) -> "Config":
@@ -1110,6 +1140,7 @@ class Config:
             bridge_kill=bool_env("CRB_KILL", False),
             flow_mirror=bool_env("CRB_FLOW_MIRROR", True),
             reasoning_mirror=bool_env("CRB_REASONING_MIRROR", True),
+            signal_path=path_env("CRB_SIGNAL_PATH", env("TAB_LOCAL_INPUT")),
         )
 
     @property
@@ -4085,6 +4116,69 @@ class Bridge:
         except Exception as exc:  # noqa: BLE001
             log("UPDATE", f"update offer failed: {exc}")
 
+    def ensure_signal_fifo(self) -> None:
+        path = self.config.signal_path
+        if path is None:
+            return
+        if not hasattr(os, "mkfifo"):
+            raise RuntimeError("CRB_SIGNAL_PATH requires os.mkfifo support")
+        path.parent.mkdir(parents=True, exist_ok=True)
+        if path.exists():
+            if not path.is_fifo():
+                raise RuntimeError(f"CRB_SIGNAL_PATH exists but is not a FIFO: {path}")
+            try:
+                path.chmod(0o600)
+            except OSError:
+                pass
+            return
+        os.mkfifo(path, 0o600)
+        try:
+            path.chmod(0o600)
+        except OSError:
+            pass
+
+    def signal_loop(self) -> None:
+        path = self.config.signal_path
+        if path is None:
+            return
+        while not self.stop_event.is_set():
+            try:
+                with path.open("r", encoding="utf-8") as fifo:
+                    for line in fifo:
+                        if self.stop_event.is_set():
+                            break
+                        self.process_signal_text(line)
+            except Exception as exc:  # noqa: BLE001
+                if not self.stop_event.is_set():
+                    log("SIGNAL", f"read failed: {exc}")
+                    time.sleep(2)
+
+    def process_signal_text(self, raw: str) -> bool:
+        prompt_text = parse_signal_prompt(raw)
+        if not prompt_text:
+            return False
+        log("SIGNAL", "prompt -> Codex REPL")
+        self.begin_repl_typing()
+        slash_command = is_codex_slash_command(prompt_text)
+        self.begin_telegram_prompt_tracking(prompt_text)
+        try:
+            self.clear_and_paste_prompt(prompt_text, "signal prompt")
+            if slash_command:
+                time.sleep(0.8)
+                had_slash_error = self.handle_slash_command_result(prompt_text)
+                if should_stop_typing_after_slash_command(prompt_text, had_slash_error):
+                    self.stop_repl_typing()
+                    self.stop_long_running_progress()
+                    self.clear_active_telegram_prompt()
+        except Exception as exc:  # noqa: BLE001
+            self.stop_repl_typing()
+            self.stop_long_running_progress()
+            self.clear_active_telegram_prompt()
+            log("SIGNAL", f"paste failed: {exc}")
+            self.telegram.send(f"codex signal delivery failed: {exc}")
+            return False
+        return True
+
     def telegram_loop(self) -> None:
         offset_raw = read_text(self.config.offset_file)
         offset = int(offset_raw) if offset_raw.isdigit() else 0
@@ -4162,6 +4256,11 @@ class Bridge:
         self.recover_repl_liveness("startup")
         liveness_thread = threading.Thread(target=self.liveness_loop, daemon=True)
         liveness_thread.start()
+        if self.config.signal_path is not None:
+            self.ensure_signal_fifo()
+            log("SIGNAL", f"fifo ready: {self.config.signal_path}")
+            signal_thread = threading.Thread(target=self.signal_loop, daemon=True, name="crb-signal")
+            signal_thread.start()
         try:
             self.telegram_loop()
         finally:
