@@ -38,6 +38,19 @@ Token safety rule: BotFather shows the bot token in Telegram, but paste it only
 into the local terminal setup wizard. In Telegram, send only `/start`, `/ping`,
 or normal prompts to your bot.
 
+## Public Export Model
+
+This public repository is maintained from a private operator source through a
+sanitized export step. The export keeps the reusable bridge behavior, setup
+wizard, and BYO signal contract, while stripping private chat ids, token paths,
+hostnames, node labels, and local automation paths before release.
+
+Do not copy another operator's private wrapper scripts into your setup. Treat
+`CRB_SIGNAL_PATH` / `TAB_LOCAL_INPUT` as the public integration boundary: your
+cron job, local queue, or orchestrator writes one prompt line to the FIFO, and
+the bridge owns only local delivery into the visible Codex session plus Telegram
+mirroring.
+
 Release: <https://github.com/ssamssae/codex-telegram-bridge/releases/latest>
 
 Promo video from the v0.3 demo release:
@@ -216,10 +229,10 @@ Prompts and final answers are mirrored to both Telegram and terminal output.
 
 ## BYO Signal Contract
 
-Do not copy another operator's private trigger scripts into your setup. Scripts
-that push work into a live agent usually contain local SSH aliases, node names,
-chat ids, token paths, and tmux assumptions. This project only needs a small
-local input contract: write one UTF-8 line to the configured signal FIFO.
+Scripts that push work into a live agent usually contain local SSH aliases,
+node names, chat ids, token paths, and tmux assumptions. This project only needs
+a small local input contract: write one UTF-8 line to the configured signal
+FIFO.
 
 Enable a signal FIFO for `repl` mode:
 
