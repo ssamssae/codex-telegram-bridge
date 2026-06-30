@@ -34,31 +34,67 @@ import urllib.parse
 import urllib.request
 from contextlib import contextmanager
 from dataclasses import dataclass, replace
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
-from agent_runtime.adapters.codex_repl import CodexReplAdapter
-from agent_runtime.approvals import ApprovalOption, ApprovalRequest
-from agent_runtime.capabilities import CapabilityRegistry
-from agent_runtime.types import AgentMessage
-
 
 HOME = Path.home()
+KST = timezone(timedelta(hours=9), "KST")
 NODE_EMOJI_LINES = {"\U0001f34e", "\U0001f3ed", "\U0001fa9f", "\U0001f5a5", "\U0001f4bb", "\U0001f916"}
+REASONING_HEADER = "\U0001f9e0 코덱스 사고"
+REASONING_MIRROR_LIMIT = 3500
 FLOW_MIRROR_HEADER = "⚙️ 작업 흐름"
 FLOW_MIRROR_LIMIT = 1500
 # Per-step line cap: each flow event is collapsed to ONE short line (claude
 # parity) instead of the full multi-line narration. Keeps many steps inside one
 # edit-in-place card instead of overflowing into many long messages.
-FLOW_MIRROR_LINE_LIMIT = 200
+FLOW_MIRROR_LINE_LIMIT = 100
+# Sliding-window size: the flow card keeps only the last N step lines in ONE
+# edit-in-place message (no length-based rollover to a new message). Older steps
+# scroll off instead of spawning multiple long cards. (T-260628-36)
+FLOW_MIRROR_WINDOW = 6
 FLOW_MIRROR_EDIT_MIN_SECONDS = 1.0
-# 🧠 reasoning mirror: Codex emits a runtime-PUBLIC reasoning summary (never the
-# raw chain-of-thought). We mirror only that summary to Telegram AFTER the final
-# answer is sent, for parity with the assistant's thinking mirror.
-REASONING_HEADER = "\U0001f9e0 코덱스 사고"
-REASONING_MIRROR_LIMIT = 3500
+# ⚙️ A2 받은-지시 카드 (T-260630-22): 노드/오케가 codex REPL 에 주입한 디렉티브를 결과(코덱스
+# 답)보다 먼저 1~2줄로 보여줘 맥락이 끊기던 문제 보완. codex 는 TUI 라 JSONL terminal-origin
+# 에 수동입력이 섞여 origin 만으론 노드주입을 못 가리므로(claude 헤드리스와 다름), 신뢰성 있는
+# directive-received-ack.sh 가 주입 시 남긴 신호파일을 브릿지가 tail 해 카드화한다. flow_mirror
+# 토글 게이트. claude-telegram-bridge.py 의 '📥 받은 지시'(PR#248, node-origin 직접감지)와 한 쌍.
+AMBIENT_DIRECTIVE_HEADER = "📥 받은 지시"
+AMBIENT_DIRECTIVE_LIMIT = 400
+DIRECTIVE_SIGNAL_ENV = "CRB_DIRECTIVE_SIGNAL_PATH"
+# Codex REPL "dead/interrupted mid-turn" markers. When these appear at the
+# BOTTOM of the pane, codex aborted the turn but the bridge can keep pulsing
+# typing for up to CRB_TYPING_MAX_SECONDS (default 7200s = 2h). The typing loop
+# watches for these and self-terminates. (T-260628-15)
+CODEX_INTERRUPT_MARKERS = ("Conversation interrupted", "Something went wrong")
 TASK_ID_RE = re.compile(r"\bT-\d{6}-\d+\b")
+IMAGE_DELIVERY_CLAIM_IMAGE_RE = re.compile(
+    r"(이미지|사진|그림|첨부|파일|image|photo|picture|attachment|png|jpe?g|webp)",
+    re.IGNORECASE,
+)
+IMAGE_DELIVERY_CLAIM_SENT_RE = re.compile(
+    r"(보냈|전송했|첨부했|올렸|sent|uploaded|attached|delivered)",
+    re.IGNORECASE,
+)
+IMAGE_DELIVERY_CLAIM_NEGATIVE_RE = re.compile(
+    r"(안\s*보냈|못\s*보냈|전송\s*실패|첨부\s*실패|업로드\s*실패|"
+    r"not\s+sent|did(?:\s+not|n't)\s+send|could(?:\s+not|n't)\s+send|"
+    r"failed\s+to\s+(?:send|upload|attach))",
+    re.IGNORECASE,
+)
+IMAGE_DELIVERY_PROMPT_OBJECT_RE = re.compile(
+    r"(이미지|사진|그림|표지|로고|배너|썸네일|포스터|카드뉴스|짤|"
+    r"image|photo|picture|cover|logo|banner|thumbnail|poster|png|jpe?g|webp)",
+    re.IGNORECASE,
+)
+IMAGE_DELIVERY_PROMPT_ACTION_RE = re.compile(
+    r"(만들어\s*(?:줘|주세요|달)|생성\s*해\s*(?:줘|주세요|달)|생성해\s*(?:줘|주세요|달)|"
+    r"그려\s*(?:줘|주세요|달)|보내\s*(?:줘|주세요|달)|전송\s*해\s*(?:줘|주세요|달)|"
+    r"전송해\s*(?:줘|주세요|달)|첨부\s*해\s*(?:줘|주세요|달)|첨부해\s*(?:줘|주세요|달)|"
+    r"올려\s*(?:줘|주세요|달)|generate|create|draw|send|upload|attach)",
+    re.IGNORECASE,
+)
 IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".webp", ".gif"}
 IMAGE_ATTACHMENT_EXTENSIONS = IMAGE_EXTENSIONS | {".bmp", ".tif", ".tiff"}
 AUDIO_EXTENSIONS = {".ogg", ".oga", ".opus", ".mp3", ".m4a", ".aac", ".wav", ".flac", ".weba"}
@@ -67,9 +103,11 @@ MEDIA_ATTACHMENT_EXTENSIONS = IMAGE_ATTACHMENT_EXTENSIONS | AUDIO_EXTENSIONS | V
 VOICE_ATTACHMENT_EXTENSIONS = {".ogg", ".oga", ".opus"}
 APPROVAL_CALLBACK_PREFIX = "crb_approval"
 CHOICE_CALLBACK_PREFIX = "crb_choice"
+BRIDGE_RESTART_CALLBACK_PREFIX = "crb_restart"
 STATUS_COMMANDS = {"status", "/status"}
 CONTEXT_COMMANDS = {"context", "/context"}
 LONG_RUNNING_SLASH_COMMANDS = {"/goal"}
+STATUS_WIDE_CAPTURE_COLUMNS = 132
 ANSI_RE = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]")
 REPL_BUSY_RE = re.compile(
     r"esc to interrupt|interrupt to stop|\bWorking\b|tokens used",
@@ -81,6 +119,8 @@ FOOTER_WEEKLY_RE = re.compile(
     r"\b(?:weekly|week|w)\w*\s+(?P<left>\d{1,3})%\s+left\b",
     re.IGNORECASE,
 )
+STATUS_BOX_LIMIT_RE = re.compile(r"\blimit\s*:", re.IGNORECASE)
+STATUS_BOX_FRAGMENT_RE = re.compile(r"^(?:\(?r|on|\d{1,2}|[A-Z][a-z]?)$")
 UNRECOGNIZED_COMMAND_RE = re.compile(r"Unrecognized command ['\"](?P<command>/[^'\"]+)['\"]")
 MARKDOWN_LOCAL_PATH_RE = re.compile(r"!?\[[^\]]*]\((?P<path>[^)\n]+)\)")
 MEDIA_ATTACHMENT_SUFFIX_RE = "|".join(
@@ -97,6 +137,28 @@ def env(name: str, default: str | None = None) -> str | None:
     return value if value not in (None, "") else default
 
 
+def release_hold_response(text: str) -> str | None:
+    if not re.match(r"^\s*출시\s*멈춰\s+\S+", text or ""):
+        return None
+    helper = Path(__file__).resolve().parent / "asc-release-hold.sh"
+    try:
+        proc = subprocess.run(
+            [str(helper), text],
+            capture_output=True,
+            text=True,
+            timeout=10,
+            stdin=subprocess.DEVNULL,
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        return f"출시 보류 신호 기록 실패: {exc}"
+    if proc.returncode == 0:
+        return (proc.stdout or "출시 보류 신호 기록됨").strip()
+    if proc.returncode == 2:
+        return None
+    detail = (proc.stderr or proc.stdout or "").strip()
+    return f"출시 보류 신호 기록 실패: {detail[:200]}"
+
+
 def int_env(name: str, default: int, minimum: int = 0) -> int:
     try:
         value = int(env(name, str(default)) or default)
@@ -108,16 +170,6 @@ def int_env(name: str, default: int, minimum: int = 0) -> int:
 def bool_env(name: str, default: bool = False) -> bool:
     fallback = "1" if default else "0"
     return (env(name, fallback) or fallback).lower() in {"1", "true", "yes", "on"}
-
-
-def path_env(name: str, fallback: str | None = None) -> Path | None:
-    raw = env(name, fallback)
-    if raw is None:
-        return None
-    raw = raw.strip()
-    if not raw or raw.lower() in {"0", "off", "false", "no", "none", "disabled"}:
-        return None
-    return Path(raw).expanduser()
 
 
 def clamp(value: int, minimum: int, maximum: int) -> int:
@@ -133,6 +185,35 @@ def path_env_list(raw: str | None, fallback: list[Path]) -> tuple[Path, ...]:
         if item:
             paths.append(Path(item).expanduser().resolve())
     return tuple(paths)
+
+
+def optional_path_env(name: str, default: str | None = None) -> Path | None:
+    raw = env(name, default)
+    if raw is None:
+        return None
+    value = raw.strip()
+    if not value or value.lower() in {"0", "off", "false", "none", "null"}:
+        return None
+    return Path(value).expanduser()
+
+
+def parse_signal_prompt(raw: str) -> str:
+    raw = (raw or "").strip()
+    if not raw:
+        return ""
+    if not raw.startswith("{"):
+        return raw
+    try:
+        payload = json.loads(raw)
+    except json.JSONDecodeError:
+        return raw
+    if not isinstance(payload, dict):
+        return raw
+    for key in ("prompt", "text", "message"):
+        value = payload.get(key)
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    return ""
 
 
 def now_ts() -> str:
@@ -247,9 +328,18 @@ def perform_self_update(latest: str) -> None:
 
 
 def node_defaults() -> tuple[str, str]:
-    hostname = os.uname().nodename
-    cleaned = safe_filename_part(hostname).lower()
-    return cleaned or "codex", env("TAB_PREFIX", "\U0001f916") or "\U0001f916"
+    return "codex", "🤖"
+
+
+# Public sender labels — 받은-지시 신호의 from=<alias> (또는 hostname) 를 (한글 라벨, 이모지) 로
+# 매핑. claude-telegram-bridge.py node_label_emoji 동형. 받은-지시 카드 "발신 → 수신" 줄용.
+_NODE_ALIAS_LABELS: dict[str, tuple[str, str]] = {}
+_NODE_HOST_LABELS: list[tuple[str, tuple[str, str]]] = []
+
+
+def node_label_emoji(token: str) -> tuple[str, str]:
+    raw = (token or "").strip()
+    return (raw, "🤖") if raw else ("", "🤖")
 
 
 def read_text(path: Path) -> str:
@@ -293,25 +383,6 @@ def write_json_atomic(path: Path, payload: dict[str, Any]) -> None:
         os.close(dir_fd)
 
 
-def parse_signal_prompt(raw: str) -> str:
-    raw = (raw or "").strip()
-    if not raw:
-        return ""
-    if not raw.startswith("{"):
-        return raw
-    try:
-        payload = json.loads(raw)
-    except json.JSONDecodeError:
-        return raw
-    if not isinstance(payload, dict):
-        return raw
-    for key in ("prompt", "text", "message"):
-        value = payload.get(key)
-        if isinstance(value, str) and value.strip():
-            return value.strip()
-    return ""
-
-
 def safe_filename_part(value: str) -> str:
     cleaned = "".join(ch if ch.isalnum() or ch in {"-", "_", "."} else "-" for ch in value)
     return cleaned.strip("-")[:80] or "file"
@@ -332,6 +403,11 @@ def slash_command_token(text: str) -> str:
 def slash_command_keeps_typing(text: str) -> bool:
     command = slash_command_token(text)
     return command.split("@", 1)[0] in LONG_RUNNING_SLASH_COMMANDS
+
+
+def is_fast_slash_command(text: str) -> bool:
+    command = slash_command_token(text)
+    return command.split("@", 1)[0] == "/fast"
 
 
 def should_stop_typing_after_slash_command(text: str, had_error: bool) -> bool:
@@ -390,8 +466,31 @@ def extract_codex_status_text(screen: str) -> str:
             continue
         cleaned.append(re.sub(r"\s{2,}", "  ", line).rstrip())
 
-    body = "\n".join(cleaned).strip()
+    body = "\n".join(normalize_codex_status_box_lines(cleaned)).strip()
     return f"Codex status\n{body}" if body else "Codex status not visible yet."
+
+
+def normalize_codex_status_box_lines(lines: list[str]) -> list[str]:
+    if not any(STATUS_BOX_LIMIT_RE.search(line) for line in lines):
+        return lines
+    normalized: list[str] = []
+    for line in lines:
+        stripped = line.strip()
+        if not stripped:
+            continue
+        if stripped.lower() == "limit:" and normalized:
+            normalized[-1] = f"{normalized[-1].rstrip()} limit:"
+            continue
+        if STATUS_BOX_LIMIT_RE.search(stripped):
+            normalized.append(stripped)
+            continue
+        if stripped == "OpenAI Codex" or stripped.startswith(("Model:", "Path:", "Context window:")):
+            normalized.append(stripped)
+            continue
+        if STATUS_BOX_FRAGMENT_RE.fullmatch(stripped):
+            continue
+        normalized.append(stripped)
+    return normalized
 
 
 def extract_codex_context_text(screen: str) -> str:
@@ -403,11 +502,7 @@ def extract_codex_context_text(screen: str) -> str:
 
 
 def composer_lock_path() -> Path:
-    # Single-writer composer lock. Defaults under the same state dir the bridge
-    # already uses (CRB_STATE_DIR / TAB_STATE_DIR), overridable via env.
-    state_dir = env("CRB_STATE_DIR", env("TAB_STATE_DIR", "~/.local/state/telegram-agent-bridge"))
-    default = str(Path(state_dir or "~/.local/state/telegram-agent-bridge") / "composer.lock")
-    return Path(os.environ.get("CODEX_COMPOSER_LOCK", default)).expanduser()
+    return Path(os.environ.get("CODEX_COMPOSER_LOCK", "~/.local/state/codex-telegram-bridge/codex-composer.lock")).expanduser()
 
 
 def extract_codex_footer_status_text(screen: str) -> str:
@@ -434,11 +529,122 @@ def extract_codex_footer_context_text(screen: str) -> str:
     return f"Codex context\nContext: {footer['context_used']}% used"
 
 
+def format_rate_limit_reset(value: Any) -> str:
+    try:
+        timestamp = int(value)
+    except (TypeError, ValueError):
+        return ""
+    if timestamp <= 0:
+        return ""
+    return datetime.fromtimestamp(timestamp, KST).strftime("%Y-%m-%d %H:%M KST")
+
+
+def extract_latest_rate_limit_resets(path: Path, max_bytes: int = 65536) -> dict[str, str]:
+    try:
+        size = path.stat().st_size
+    except OSError:
+        return {}
+    start = max(0, size - max(1, max_bytes))
+    resets: dict[str, str] = {}
+    try:
+        with path.open("r", encoding="utf-8", errors="replace") as handle:
+            handle.seek(start)
+            if start > 0:
+                handle.readline()
+            for line in handle:
+                try:
+                    record = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                payload = record.get("payload")
+                if not isinstance(payload, dict) or payload.get("type") != "token_count":
+                    continue
+                rate_limits = payload.get("rate_limits")
+                if not isinstance(rate_limits, dict):
+                    continue
+                primary = rate_limits.get("primary")
+                if isinstance(primary, dict):
+                    five_hour = format_rate_limit_reset(primary.get("resets_at"))
+                    if five_hour:
+                        resets["five_hour_reset"] = five_hour
+                secondary = rate_limits.get("secondary")
+                if isinstance(secondary, dict):
+                    weekly = format_rate_limit_reset(secondary.get("resets_at"))
+                    if weekly:
+                        resets["weekly_reset"] = weekly
+    except OSError:
+        return {}
+    return resets
+
+
+def append_rate_limit_resets(status_text: str, path: Path | None) -> str:
+    if not status_text or path is None:
+        return status_text
+    resets = extract_latest_rate_limit_resets(path)
+    lines: list[str] = []
+    if resets.get("five_hour_reset") and "5h reset:" not in status_text:
+        lines.append(f"5h reset: {resets['five_hour_reset']}")
+    if resets.get("weekly_reset") and "Weekly reset:" not in status_text:
+        lines.append(f"Weekly reset: {resets['weekly_reset']}")
+    return "\n".join([status_text, *lines]) if lines else status_text
+
+
+def codex_bridge_launchd_label(node: str) -> str:
+    return f"com.codex-telegram-bridge.{node}"
+
+
+def codex_bridge_restart_command(node: str) -> list[str]:
+    """codex 텔레그램 브릿지 재시작 명령(플랫폼 분기).
+
+    macOS 본진/맥미니는 launchd 잡(노드별 라벨)으로, Linux 노드(라이덴/데스크탑/노트북)는
+    systemd user unit(codex-bridge.service)으로 브릿지를 관리한다. 기존엔 launchctl 만 호출해
+    launchctl 부재인 Linux 노드에서 재시작 버튼이 무동작이었다(T-260630-18, PR #246 리뷰노트).
+    """
+    if sys.platform == "darwin":
+        return [
+            "launchctl",
+            "kickstart",
+            "-k",
+            f"gui/{os.getuid()}/{codex_bridge_launchd_label(node)}",
+        ]
+    unit = os.environ.get("CODEX_BRIDGE_SYSTEMD_UNIT", "codex-bridge.service")
+    return ["systemctl", "--user", "restart", unit]
+
+
+def restart_codex_bridge(node: str) -> None:
+    subprocess.Popen(
+        codex_bridge_restart_command(node),
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        start_new_session=True,
+    )
+
+
 def parse_codex_footer_status(screen: str) -> dict[str, str]:
-    for raw_line in reversed(clean_pane_lines(screen)[-20:]):
-        line = " ".join(raw_line.strip().split())
-        if not line or not FOOTER_CONTEXT_RE.search(line):
+    lines = [" ".join(line.strip().split()) for line in clean_pane_lines(screen)[-20:]]
+
+    def footer_continuation(line: str) -> bool:
+        return bool(
+            line
+            and (
+                "·" in line
+                or FOOTER_CONTEXT_RE.search(line)
+                or FOOTER_FIVE_HOUR_RE.search(line)
+                or FOOTER_WEEKLY_RE.search(line)
+            )
+        )
+
+    for index in range(len(lines) - 1, -1, -1):
+        if not FOOTER_CONTEXT_RE.search(lines[index]):
             continue
+        start = index
+        while start > 0 and index - start < 2 and footer_continuation(lines[start - 1]):
+            start -= 1
+        end = index
+        while end < len(lines) - 1 and end - index < 2 and footer_continuation(lines[end + 1]):
+            end += 1
+        line = " ".join(lines[start : end + 1])
         parts = [part.strip() for part in line.split("·") if part.strip()]
         context_index = next(
             (index for index, part in enumerate(parts) if FOOTER_CONTEXT_RE.search(part)),
@@ -483,6 +689,37 @@ def extract_unrecognized_slash_error(screen: str, command: str) -> str:
     return ""
 
 
+def _clean_terminal_line(raw_line: str) -> str:
+    line = ANSI_RE.sub("", raw_line).strip()
+    if "│" in raw_line:
+        parts = raw_line.split("│")
+        line = "│".join(parts[1:-1]).strip() if len(parts) >= 3 else line.strip(" │")
+    return re.sub(r"\s{2,}", " ", line).strip()
+
+
+def extract_fast_mode_notice(screen: str) -> str:
+    lines = [_clean_terminal_line(line) for line in (screen or "").splitlines()]
+    lines = [line for line in lines if line]
+
+    for line in reversed(lines[-40:]):
+        normalized = line.lower()
+        if normalized == "fast":
+            return "패스트모드 켜졌습니다"
+        if re.search(r"\bfast(?:\s+mode)?\s*[:=-]?\s*(?:off|disabled)\b", normalized):
+            return "패스트모드 꺼졌습니다"
+        if re.search(r"\bfast(?:\s+mode)?\s*[:=-]?\s*(?:on|enabled)\b", normalized):
+            return "패스트모드 켜졌습니다"
+
+    for line in reversed(lines[-20:]):
+        normalized = line.lower()
+        if "context" not in normalized or "·" not in normalized:
+            continue
+        model_segment = normalized.split("·", 1)[0]
+        return "패스트모드 켜졌습니다" if re.search(r"\bfast\b", model_segment) else "패스트모드 꺼졌습니다"
+
+    return ""
+
+
 def suffix_from_metadata(file_name: str = "", mime_type: str = "", default: str = ".bin") -> str:
     suffix = Path(file_name or "").suffix.lower()
     if suffix:
@@ -514,9 +751,18 @@ def strip_node_emoji_header(text: str) -> str:
     return "\n".join(lines).strip()
 
 
-def format_flow_mirror(text: str) -> str:
-    body = truncate_text(strip_node_emoji_header(text), FLOW_MIRROR_LIMIT).strip()
-    return f"{FLOW_MIRROR_HEADER}\n{body}" if body else ""
+def strip_inline_node_emoji_header(text: str) -> str:
+    lines = (text or "").splitlines()
+    if not lines:
+        return text
+    first = lines[0].lstrip()
+    for emoji in NODE_EMOJI_LINES:
+        if first.startswith(emoji):
+            rest = first[len(emoji) :]
+            if rest and rest[0].isspace():
+                lines[0] = rest.lstrip()
+                return "\n".join(lines).strip()
+    return text
 
 
 def format_reasoning_mirror(text: str) -> str:
@@ -524,18 +770,201 @@ def format_reasoning_mirror(text: str) -> str:
     return f"{REASONING_HEADER}\n{body}" if body else ""
 
 
+def format_flow_mirror(text: str) -> str:
+    body = flow_mirror_body(text)
+    return f"{FLOW_MIRROR_HEADER}\n{body}" if body else ""
+
+
+def flow_mirror_body(text: str) -> str:
+    return truncate_text(strip_node_emoji_header(text), FLOW_MIRROR_LIMIT).strip()
+
+
+def format_ambient_directive(
+    gist: str,
+    from_node: str | None = None,
+    task: str | None = None,
+    self_emoji: str | None = None,
+) -> str:
+    # ⚙️ A2 받은-지시 카드 본문 — directive-received-ack.sh 가 신호로 남긴 디렉티브 gist
+    # (이미 보일러플레이트 헤더 제거된 1~2줄)에 "발신 → 수신 · task" 라우트 줄을 얹는다.
+    # from/task 는 신호 메타. claude-telegram-bridge.py format_ambient_directive 동형
+    # (claude 는 full text 파싱, codex 는 신호 메타 사용). (T-260630-33)
+    body = (gist or "").strip()
+    route_line = ""
+    if from_node:
+        label, emoji = node_label_emoji(from_node)
+        sender = f"{emoji} {label}".strip()
+        recv = self_emoji if self_emoji is not None else node_defaults()[1]
+        route_line = f"{sender} → {recv}"
+        if task:
+            route_line = f"{route_line} · {task}"
+    parts: list[str] = []
+    if route_line:
+        parts.append(route_line)
+    if body:
+        parts.append(body)
+    elif task and not route_line:
+        parts.append(task)
+    out = "\n".join(parts)[:AMBIENT_DIRECTIVE_LIMIT].strip()
+    return f"{AMBIENT_DIRECTIVE_HEADER}\n{out}" if out else ""
+
+
 def flow_step_summary(text: str, limit: int = FLOW_MIRROR_LINE_LIMIT) -> str:
     """One clean line for a single flow step (claude parity).
 
-    Collapse all whitespace into a single line, drop the node emoji header, and
+    Collapse all whitespace into a single line, drop node/reasoning headers, and
     hard-truncate with an ellipsis — NO multi-line ``[truncated]`` footer. This
     keeps each accumulated step short so many fit inside one edit-in-place card
     instead of overflowing FLOW_MIRROR_LIMIT into multiple long messages.
     """
     body = " ".join(strip_node_emoji_header(text).split())
+    if body.startswith(REASONING_HEADER):
+        body = body[len(REASONING_HEADER) :].strip()
+    # function_call one-liners ("• <label> · <detail>") are already collapsed and
+    # length-capped (no ellipsis) by function_call_flow_summary — keep them whole
+    # so the claude-parity flow card shows the full tool detail. (T-260628-43)
+    if body.startswith("• "):
+        return body.strip()
     if len(body) > limit:
         body = body[:limit].rstrip() + "…"
     return body.strip()
+
+
+# Tool-call → Korean label map for the flow card (claude parity). Each codex
+# function_call becomes ONE short line "• <label> · <detail>" instead of long
+# commentary prose that overflowed and got ellipsis-truncated. (T-260628-43)
+TOOL_LABEL_KO = {
+    "exec_command": "실행",
+    "write_stdin": "입력",
+    "apply_patch": "편집",
+    "view_image": "이미지확인",
+    "imagegen": "이미지생성",
+    "update_plan": "계획",
+    "parallel": "병렬",
+    "web": "웹열기",
+    "web_open": "웹열기",
+    "open_page": "웹열기",
+    "search": "웹검색",
+    "web_search": "웹검색",
+    "finance": "금융조회",
+    "weather": "날씨조회",
+    "sports": "스포츠조회",
+    "time": "시간조회",
+}
+
+# Substring families: when an exact name is not in TOOL_LABEL_KO, match these
+# family keywords so vendor-prefixed tool names (e.g. "browser.web_search")
+# still get the right Korean label.
+TOOL_LABEL_FAMILIES = (
+    ("web_search", "웹검색"),
+    ("search", "웹검색"),
+    ("web", "웹열기"),
+    ("finance", "금융조회"),
+    ("weather", "날씨조회"),
+    ("sports", "스포츠조회"),
+    ("time", "시간조회"),
+)
+
+PATCH_TARGET_RE = re.compile(
+    r"^\*\*\*\s+(?:Update|Add|Delete)\s+File:\s*(?P<target>.+?)\s*$",
+    re.MULTILINE,
+)
+
+FLOW_TOOL_DETAIL_LIMIT = 140
+GENERIC_DETAIL_KEYS = (
+    "path",
+    "file_path",
+    "query",
+    "q",
+    "url",
+    "pattern",
+    "prompt",
+    "skill",
+    "location",
+    "ticker",
+    "ref_id",
+    "uri",
+    "workdir",
+)
+
+
+def tool_label_ko(name: str) -> str:
+    key = (name or "").strip()
+    if not key:
+        return "도구"
+    if key in TOOL_LABEL_KO:
+        return TOOL_LABEL_KO[key]
+    lowered = key.lower()
+    for family, label in TOOL_LABEL_FAMILIES:
+        if family in lowered:
+            return label
+    return key
+
+
+def parse_tool_arguments(payload: dict[str, Any]) -> tuple[dict[str, Any], str]:
+    """Return (parsed_dict, raw_string) for a function_call payload.
+
+    Reads ``arguments`` (or ``input``). A JSON-object string is parsed into a
+    dict; a freeform string is kept as the raw value. (T-260628-43)
+    """
+    raw_value = payload.get("arguments")
+    if raw_value is None:
+        raw_value = payload.get("input")
+    if isinstance(raw_value, dict):
+        return raw_value, ""
+    raw = str(raw_value or "")
+    stripped = raw.strip()
+    if stripped.startswith("{"):
+        try:
+            parsed = json.loads(stripped)
+        except json.JSONDecodeError:
+            parsed = None
+        if isinstance(parsed, dict):
+            return parsed, ""
+    return {}, raw
+
+
+def patch_target_from_text(text: str) -> str:
+    match = PATCH_TARGET_RE.search(text or "")
+    if not match:
+        return ""
+    return match.group("target").strip()
+
+
+def tool_detail(name: str, args: dict[str, Any], raw: str) -> str:
+    key = (name or "").strip()
+    if key == "apply_patch":
+        target = patch_target_from_text(raw) or patch_target_from_text(
+            str(args.get("patch") or args.get("input") or "")
+        )
+        if target:
+            return target
+    if key == "exec_command":
+        cmd = args.get("cmd")
+        if isinstance(cmd, list):
+            cmd = " ".join(str(part) for part in cmd)
+        if cmd:
+            return str(cmd)
+    for detail_key in GENERIC_DETAIL_KEYS:
+        value = args.get(detail_key)
+        if value:
+            if isinstance(value, list):
+                value = " ".join(str(part) for part in value)
+            return str(value)
+    if raw.strip():
+        return raw.strip()
+    return ""
+
+
+def function_call_flow_summary(payload: dict[str, Any]) -> str:
+    name = str(payload.get("name") or "")
+    args, raw = parse_tool_arguments(payload)
+    label = tool_label_ko(name)
+    detail = " ".join(tool_detail(name, args, raw).split())
+    if len(detail) > FLOW_TOOL_DETAIL_LIMIT:
+        # Truncate but add NO ellipsis (claude parity). (T-260628-43)
+        detail = detail[:FLOW_TOOL_DETAIL_LIMIT].rstrip()
+    return f"• {label} · {detail}".rstrip(" ·").rstrip() if not detail else f"• {label} · {detail}"
 
 
 def flow_mirror_dedup_key(text: str, scope: str = "") -> str:
@@ -777,6 +1206,8 @@ def copy_payload_pair_repair_prompt(missing: list[str]) -> str:
 
 def format_progress_summary(text: str, limit: int = 180) -> str:
     body = " ".join(strip_node_emoji_header(text).split())
+    if body.startswith(REASONING_HEADER):
+        body = body[len(REASONING_HEADER) :].strip()
     return truncate_text(body, limit).strip()
 
 
@@ -791,44 +1222,24 @@ def format_long_running_progress_message(
     task_id: str = "",
     recent_progress: str = "",
 ) -> str:
-    # Prose-style progress update — NO fixed field labels
-    # (Task:/Task ID:/Elapsed:/Recent:/Current:/Next:/Blocked:). A "Progress
-    # update" header, a "✓ headline — summary" line, then 1~2 natural sentences
-    # with the task id / elapsed time / recent progress woven into the prose.
     label = " ".join((prompt or "").strip().split())
-    label = truncate_text(label or "(empty request)", 160)
+    label = truncate_text(label or "(empty prompt)", 160)
     elapsed_minutes = max(1, int(elapsed_seconds // 60))
     recent = format_progress_summary(recent_progress, 220) if recent_progress else ""
-    task_clause = f"Working on {task_id}, " if task_id else ""
+    task_clause = f"{task_id} " if task_id else ""
     if recent:
         headline = f"✓ Progress so far — {recent}"
         body = (
-            f"{task_clause}still on '{label}', about {elapsed_minutes} min in. "
-            f'Latest progress reached "{recent}", and I will send the final answer '
-            "as soon as it is ready."
+            f"{task_clause}{label} has been running for about {elapsed_minutes} min. "
+            f"Recent progress: {recent}. I will send the final answer as soon as it is ready."
         )
     else:
-        headline = "✓ Working — no shareable progress note yet"
+        headline = "✓ Still working — no progress note yet"
         body = (
-            f"{task_clause}still on '{label}', about {elapsed_minutes} min in. "
-            "There is no shareable progress note yet, and I am waiting on the "
-            "final answer."
+            f"{task_clause}{label} has been running for about {elapsed_minutes} min. "
+            "I am waiting for the final answer."
         )
     return f"Progress update\n\n{headline}\n\n{body}"
-
-
-def strip_inline_node_emoji_header(text: str) -> str:
-    lines = (text or "").splitlines()
-    if not lines:
-        return text
-    first = lines[0].lstrip()
-    for emoji in NODE_EMOJI_LINES:
-        if first.startswith(emoji):
-            rest = first[len(emoji) :]
-            if rest and rest[0].isspace():
-                lines[0] = rest.lstrip()
-                return "\n".join(lines).strip()
-    return text
 
 
 def process_alive(pid: int) -> bool:
@@ -848,7 +1259,7 @@ def load_token(token_file: Path | None) -> str:
     if token:
         return token
     if token_file is None:
-        raise RuntimeError("TAB_BOT_TOKEN is required")
+        raise RuntimeError("CRB_BOT_TOKEN or TAB_BOT_TOKEN is required")
     try:
         payload = json.loads(token_file.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError) as exc:
@@ -1029,7 +1440,7 @@ def eligible_backfill_events(
     return fresh[-max(1, limit) :]
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, kw_only=True)
 class Config:
     node: str
     emoji: str
@@ -1055,6 +1466,9 @@ class Config:
     approval_ttl_seconds: int
     workdir: Path
     attachment_roots: tuple[Path, ...]
+    generated_image_roots: tuple[Path, ...] = ()
+    generated_image_autosend: bool = True
+    generated_image_window_sec: int = 1800
     max_attachment_bytes: int
     telegram_chunk: int
     poll_timeout: int
@@ -1066,29 +1480,35 @@ class Config:
     tail_scan_bytes: int
     state_ring_cap: int
     bridge_kill: bool
-    flow_mirror: bool
     reasoning_mirror: bool
-    signal_path: Path | None
+    flow_mirror: bool
+    signal_path: Path | None = None
+    directive_signal_path: Path | None = None
 
     @classmethod
     def from_env(cls) -> "Config":
         default_node, default_emoji = node_defaults()
         node = env("CRB_NODE", default_node) or default_node
-        token_file_raw = env("CRB_TOKEN_FILE")
-        chat_id = env("CRB_CHAT_ID") or env("TAB_CHAT_ID")
-        if not chat_id:
-            raise RuntimeError("TAB_CHAT_ID is required")
         state_dir = Path(
-            env("CRB_STATE_DIR", env("TAB_STATE_DIR", "~/.local/state/telegram-agent-bridge") or "")
-            or ""
+            env("CRB_STATE_DIR", env("TAB_STATE_DIR", "~/.local/state/codex-telegram-bridge") or "") or ""
         ).expanduser()
         workdir = Path(env("TAB_WORKDIR", str(HOME)) or str(HOME)).expanduser()
+        token_file_raw = env("CRB_TOKEN_FILE")
+        token_file = (
+            Path(token_file_raw).expanduser()
+            if token_file_raw
+            else None
+            if env("TAB_BOT_TOKEN")
+            else Path("~/.config/codex-telegram-bridge/token.json").expanduser()
+        )
         default_state_path = state_dir / f"codex-repl-bridge-{node}.state.json"
         return cls(
             node=node,
-            emoji=env("CRB_EMOJI", env("TAB_PREFIX", default_emoji) or default_emoji) or "",
-            token_file=Path(token_file_raw).expanduser() if token_file_raw else None,
-            chat_id=chat_id,
+            emoji=env("CRB_EMOJI", env("TAB_PREFIX", default_emoji) or default_emoji)
+            or default_emoji,
+            token_file=token_file,
+            chat_id=env("CRB_CHAT_ID", env("TAB_CHAT_ID", "") or "")
+            or "",
             state_dir=state_dir,
             tmux_bin=env("CRB_TMUX_BIN", "tmux") or "tmux",
             tmux_socket=env("CRB_TMUX_SOCKET", env("TAB_AGENT_TMUX_SOCKET", "codex") or "codex")
@@ -1097,7 +1517,11 @@ class Config:
             or "codex",
             submit_key=env("CRB_TMUX_SUBMIT_KEY", env("TAB_AGENT_TMUX_SUBMIT_KEY", "Tab") or "Tab")
             or "Tab",
-            enter_count=int_env("CRB_TMUX_ENTER_COUNT", int_env("TAB_AGENT_TMUX_ENTER_COUNT", 5), minimum=1),
+            enter_count=int_env(
+                "CRB_TMUX_ENTER_COUNT",
+                int_env("TAB_AGENT_TMUX_ENTER_COUNT", 5),
+                minimum=1,
+            ),
             codex_bin=env("CRB_CODEX_BIN", env("TAB_AGENT_CMD", "codex") or "codex") or "codex",
             codex_timeout=int_env("CRB_CODEX_TIMEOUT", 600, minimum=30),
             image_mode=env("CRB_IMAGE_MODE", "repl") or "repl",
@@ -1121,7 +1545,17 @@ class Config:
             workdir=workdir,
             attachment_roots=path_env_list(
                 env("CRB_ATTACHMENT_ROOTS"),
-                [state_dir, workdir, Path("/tmp")],
+                [state_dir, workdir, HOME / ".codex/generated_images", Path("/tmp")],
+            ),
+            generated_image_roots=path_env_list(
+                env("CRB_GENERATED_IMAGE_ROOTS"),
+                [HOME / ".codex/generated_images"],
+            ),
+            generated_image_autosend=bool_env("CRB_GENERATED_IMAGE_AUTOSEND", True),
+            generated_image_window_sec=int_env(
+                "CRB_GENERATED_IMAGE_WINDOW_SEC",
+                1800,
+                minimum=0,
             ),
             max_attachment_bytes=int_env(
                 "CRB_MAX_ATTACHMENT_BYTES",
@@ -1130,7 +1564,8 @@ class Config:
             ),
             telegram_chunk=int_env("CRB_TG_CHUNK", 4096, minimum=512),
             poll_timeout=int_env("CRB_TG_POLL_TIMEOUT", 2, minimum=1),
-            start_at_end=bool_env("CRB_START_AT_END", True),
+            start_at_end=(env("CRB_START_AT_END", "1") or "1").lower()
+            in {"1", "true", "yes", "on"},
             state_path=Path(env("CRB_STATE_PATH", str(default_state_path)) or "").expanduser(),
             backfill_enabled=bool_env("CRB_BACKFILL", True),
             backfill_max=clamp(int_env("CRB_BACKFILL_MAX", 1, minimum=1), 1, 3),
@@ -1138,9 +1573,10 @@ class Config:
             tail_scan_bytes=int_env("CRB_TAIL_SCAN_BYTES", 65536, minimum=1024),
             state_ring_cap=int_env("CRB_STATE_RING_CAP", 64, minimum=1),
             bridge_kill=bool_env("CRB_KILL", False),
-            flow_mirror=bool_env("CRB_FLOW_MIRROR", True),
             reasoning_mirror=bool_env("CRB_REASONING_MIRROR", True),
-            signal_path=path_env("CRB_SIGNAL_PATH", env("TAB_LOCAL_INPUT")),
+            flow_mirror=bool_env("CRB_FLOW_MIRROR", True),
+            signal_path=optional_path_env("CRB_SIGNAL_PATH", env("TAB_LOCAL_INPUT")),
+            directive_signal_path=optional_path_env(DIRECTIVE_SIGNAL_ENV, str(state_dir / "received-directive.jsonl")),
         )
 
     @property
@@ -1174,20 +1610,30 @@ class TelegramClient:
         self.emoji = emoji
         self.chunk_size = chunk_size
 
-    def call(self, method: str, **params: Any) -> dict[str, Any] | None:
+    def call(
+        self,
+        method: str,
+        *,
+        _request_timeout: float = 60.0,
+        _attempts: int = 3,
+        _retry_delay: float = 2.0,
+        **params: Any,
+    ) -> dict[str, Any] | None:
         data = urllib.parse.urlencode(params).encode()
         url = f"{self.api}/{method}"
-        for attempt in range(3):
+        attempts = max(1, _attempts)
+        for attempt in range(attempts):
             try:
                 request = urllib.request.Request(url, data=data)
-                with urllib.request.urlopen(request, timeout=60) as response:
+                with urllib.request.urlopen(request, timeout=_request_timeout) as response:
                     payload = json.load(response)
                 return payload if isinstance(payload, dict) else None
             except Exception as exc:  # noqa: BLE001
-                if attempt == 2:
+                if attempt == attempts - 1:
                     log("TGERR", f"{method} failed: {exc}")
                     return None
-                time.sleep(2)
+                if _retry_delay > 0:
+                    time.sleep(_retry_delay)
         return None
 
     def call_multipart(
@@ -1236,8 +1682,19 @@ class TelegramClient:
                 time.sleep(2)
         return None
 
-    def send_typing(self) -> None:
-        self.call("sendChatAction", chat_id=self.chat_id, action="typing")
+    def send_typing(self) -> bool:
+        payload = self.call(
+            "sendChatAction",
+            _request_timeout=10,
+            _attempts=1,
+            chat_id=self.chat_id,
+            action="typing",
+        )
+        ok = bool(payload and payload.get("ok") and payload.get("result"))
+        if payload and not ok:
+            detail = payload.get("description") or payload.get("error_code") or payload
+            log("TGERR", f"sendChatAction rejected: {detail}")
+        return ok
 
     def download_file(
         self,
@@ -1271,12 +1728,10 @@ class TelegramClient:
         return output_path
 
     def with_emoji_prefix(self, text: str) -> str:
-        if not self.emoji:
-            return text
         first_line = text.splitlines()[0].strip() if text.splitlines() else ""
-        if first_line in NODE_EMOJI_LINES:
+        if first_line == self.emoji:
             return text
-        text = strip_inline_node_emoji_header(text)
+        text = strip_inline_node_emoji_header(strip_node_emoji_header(text))
         return f"{self.emoji}\n{text}"
 
     def chunks(self, text: str) -> list[str]:
@@ -1302,6 +1757,19 @@ class TelegramClient:
             ensure_ascii=False,
         )
         self.call("sendMessage", chat_id=self.chat_id, text=self.with_emoji_prefix(text), reply_markup=reply_markup)
+
+    def send_restart_button(self, text: str, callback_data: str) -> bool:
+        reply_markup = json.dumps(
+            {"inline_keyboard": [[{"text": "\U0001f504 브릿지 재시작", "callback_data": callback_data}]]},
+            ensure_ascii=False,
+        )
+        payload = self.call(
+            "sendMessage",
+            chat_id=self.chat_id,
+            text=self.with_emoji_prefix(text),
+            reply_markup=reply_markup,
+        )
+        return bool(payload and payload.get("ok"))
 
     def send_message_id(self, text: str) -> int | None:
         payload = self.call(
@@ -1366,7 +1834,7 @@ class TelegramClient:
             payload = self.call_multipart("sendDocument", {"chat_id": self.chat_id}, "document", path)
         return bool(payload and payload.get("ok"))
 
-    def send_approval_prompt(self, prompt: ApprovalRequest) -> int | None:
+    def send_approval_prompt(self, prompt: "ApprovalPrompt") -> int | None:
         buttons = [
             [
                 {
@@ -1393,9 +1861,9 @@ class TelegramClient:
     def update_approval_prompt(
         self,
         message_id: int | None,
-        prompt: ApprovalRequest,
+        prompt: "ApprovalPrompt",
         status_text: str,
-        selected: ApprovalOption | None = None,
+        selected: "ApprovalOption | None" = None,
     ) -> None:
         if message_id is None:
             return
@@ -1418,7 +1886,7 @@ class TelegramClient:
             reply_markup=json.dumps({"inline_keyboard": buttons}, ensure_ascii=False),
         )
 
-    def send_choice_prompt(self, prompt: ChoicePrompt) -> int | None:
+    def send_choice_prompt(self, prompt: "ChoicePrompt") -> int | None:
         buttons = [
             [
                 {
@@ -1445,9 +1913,9 @@ class TelegramClient:
     def update_choice_prompt(
         self,
         message_id: int | None,
-        prompt: ChoicePrompt,
+        prompt: "ChoicePrompt",
         status_text: str,
-        selected: ChoiceOption | None = None,
+        selected: "ChoiceOption | None" = None,
     ) -> None:
         if message_id is None:
             return
@@ -1480,10 +1948,7 @@ class CodexRepl:
         path = composer_lock_path()
         path.parent.mkdir(parents=True, exist_ok=True)
         with path.open("a", encoding="utf-8") as lock_file:
-            # ⚠️ 제거 금지 (DO NOT REMOVE) — codex composer single-writer guard.
-            # Serializes every composer write (paste/clear) so concurrent
-            # Telegram inputs, status probes and recovery cannot interleave
-            # keystrokes into the live Codex TUI composer.
+            # ⚠️ 제거 금지 (DO NOT REMOVE) — codex composer single-writer guard (T-260628-35)
             fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
             try:
                 yield
@@ -1561,6 +2026,62 @@ class CodexRepl:
             self.config.pane_target,
         )
         return out.stdout
+
+    @contextmanager
+    def temporary_window_width(self, columns: int = STATUS_WIDE_CAPTURE_COLUMNS):
+        try:
+            out = self.tmux(
+                "display-message",
+                "-p",
+                "-t",
+                self.config.pane_target,
+                "#{window_id} #{window_width} #{window_height} #{pane_width} #{pane_height}",
+            )
+            window_id, window_width, window_height, pane_width, pane_height = out.stdout.strip().split()
+            original_window_width = int(window_width)
+            original_window_height = int(window_height)
+            original_pane_width = int(pane_width)
+            original_pane_height = int(pane_height)
+        except Exception as exc:  # noqa: BLE001
+            log("REPL", f"wide status capture unavailable: {exc}")
+            yield
+            return
+
+        target_width = max(columns, original_window_width)
+        resized = False
+        if target_width > original_window_width:
+            try:
+                self.tmux("resize-window", "-t", window_id, "-x", str(target_width), "-y", str(original_window_height))
+                self.tmux("resize-pane", "-t", self.config.pane_target, "-x", str(target_width))
+                resized = True
+                time.sleep(0.15)
+            except Exception as exc:  # noqa: BLE001
+                log("REPL", f"wide status capture resize failed: {exc}")
+        try:
+            yield
+        finally:
+            if resized:
+                try:
+                    self.tmux(
+                        "resize-pane",
+                        "-t",
+                        self.config.pane_target,
+                        "-x",
+                        str(original_pane_width),
+                        "-y",
+                        str(original_pane_height),
+                    )
+                    self.tmux(
+                        "resize-window",
+                        "-t",
+                        window_id,
+                        "-x",
+                        str(original_window_width),
+                        "-y",
+                        str(original_window_height),
+                    )
+                except Exception as exc:  # noqa: BLE001
+                    log("REPL", f"wide status capture restore failed: {exc}")
 
     def send_approval_key(self, key: str) -> None:
         normalized = key.strip().lower()
@@ -1746,6 +2267,83 @@ def extract_local_image_paths(
     ]
 
 
+def claims_image_delivery_success(text: str) -> bool:
+    body = normalize_prompt(text)
+    if not body or IMAGE_DELIVERY_CLAIM_NEGATIVE_RE.search(body):
+        return False
+    return bool(
+        IMAGE_DELIVERY_CLAIM_IMAGE_RE.search(body)
+        and IMAGE_DELIVERY_CLAIM_SENT_RE.search(body)
+    )
+
+
+def requests_image_delivery(text: str) -> bool:
+    body = normalize_prompt(text)
+    if not body:
+        return False
+    return bool(
+        IMAGE_DELIVERY_PROMPT_OBJECT_RE.search(body)
+        and IMAGE_DELIVERY_PROMPT_ACTION_RE.search(body)
+    )
+
+
+def image_delivery_unverified_text() -> str:
+    return (
+        "이미지 생성 또는 첨부 요청을 처리했지만, 텔레그램 사진 업로드 성공 증거가 없어 "
+        "전송 완료로 처리하지 않았어요. 생성 파일 경로를 답변에 포함하거나 최근 생성 이미지 "
+        "후보가 감지되도록 다시 전송해야 합니다."
+    )
+
+
+def recent_generated_image_paths(
+    roots: tuple[Path, ...],
+    since_ts: float,
+    window_sec: int,
+    max_bytes: int,
+    exclude: list[Path] | None = None,
+) -> list[Path]:
+    excluded: set[Path] = set()
+    for path in exclude or []:
+        try:
+            excluded.add(path.resolve())
+        except OSError:
+            continue
+
+    now = time.time()
+    cutoff = since_ts if since_ts > 0 else now - max(0, window_sec)
+    if window_sec > 0:
+        cutoff = max(cutoff, now - window_sec)
+    cutoff = max(0.0, cutoff - 2.0)
+
+    candidates: list[tuple[float, Path]] = []
+    for root in roots:
+        try:
+            resolved_root = root.expanduser().resolve()
+        except OSError:
+            continue
+        if not resolved_root.exists():
+            continue
+        paths = [resolved_root] if resolved_root.is_file() else resolved_root.rglob("*")
+        for path in paths:
+            try:
+                resolved = path.resolve()
+                stat = resolved.stat()
+            except OSError:
+                continue
+            if resolved in excluded:
+                continue
+            if not resolved.is_file() or resolved.suffix.lower() not in IMAGE_ATTACHMENT_EXTENSIONS:
+                continue
+            if stat.st_size <= 0 or stat.st_size > max_bytes:
+                continue
+            if stat.st_mtime < cutoff or stat.st_mtime > now + 60:
+                continue
+            candidates.append((stat.st_mtime, resolved))
+
+    candidates.sort(key=lambda item: item[0], reverse=True)
+    return [path for _mtime, path in candidates[:1]]
+
+
 def strip_sent_attachment_references(text: str, attachments: list[Path]) -> str:
     if not attachments:
         return (text or "").strip()
@@ -1774,6 +2372,196 @@ def strip_sent_attachment_references(text: str, attachments: list[Path]) -> str:
         if line:
             lines.append(line)
     return "\n".join(lines).strip() or "파일을 첨부했어요."
+
+
+@dataclass(frozen=True)
+class ApprovalOption:
+    number: str
+    label: str
+    key: str
+
+    @property
+    def short_label(self) -> str:
+        label = self.label.strip()
+        lowered = label.lower()
+        if "don't ask" in lowered or "do not ask" in lowered:
+            return "Yes, don't ask again"
+        if lowered.startswith("no"):
+            return "No"
+        if lowered.startswith("yes"):
+            return "Yes"
+        return label[:40] or self.number
+
+
+@dataclass(frozen=True)
+class ApprovalRequest:
+    approval_id: str
+    source_head: str
+    command: str
+    reason: str
+    options: tuple[ApprovalOption, ...]
+    expires_at: float
+    cancelled: bool = False
+
+    @classmethod
+    def create(
+        cls,
+        approval_id: str,
+        source_head: str,
+        command: str,
+        reason: str,
+        options: tuple[ApprovalOption, ...],
+        ttl_seconds: int,
+        now: float | None = None,
+    ) -> "ApprovalRequest":
+        base = time.time() if now is None else now
+        return cls(
+            approval_id=approval_id,
+            source_head=source_head,
+            command=command,
+            reason=reason,
+            options=options,
+            expires_at=base + max(1, ttl_seconds),
+        )
+
+    @property
+    def signature(self) -> str:
+        return self.approval_id
+
+    @property
+    def short_signature(self) -> str:
+        return self.approval_id[:16]
+
+    def is_expired(self, now: float | None = None) -> bool:
+        current = time.time() if now is None else now
+        return current >= self.expires_at
+
+    def is_active(self, now: float | None = None) -> bool:
+        return not self.cancelled and not self.is_expired(now)
+
+    def cancel(self) -> "ApprovalRequest":
+        return replace(self, cancelled=True)
+
+    def option(self, choice: str) -> ApprovalOption | None:
+        return next((item for item in self.options if item.number == choice), None)
+
+    def telegram_text(self) -> str:
+        lines = [f"{self.source_head} is waiting for command approval.", ""]
+        if self.command:
+            lines.extend(["Command:", truncate_text(self.command, 600), ""])
+        if self.reason:
+            lines.extend(["Reason:", truncate_text(self.reason, 600), ""])
+        lines.append("Choose a button, or reply with the visible number/shortcut.")
+        return "\n".join(lines)
+
+
+@dataclass(frozen=True)
+class ApprovalPrompt:
+    signature: str
+    command: str
+    reason: str
+    options: tuple[ApprovalOption, ...]
+
+    @property
+    def approval_id(self) -> str:
+        return self.signature
+
+    @property
+    def short_signature(self) -> str:
+        return self.signature[:16]
+
+    def telegram_text(self) -> str:
+        lines = ["Codex is waiting for command approval.", ""]
+        if self.command:
+            lines.extend(["Command:", truncate_text(self.command, 600), ""])
+        if self.reason:
+            lines.extend(["Reason:", truncate_text(self.reason, 600), ""])
+        lines.append("Choose a button, or reply with the visible number/shortcut.")
+        return "\n".join(lines)
+
+
+@dataclass(frozen=True)
+class ChoiceOption:
+    value: str
+    label: str
+    key: str = ""
+    index: int = 0
+    selected: bool = False
+
+    @property
+    def short_label(self) -> str:
+        label = self.label.strip()
+        return label[:40] or self.value
+
+
+@dataclass(frozen=True)
+class ChoicePrompt:
+    signature: str
+    title: str
+    options: tuple[ChoiceOption, ...]
+    source_head: str = "codex_repl"
+    expires_at: float = 0.0
+    cancelled: bool = False
+
+    @classmethod
+    def create(
+        cls,
+        choice_id: str,
+        source_head: str,
+        title: str,
+        options: tuple[ChoiceOption, ...],
+        ttl_seconds: int,
+        now: float | None = None,
+    ) -> "ChoicePrompt":
+        base = time.time() if now is None else now
+        return cls(
+            signature=choice_id,
+            title=title,
+            options=options,
+            source_head=source_head,
+            expires_at=base + max(1, ttl_seconds),
+        )
+
+    @property
+    def approval_id(self) -> str:
+        return self.signature
+
+    @property
+    def choice_id(self) -> str:
+        return self.signature
+
+    @property
+    def short_signature(self) -> str:
+        return self.signature[:16]
+
+    def is_expired(self, now: float | None = None) -> bool:
+        if self.expires_at <= 0:
+            return False
+        current = time.time() if now is None else now
+        return current >= self.expires_at
+
+    def is_active(self, now: float | None = None) -> bool:
+        return not self.cancelled and not self.is_expired(now)
+
+    def cancel(self) -> "ChoicePrompt":
+        return replace(self, cancelled=True)
+
+    def option(self, value: str) -> ChoiceOption | None:
+        lowered = value.strip().lower()
+        for item in self.options:
+            if item.value.lower() == lowered or item.key.lower() == lowered:
+                return item
+        return None
+
+    def selected_option(self) -> ChoiceOption | None:
+        return next((item for item in self.options if item.selected), None)
+
+    def telegram_text(self) -> str:
+        lines = ["Codex is waiting for a selection.", ""]
+        if self.title:
+            lines.extend(["Prompt:", truncate_text(self.title, 600), ""])
+        lines.append("Choose a button, or reply with the visible number/letter/shortcut.")
+        return "\n".join(lines)
 
 
 def clean_pane_lines(screen: str) -> list[str]:
@@ -1921,7 +2709,7 @@ def approval_fallback_key(option: ParsedScreenOption) -> str:
     return option.value.lower()
 
 
-def parse_approval_prompt(screen: str, ttl_seconds: int = 300) -> ApprovalRequest | None:
+def parse_approval_prompt(screen: str) -> ApprovalPrompt | None:
     lines = clean_pane_lines(screen)
     trigger_index = -1
     for index, line in enumerate(lines):
@@ -1965,17 +2753,15 @@ def parse_approval_prompt(screen: str, ttl_seconds: int = 300) -> ApprovalReques
         ]
     ).strip()
     signature = hashlib.sha256(signature_source.encode("utf-8", errors="replace")).hexdigest()
-    return ApprovalRequest.create(
-        approval_id=signature,
-        source_head="codex_repl",
+    return ApprovalPrompt(
+        signature=signature,
         command=command,
         reason=reason,
         options=tuple(options),
-        ttl_seconds=ttl_seconds,
     )
 
 
-def parse_yes_no_choice_prompt(lines: list[str], ttl_seconds: int = 300) -> ChoicePrompt | None:
+def parse_yes_no_choice_prompt(lines: list[str]) -> ChoicePrompt | None:
     for line in reversed(lines[-24:]):
         stripped = line.strip()
         if not stripped or not ("?" in stripped or is_choice_hint_line(stripped)):
@@ -2005,24 +2791,17 @@ def parse_yes_no_choice_prompt(lines: list[str], ttl_seconds: int = 300) -> Choi
             ]
         )
         signature = hashlib.sha256(signature_source.encode("utf-8", errors="replace")).hexdigest()
-        return ChoicePrompt.create(
-            choice_id=signature,
-            source_head="codex_repl",
-            title=stripped,
-            options=tuple(options),
-            ttl_seconds=ttl_seconds,
-        )
+        return ChoicePrompt(signature=signature, title=stripped, options=tuple(options))
     return None
 
 
-def parse_choice_prompt(screen: str, ttl_seconds: int = 300) -> ChoicePrompt | None:
-    if parse_approval_prompt(screen, ttl_seconds=ttl_seconds):
+def parse_choice_prompt(screen: str) -> ChoicePrompt | None:
+    if parse_approval_prompt(screen):
         return None
 
     lines = clean_pane_lines(screen)
-    tail_start = max(0, len(lines) - 40)
-    tail = lines[tail_start:]
-    yes_no = parse_yes_no_choice_prompt(tail, ttl_seconds=ttl_seconds)
+    tail = lines[max(0, len(lines) - 40) :]
+    yes_no = parse_yes_no_choice_prompt(tail)
     if yes_no:
         return yes_no
 
@@ -2057,13 +2836,18 @@ def parse_choice_prompt(screen: str, ttl_seconds: int = 300) -> ChoicePrompt | N
         ]
     )
     signature = hashlib.sha256(signature_source.encode("utf-8", errors="replace")).hexdigest()
-    return ChoicePrompt.create(
-        choice_id=signature,
-        source_head="codex_repl",
-        title=title,
-        options=options,
-        ttl_seconds=ttl_seconds,
-    )
+    return ChoicePrompt(signature=signature, title=title, options=options)
+
+
+def extract_message_content(payload: dict[str, Any]) -> str:
+    content = payload.get("content")
+    if not isinstance(content, list):
+        return ""
+    parts = []
+    for item in content:
+        if isinstance(item, dict) and item.get("type") == "output_text":
+            parts.append(str(item.get("text") or ""))
+    return "\n".join(parts)
 
 
 def collect_reasoning_summary(value: Any, parts: list[str]) -> None:
@@ -2084,8 +2868,6 @@ def collect_reasoning_summary(value: Any, parts: list[str]) -> None:
 
 
 def extract_reasoning_summary(payload: dict[str, Any]) -> str:
-    # Only the runtime-PUBLIC reasoning summary is read — never any raw
-    # chain-of-thought field. Codex carries the public summary under "summary".
     parts: list[str] = []
     collect_reasoning_summary(payload.get("summary"), parts)
     return "\n".join(parts).strip()
@@ -2100,37 +2882,45 @@ def extract_event(record: dict[str, Any]) -> tuple[str, str] | None:
         if payload_type == "user_message":
             return "user", str(payload.get("message") or "")
         if payload_type == "agent_message":
+            phase = payload.get("phase")
             message = str(payload.get("message") or "")
-            if payload.get("phase") == "final_answer":
+            if phase == "final_answer":
                 return "assistant", message
-            if is_copy_payload_message(message):
-                return "copy_payload", message
-            return "progress", message
+            if not phase and message:
+                if is_copy_payload_message(message):
+                    return "copy_payload", message
+                return "flow", message
+            if phase == "commentary":
+                # Generic commentary no longer drives the flow card — only
+                # copy-paste payloads (e.g. /goal, 제목/내용) stay routed.
+                # Tool activity is sourced from function_call records below so
+                # the flow card shows ONE LINE PER TOOL CALL. (T-260628-43)
+                if is_copy_payload_message(message):
+                    return "copy_payload", message
+                return None
 
     if kind == "response_item":
-        if payload.get("type") == "reasoning":
+        payload_type = payload.get("type")
+        if payload_type == "function_call":
+            summary = function_call_flow_summary(payload)
+            if summary:
+                return "flow", summary
+            return None
+        if payload_type == "reasoning":
             summary = extract_reasoning_summary(payload)
             if summary:
                 if is_copy_payload_message(summary):
                     return "copy_payload", summary
                 return "reasoning", summary
-            return None
-        if payload.get("type") == "message" and payload.get("role") == "assistant":
+        if payload_type == "message" and payload.get("role") == "assistant":
             phase = payload.get("phase") or payload.get("metadata", {}).get("phase")
-            content = payload.get("content")
-            parts = []
-            if isinstance(content, list):
-                for item in content:
-                    if isinstance(item, dict) and item.get("type") == "output_text":
-                        parts.append(str(item.get("text") or ""))
-            text = "\n".join(parts)
-            if phase != "final_answer":
-                if text:
-                    if is_copy_payload_message(text):
-                        return "copy_payload", text
-                    return "progress", text
+            content = extract_message_content(payload)
+            if phase == "final_answer":
+                return "assistant", content
+            if phase == "commentary":
+                if is_copy_payload_message(content):
+                    return "copy_payload", content
                 return None
-            return "assistant", text
     return None
 
 
@@ -2164,88 +2954,11 @@ class TelegramPrompt:
     kind: str = "text"
 
 
-@dataclass(frozen=True)
-class ChoiceOption:
-    value: str
-    label: str
-    key: str = ""
-    index: int = 0
-    selected: bool = False
-
-    @property
-    def short_label(self) -> str:
-        label = self.label.strip()
-        return label[:40] or self.value
-
-
-@dataclass(frozen=True)
-class ChoicePrompt:
-    choice_id: str
-    source_head: str
-    title: str
-    options: tuple[ChoiceOption, ...]
-    expires_at: float
-    cancelled: bool = False
-
-    @classmethod
-    def create(
-        cls,
-        choice_id: str,
-        source_head: str,
-        title: str,
-        options: tuple[ChoiceOption, ...],
-        ttl_seconds: int,
-        now: float | None = None,
-    ) -> "ChoicePrompt":
-        base = time.time() if now is None else now
-        return cls(
-            choice_id=choice_id,
-            source_head=source_head,
-            title=title,
-            options=options,
-            expires_at=base + max(1, ttl_seconds),
-        )
-
-    @property
-    def short_signature(self) -> str:
-        return self.choice_id[:16]
-
-    def is_expired(self, now: float | None = None) -> bool:
-        current = time.time() if now is None else now
-        return current >= self.expires_at
-
-    def is_active(self, now: float | None = None) -> bool:
-        return not self.cancelled and not self.is_expired(now)
-
-    def cancel(self) -> "ChoicePrompt":
-        return replace(self, cancelled=True)
-
-    def option(self, value: str) -> ChoiceOption | None:
-        lowered = value.strip().lower()
-        for item in self.options:
-            if item.value.lower() == lowered or item.key.lower() == lowered:
-                return item
-        return None
-
-    def selected_option(self) -> ChoiceOption | None:
-        return next((item for item in self.options if item.selected), None)
-
-    def telegram_text(self) -> str:
-        lines = [f"{self.source_head} is waiting for a selection.", ""]
-        if self.title:
-            lines.extend(["Prompt:", self.title[:600], ""])
-        lines.append("Choose a button, or reply with the visible number/letter/shortcut.")
-        return "\n".join(lines)
-
-
 class Bridge:
     def __init__(self, config: Config, telegram: TelegramClient, repl: CodexRepl) -> None:
         self.config = config
         self.telegram = telegram
         self.repl = repl
-        self.head = CodexReplAdapter(repl, workdir=config.workdir)
-        self.capabilities = CapabilityRegistry()
-        self.capabilities.register(self.head.capabilities())
         self.lock = threading.Lock()
         self.exec_lock = threading.Lock()
         self.typing_lock = threading.Lock()
@@ -2257,7 +2970,7 @@ class Bridge:
         self.long_running_progress_stop: threading.Event | None = None
         self.telegram_fallback_stop: threading.Event | None = None
         self.pending_telegram: list[str] = []
-        self.pending_approval: ApprovalRequest | None = None
+        self.pending_approval: ApprovalPrompt | None = None
         self.pending_approval_message_id: int | None = None
         self.resolved_approval_ids: set[str] = set()
         self.pending_choice: ChoicePrompt | None = None
@@ -2266,37 +2979,65 @@ class Bridge:
         self.stop_event = threading.Event()
         self.current_origin: str | None = None
         self.current_flow_scope = ""
+        self.last_repl_activity_at = 0.0
         self.suppress_until_user = False
         self.needs_composer_clear = False
+        self.pending_reasoning_mirror: tuple[str, str] | None = None
         self.active_telegram_prompt = ""
-        self.last_public_progress: str = ""
-        # ⚙️ flow mirror edit-in-place state: accumulate a turn's steps into ONE
-        # growing card (edit the same message) instead of one message per step.
+        self.active_telegram_prompt_started_at = 0.0
         self.flow_message_id = 0
         self.flow_body = ""
         self.flow_scope = ""
+        # ⚙️ 받은지시 카드를 코덱스 답의 앵커로 재사용 (T-260630-48 phase2, claude 브릿지 동형):
+        # 노드-origin 답 도착 시 새 카드 대신 받은지시 카드를 in-place edit 해 받은지시→코덱스답을
+        # 1장으로 통합(받은지시/코덱스답 2장 중복 제거). 0 = 열린 앵커 없음. 휘발성(미persist).
+        self.ambient_directive_message_id = 0
+        self.ambient_directive_body = ""
         self.flow_last_edit_at = 0.0
-        # 🧠 reasoning mirror captured during the turn; sent AFTER the final answer.
-        self.pending_reasoning_mirror: tuple[str, str] | None = None
+        self.last_public_progress: str = ""
         self.telegram_fallback_sent = False
         self.session_path: Path | None = None
         self.session_identity: SessionIdentity | None = None
         self.bridge_state: dict[str, Any] | None = None
         self.session_pos = 0
+        # ⚙️ A2 받은-지시 신호 tail 오프셋 (T-260630-22). None=미초기화 → 첫 poll 에서
+        # 파일 END 로 seek(기존 엔트리 skip, 새 append 만 카드화).
+        self.directive_signal_pos: int | None = None
 
     def acquire_lock(self) -> None:
+        # flock 기반 락 — 프로세스 사망 시 커널이 자동 해제하고 PID 재사용에 면역.
+        # ⚠️ 제거 금지 (DO NOT REMOVE) — 옛 pid-file + process_alive 방식은 tight
+        # restart 루프 중 죽은 pid 가 재사용되면 "already running" 오판으로 자기영속
+        # 크래시 루프(NRestarts 1320회)에 빠졌음. claude-telegram-bridge.py 와 동일한
+        # flock 으로 통일. 근거: issues/2026-06-26-codex-bridge-stale-pid-loop.md
         self.config.state_dir.mkdir(parents=True, exist_ok=True)
-        existing = read_text(self.config.pid_file)
-        if existing.isdigit() and int(existing) != os.getpid() and process_alive(int(existing)):
-            raise RuntimeError(f"bridge already running pid={existing}")
-        write_text_atomic(self.config.pid_file, os.getpid())
+        self.pid_handle = self.config.pid_file.open("a+")
+        try:
+            fcntl.flock(self.pid_handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError as exc:
+            raise RuntimeError(f"bridge already running for pid file {self.config.pid_file}") from exc
+        self.pid_handle.seek(0)
+        self.pid_handle.truncate()
+        self.pid_handle.write(f"{os.getpid()}\n")
+        self.pid_handle.flush()
+        os.fsync(self.pid_handle.fileno())
 
     def release_lock(self) -> None:
-        if read_text(self.config.pid_file) == str(os.getpid()):
+        handle = getattr(self, "pid_handle", None)
+        if handle is not None:
             try:
-                self.config.pid_file.unlink()
+                fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
             except OSError:
                 pass
+            try:
+                handle.close()
+            except OSError:
+                pass
+            self.pid_handle = None
+        try:
+            self.config.pid_file.unlink()
+        except OSError:
+            pass
 
     def add_pending_telegram(self, prompt: str) -> None:
         with self.lock:
@@ -2312,10 +3053,22 @@ class Bridge:
                     return True
         return False
 
+    def mark_repl_activity(self) -> None:
+        with self.lock:
+            self.last_repl_activity_at = time.monotonic()
+
+    def has_recent_repl_activity(self) -> bool:
+        interval = int(getattr(self.config, "typing_liveness_seconds", 0) or 0)
+        grace_seconds = max(60.0, float(interval) * 6.0)
+        with self.lock:
+            last_activity = self.last_repl_activity_at
+        return last_activity > 0 and time.monotonic() - last_activity <= grace_seconds
+
     def handle_user_event(self, text: str) -> None:
+        self.mark_repl_activity()
         self.suppress_until_user = False
-        self.last_public_progress = ""
         self.pending_reasoning_mirror = None
+        self.reset_flow_card()
         self.current_flow_scope = normalize_prompt(text)
         if self.consume_pending_match(text):
             self.current_origin = "telegram"
@@ -2327,79 +3080,11 @@ class Bridge:
             log("JSONL", "terminal-origin prompt")
             self.begin_repl_typing()
 
-    def handle_progress_event(self, text: str, key: str = "") -> bool:
-        summary = format_progress_summary(text, 220)
-        if not summary:
-            return True
-        with self.lock:
-            self.last_public_progress = summary
-        if not self.config.flow_mirror:
-            return True
-        flow_key = flow_mirror_dedup_key(
-            text,
-            self.active_telegram_prompt or self.current_flow_scope,
-        )
-        dedup_key = flow_key or key
-        if self.bridge_state and ring_contains(self.bridge_state, dedup_key):
-            log("SEND", "skip duplicate flow mirror")
-            return True
-        # Collapse each flow event to a single short line (claude parity). Full
-        # narration was overflowing FLOW_MIRROR_LIMIT after 1-2 steps and
-        # spilling into multiple long messages instead of one growing card.
-        summary = flow_step_summary(text)
-        if not summary:
-            return True
-        if self.config.bridge_kill:
-            log("SEND", "flow mirror blocked by CRB_KILL=1")
-            return True
-        # Edit-in-place: accumulate this turn's steps into ONE growing card
-        # (edit the same message) until it overflows FLOW_MIRROR_LIMIT.
-        scope = self.active_telegram_prompt or self.current_flow_scope
-        if self.flow_scope != scope:
-            self.reset_flow_card()
-            self.flow_scope = scope
-        candidate = f"{self.flow_body}\n{summary}".strip() if self.flow_body else summary
-        if not self.flow_message_id or len(candidate) > FLOW_MIRROR_LIMIT:
-            message_id = self.telegram.send_message_id(format_flow_mirror(summary))
-            if not message_id:
-                log("SEND", "flow mirror failed")
-                return False
-            self.flow_body = summary
-            self.flow_message_id = message_id
-            log("SEND", f"sent flow mirror mid={message_id}")
-        else:
-            self.wait_for_flow_edit_budget()
-            if not self.telegram.edit(self.flow_message_id, format_flow_mirror(candidate)):
-                log("SEND", "flow mirror edit failed")
-                return False
-            self.flow_body = candidate
-            self.flow_last_edit_at = time.monotonic()
-            log("SEND", f"edited flow mirror mid={self.flow_message_id}")
-        self.persist_state(event_key=dedup_key)
-        return True
-
-    def reset_flow_card(self) -> None:
-        self.flow_message_id = 0
-        self.flow_body = ""
-        self.flow_scope = ""
-        self.flow_last_edit_at = 0.0
-
-    def wait_for_flow_edit_budget(self) -> None:
-        if self.flow_last_edit_at <= 0:
-            return
-        elapsed = time.monotonic() - self.flow_last_edit_at
-        remaining = FLOW_MIRROR_EDIT_MIN_SECONDS - elapsed
-        if remaining > 0:
-            time.sleep(remaining)
-
     def handle_reasoning_event(self, text: str, key: str) -> None:
-        # Capture this turn's public reasoning summary; it is mirrored AFTER the
-        # final answer is sent (see send_pending_reasoning_mirror). Copy-payload
-        # turns never emit a reasoning mirror. Non-fatal: failures here never
-        # block the answer.
         if is_copy_payload_message(text):
             self.handle_copy_payload_event(text)
             return
+        self.mark_repl_activity()
         if not self.config.reasoning_mirror:
             return
         message = format_reasoning_mirror(text)
@@ -2412,9 +3097,84 @@ class Bridge:
             self.last_public_progress = format_progress_summary(text, 220)
         self.pending_reasoning_mirror = (message, key)
 
+    def handle_flow_event(self, text: str, key: str) -> None:
+        if is_copy_payload_message(text):
+            self.handle_copy_payload_event(text)
+            return
+        self.mark_repl_activity()
+        with self.lock:
+            self.last_public_progress = format_progress_summary(text, 220)
+        if not self.has_repl_typing():
+            log("TYPE", "recover from flow")
+            self.begin_repl_typing()
+        if not self.config.flow_mirror:
+            return
+        scope = self.active_telegram_prompt or self.current_flow_scope
+        flow_key = flow_mirror_dedup_key(text, scope)
+        dedup_key = flow_key or key
+        if self.bridge_state and ring_contains(self.bridge_state, dedup_key):
+            log("SEND", "skip duplicate flow mirror")
+            return
+        # Collapse each flow event to a single short line (claude parity).
+        # Full narration was overflowing FLOW_MIRROR_LIMIT after 1-2 steps and
+        # spilling into multiple long messages instead of one growing card.
+        summary = flow_step_summary(text)
+        if not summary:
+            return
+        if self.config.bridge_kill:
+            log("SEND", "flow mirror blocked by CRB_KILL=1")
+            return
+
+        if self.flow_scope != scope:
+            self.reset_flow_card()
+            self.flow_scope = scope
+
+        # Sliding window: keep only the last FLOW_MIRROR_WINDOW step lines in ONE
+        # edit-in-place card (claude parity). No length-based rollover to a new
+        # message — old steps scroll off instead of spawning multiple long cards.
+        prior_lines = self.flow_body.split("\n") if self.flow_body else []
+        candidate = "\n".join((prior_lines + [summary])[-FLOW_MIRROR_WINDOW:])
+        if not self.flow_message_id:
+            message_id = self.telegram.send_message_id(format_flow_mirror(candidate))
+            if not message_id:
+                log("SEND", "flow mirror failed")
+                return
+            self.flow_body = candidate
+            self.flow_message_id = message_id
+            log("SEND", f"sent flow mirror mid={message_id}")
+        else:
+            self.wait_for_flow_edit_budget()
+            if not self.telegram.edit(self.flow_message_id, format_flow_mirror(candidate)):
+                log("SEND", "flow mirror edit failed")
+                return
+            self.flow_body = candidate
+            self.flow_last_edit_at = time.monotonic()
+            log("SEND", f"edited flow mirror mid={self.flow_message_id}")
+        self.persist_state(event_key=dedup_key)
+
+    def handle_progress_event(self, text: str, key: str = "") -> bool:
+        dedup_key = key or flow_mirror_dedup_key(text, self.active_telegram_prompt)
+        self.handle_flow_event(text, dedup_key)
+        return True
+
+    def reset_flow_card(self) -> None:
+        self.flow_message_id = 0
+        self.flow_body = ""
+        self.flow_scope = ""
+        self.flow_last_edit_at = 0.0
+        # persisted across restart (anti-fragmentation): clear the saved card id too, so a
+        # restart right after reset starts a fresh card instead of resuming a stale one.
+        self.persist_state()
+
+    def wait_for_flow_edit_budget(self) -> None:
+        if self.flow_last_edit_at <= 0:
+            return
+        elapsed = time.monotonic() - self.flow_last_edit_at
+        remaining = FLOW_MIRROR_EDIT_MIN_SECONDS - elapsed
+        if remaining > 0:
+            time.sleep(remaining)
+
     def send_pending_reasoning_mirror(self) -> None:
-        # Sent right after the final answer succeeds, mirroring the assistant's
-        # post-answer thinking. Dedup via the state ring; non-fatal.
         pending = self.pending_reasoning_mirror
         self.pending_reasoning_mirror = None
         if not pending:
@@ -2433,11 +3193,10 @@ class Bridge:
         self.persist_state(event_key=key)
 
     def handle_copy_payload_event(self, text: str) -> bool:
-        # Copy-payload replies never carry a reasoning mirror.
-        self.pending_reasoning_mirror = None
         messages = split_copy_payload_messages(text)
         if not messages:
             return True
+        self.pending_reasoning_mirror = None
         for message in messages:
             key = self.copy_payload_dedup_key_for_turn(message)
             if key and self.bridge_state and ring_contains(self.bridge_state, key):
@@ -2466,20 +3225,25 @@ class Bridge:
         origin = self.current_origin or "terminal"
         log("SEND", f"Telegram mirror from {origin}")
         if is_copy_payload_message(answer):
+            self.pending_reasoning_mirror = None
             if not self.handle_copy_payload_event(answer):
                 return False
         else:
+            # 🧠 코덱스 사고 미러는 최종 답변이 성공적으로 발송된 *뒤*에 보낸다
+            # (Claude 브릿지의 🧠 클로드 사고와 동일 순서). 내부 추론 원문이 아니라
+            # 런타임이 준 공개 reasoning summary 만 전송 — send_pending_reasoning_mirror
+            # 이 reasoning_mirror 토글·dedup·non-fatal 을 그대로 적용. (T-260628-38)
             if not self.send_answer(answer):
                 return False
-            # 🧠 Mirror the public reasoning summary AFTER the final answer is
-            # sent (parity with the assistant's post-answer thinking mirror).
             self.send_pending_reasoning_mirror()
         if self.request_incomplete_copy_payload_pair_repair_if_needed():
             return True
         self.warn_incomplete_copy_payload_pair_if_needed()
         self.clear_active_telegram_prompt()
+        self.reset_flow_card()
         self.current_origin = None
         self.current_flow_scope = ""
+        self.last_repl_activity_at = 0.0
         self.suppress_until_user = True
         return True
 
@@ -2492,9 +3256,50 @@ class Bridge:
             self.config.attachment_roots,
             self.config.max_attachment_bytes,
         )
-        ok = self.telegram.send(strip_sent_attachment_references(answer, attachments))
-        if not ok:
-            return False
+        if (
+            self.current_origin == "telegram"
+            and self.config.generated_image_autosend
+            and requests_image_delivery(self.active_prompt_for_recovery())
+            and claims_image_delivery_success(answer)
+            and not extract_local_image_paths(
+                answer,
+                self.config.attachment_roots,
+                self.config.max_attachment_bytes,
+            )
+        ):
+            started_at = self.active_telegram_prompt_started_at
+            if started_at <= 0 and self.bridge_state is not None:
+                try:
+                    started_at = float(self.bridge_state.get("active_telegram_prompt_started_at") or 0)
+                except (TypeError, ValueError):
+                    started_at = 0.0
+            generated = recent_generated_image_paths(
+                self.config.generated_image_roots,
+                started_at,
+                self.config.generated_image_window_sec,
+                self.config.max_attachment_bytes,
+                exclude=attachments,
+            )
+            if generated:
+                log("ATTACH", f"auto generated image {generated[0]}")
+                attachments.extend(generated)
+            else:
+                log("ATTACH", "blocked unverified image delivery claim")
+                answer = image_delivery_unverified_text()
+        outgoing = strip_sent_attachment_references(answer, attachments)
+        # ⚙️ T-260630-48 phase2 — 노드-origin(받은지시 카드 존재) 코덱스 답은 새 카드 대신 받은지시
+        # 앵커를 edit 해 받은지시→코덱스답을 1장 통합. 첨부 있으면(편집 불가)/길이 4000 초과/edit 실패
+        # 시 폴백 send → 답 1장 보장(0장도 2장폭발도 아님). 텔레그램-origin 답은 영향 없음.
+        anchor = self.ambient_directive_message_id
+        if self.current_origin != "telegram" and anchor and not attachments:
+            unified = f"{self.ambient_directive_body}\n\n{outgoing}"
+            self.ambient_directive_message_id = 0
+            self.ambient_directive_body = ""
+            if len(unified) <= 4000 and self.telegram.edit(anchor, unified):
+                log("SEND", f"edited codex answer into directive anchor mid={anchor}")
+                return True
+            # 폴백: 길이초과/edit실패 → 아래에서 새 카드 send
+        ok = self.telegram.send(outgoing)
         for path in attachments:
             log("ATTACH", f"send {path}")
             if not self.telegram.send_local_attachment(path, self.config.max_attachment_bytes):
@@ -2510,6 +3315,11 @@ class Bridge:
         state["session_path"] = identity.path
         state["dev"] = identity.dev
         state["ino"] = identity.ino
+        # persisted across restart (anti-fragmentation): keep the ⚙️ flow card identity
+        # so a daemon restart resumes edit-in-place instead of spawning a new card per step.
+        state["flow_message_id"] = self.flow_message_id
+        state["flow_body"] = self.flow_body
+        state["flow_scope"] = self.flow_scope
         if offset is not None:
             state["offset"] = offset
         if event_key:
@@ -2656,10 +3466,9 @@ class Bridge:
             if line_end is not None:
                 self.persist_state(line_end)
             return True
-        elif kind == "progress":
+        elif kind == "flow":
             key = event_dedup_key(record, kind, text)
-            if not self.handle_progress_event(text, key):
-                return False
+            self.handle_flow_event(text, key)
             if line_end is not None:
                 self.persist_state(line_end)
             return True
@@ -2700,7 +3509,6 @@ class Bridge:
                 self.stop_repl_typing()
                 self.stop_long_running_progress()
                 self.stop_telegram_fallback()
-                self.pending_reasoning_mirror = None
                 self.clear_active_telegram_prompt()
                 if line_end is not None:
                     self.persist_state(line_end)
@@ -2717,7 +3525,7 @@ class Bridge:
         return True
 
     def ensure_session_file(self) -> Path:
-        path = self.head.session_file()
+        path = self.repl.session_file()
         if self.session_path != path:
             identity = session_identity(path)
             state = read_json(self.config.state_path)
@@ -2731,6 +3539,11 @@ class Bridge:
                 self.active_telegram_prompt = str(
                     self.bridge_state.get("active_telegram_prompt") or ""
                 )
+            # persisted across restart (anti-fragmentation): resume the ⚙️ flow card so the
+            # next tool step edits the existing card instead of sending a fresh one.
+            self.flow_message_id = int(self.bridge_state.get("flow_message_id") or 0)
+            self.flow_body = str(self.bridge_state.get("flow_body") or "")
+            self.flow_scope = str(self.bridge_state.get("flow_scope") or "")
             if cursor is not None:
                 self.session_pos = cursor
                 log("REPL", f"watching {path} from cursor {cursor}")
@@ -2798,18 +3611,137 @@ class Bridge:
                         self.session_pos = line_end
             except Exception as exc:  # noqa: BLE001
                 log("JSONL", f"watch error: {exc}")
+            self.poll_directive_signals()
             time.sleep(0.5)
 
-    def start_typing_loop(self, max_seconds: int | None = None) -> threading.Event:
+    def poll_directive_signals(self) -> None:
+        # ⚙️ A2 (T-260630-22) — 수신노드 신호파일을 tail 해 '📥 받은 지시' 카드 렌더.
+        # directive-received-ack.sh 가 노드주입 디렉티브 1건당 1줄(JSON) append 한다. 브릿지가
+        # JSONL 만으론 노드주입 vs 사람 수동입력을 구분 못 하므로, 신뢰성 있는 ack 스크립트가
+        # 남긴 신호만 카드화(수동입력 오미러 X). flow_mirror ON 한정. 시작 시 기존 엔트리는
+        # 건너뛰고(END seek) 이후 새 append 만 emit. Non-fatal — 메시지 전달엔 영향 X.
+        if not self.config.flow_mirror:
+            return
+        path = self.config.directive_signal_path
+        if path is None:
+            return
+        try:
+            if not path.exists():
+                return
+            size = path.stat().st_size
+            if self.directive_signal_pos is None:
+                self.directive_signal_pos = size  # 시작점 = END (기존 엔트리 skip)
+                return
+            if size < self.directive_signal_pos:
+                self.directive_signal_pos = 0  # truncate/rotate 감지 → 처음부터
+            with path.open("r", encoding="utf-8", errors="replace") as f:
+                f.seek(self.directive_signal_pos)
+                while True:
+                    line = f.readline()
+                    if not line:
+                        break
+                    self.directive_signal_pos = f.tell()
+                    stripped = line.strip()
+                    if stripped:
+                        self.emit_directive_signal_card(stripped)
+        except Exception as exc:  # noqa: BLE001
+            log("JSONL", f"directive signal poll error (non-fatal): {exc}")
+
+    def emit_directive_signal_card(self, line: str) -> None:
+        # ⚙️ A2 받은-지시 카드 1장 emit. 신호 1줄(JSON {ts,from,gist}) → '📥 받은 지시'.
+        # 새 bout 경계 → reset_flow_card() 로 flow 카드 묶음(받은지시→작업흐름→코덱스답) 리셋.
+        if self.config.bridge_kill:
+            return
+        try:
+            data = json.loads(line)
+        except Exception:  # noqa: BLE001
+            return
+        body = format_ambient_directive(
+            str(data.get("gist", "")),
+            from_node=str(data.get("from", "")) or None,
+            task=str(data.get("task", "")) or None,
+        )
+        if not body:
+            return
+        self.reset_flow_card()
+        try:
+            message_id = self.telegram.send_message_id(body)
+            if message_id:
+                # ⚙️ T-260630-48 phase2 — 받은지시 카드를 코덱스 답의 앵커로 보관.
+                self.ambient_directive_message_id = message_id
+                self.ambient_directive_body = body
+                log("SEND", f"sent received-directive card mid={message_id}")
+            else:
+                self.ambient_directive_message_id = 0
+                self.ambient_directive_body = ""
+                log("SEND", "received-directive card failed")
+        except Exception as exc:  # noqa: BLE001
+            log("SEND", f"received-directive card send failed (non-fatal): {exc}")
+
+    def repl_interrupted(self) -> bool:
+        """True if codex aborted the turn (interrupt/error marker at pane bottom).
+
+        Only the last few non-empty lines are inspected so a stale marker still
+        sitting in scrollback from an OLD error does not falsely trip detection.
+        """
+        try:
+            screen = self.repl.capture_pane(15)
+        except Exception:  # noqa: BLE001
+            return False
+        lines = [ln.strip() for ln in (screen or "").splitlines() if ln.strip()]
+        tail = lines[-6:]
+        return any(any(m in ln for m in CODEX_INTERRUPT_MARKERS) for ln in tail)
+
+    def abort_typing_on_interrupt(self, owner: threading.Event) -> None:
+        """Stop the REPL typing loop + clear zombie turn state on codex interrupt.
+
+        Guarded by a turn token (the loop's own stop_event): if a newer turn has
+        already taken over typing, do nothing — never wipe a live turn's state.
+        """
+        with self.typing_lock:
+            if self.repl_typing_stop is not owner:
+                return
+            self.repl_typing_stop = None
+        self.clear_active_telegram_prompt()
+        log("TYPE", "codex interrupted/dead -> typing stopped + turn state cleared")
+
+    def start_typing_loop(
+        self, max_seconds: int | None = None, watch_interrupt: bool = False
+    ) -> threading.Event:
         stop_event = threading.Event()
 
         def loop() -> None:
             deadline = time.monotonic() + max_seconds if max_seconds else None
+            pulse_count = 0
+            last_ok: bool | None = None
+            interrupt_hits = 0
             while not stop_event.is_set():
                 if deadline is not None and time.monotonic() >= deadline:
                     break
-                self.telegram.send_typing()
-                wait_seconds = 4.0
+                # Every other pulse (~8s), check whether codex aborted the turn.
+                # Require 2 consecutive hits before aborting to ignore transients.
+                if watch_interrupt and pulse_count >= 1 and pulse_count % 2 == 0:
+                    if self.repl_interrupted():
+                        interrupt_hits += 1
+                        if interrupt_hits >= 2:
+                            self.abort_typing_on_interrupt(stop_event)
+                            break
+                    else:
+                        interrupt_hits = 0
+                pulse_count += 1
+                try:
+                    ok = self.telegram.send_typing()
+                except Exception as exc:  # noqa: BLE001
+                    ok = False
+                    log("TGERR", f"sendChatAction raised: {exc}")
+                if pulse_count == 1:
+                    log("TYPE", "pulse ok" if ok else "pulse failed")
+                elif not ok and last_ok is not False:
+                    log("TYPE", "pulse failed")
+                elif ok and last_ok is False:
+                    log("TYPE", "pulse recovered")
+                last_ok = ok
+                wait_seconds = 1.0 if pulse_count == 1 else 4.0
                 if deadline is not None:
                     wait_seconds = min(wait_seconds, max(0.0, deadline - time.monotonic()))
                 if wait_seconds <= 0:
@@ -2834,7 +3766,9 @@ class Bridge:
                 log("TYPE", "restart")
             else:
                 log("TYPE", "start")
-            self.repl_typing_stop = self.start_typing_loop(self.config.typing_max_seconds)
+            self.repl_typing_stop = self.start_typing_loop(
+                self.config.typing_max_seconds, watch_interrupt=True
+            )
 
     def stop_repl_typing(self) -> None:
         with self.typing_lock:
@@ -2843,19 +3777,24 @@ class Bridge:
                 self.repl_typing_stop = None
                 log("TYPE", "stop")
 
-    def set_active_telegram_prompt(self, prompt: str) -> None:
+    def set_active_telegram_prompt(self, prompt: str, started_at: float | None = None) -> None:
         prompt = normalize_prompt(prompt)
         with self.lock:
             self.active_telegram_prompt = prompt
+            if started_at is not None:
+                self.active_telegram_prompt_started_at = started_at if prompt else 0.0
             if self.bridge_state is not None:
                 if prompt:
                     self.bridge_state["active_telegram_prompt"] = prompt
+                    if started_at is not None:
+                        self.bridge_state["active_telegram_prompt_started_at"] = started_at
                 else:
                     self.bridge_state.pop("active_telegram_prompt", None)
+                    self.bridge_state.pop("active_telegram_prompt_started_at", None)
         self.persist_state()
 
     def clear_active_telegram_prompt(self) -> None:
-        self.set_active_telegram_prompt("")
+        self.set_active_telegram_prompt("", 0.0)
 
     def active_prompt_for_recovery(self) -> str:
         with self.lock:
@@ -2869,15 +3808,20 @@ class Bridge:
 
     def begin_telegram_prompt_tracking(self, prompt: str) -> None:
         self.add_pending_telegram(prompt)
+        started_at = time.time()
         with self.lock:
             self.current_origin = "telegram"
             self.suppress_until_user = False
             self.last_public_progress = ""
             self.telegram_fallback_sent = False
-        self.set_active_telegram_prompt(prompt)
+            self.reset_flow_card()
+        self.set_active_telegram_prompt(prompt, started_at)
         self.set_copy_payload_pair_contract(prompt)
         self.start_telegram_fallback(prompt)
         self.start_long_running_progress(prompt)
+
+    def begin_long_running_telegram_prompt(self, prompt: str) -> None:
+        self.begin_telegram_prompt_tracking(prompt)
 
     def start_long_running_progress(self, prompt: str) -> None:
         self.stop_long_running_progress()
@@ -2976,7 +3920,7 @@ class Bridge:
 
     def repl_is_working(self) -> bool:
         try:
-            screen = self.head.capture_pane(60)
+            screen = self.repl.capture_pane(60)
         except Exception as exc:  # noqa: BLE001
             log("LIVE", f"pane capture failed: {exc}")
             return False
@@ -2984,10 +3928,11 @@ class Bridge:
 
     def recover_repl_liveness(self, reason: str = "poll") -> bool:
         if not self.repl_is_working():
-            # Codex is idle. If typing was recovered earlier but there is no
-            # active prompt to wait on, stop the dangling typing indicator
-            # instead of leaving it pulsing forever.
-            if self.has_repl_typing() and not self.active_prompt_for_recovery():
+            if (
+                self.has_repl_typing()
+                and not self.active_prompt_for_recovery()
+                and not self.has_recent_repl_activity()
+            ):
                 log("LIVE", f"idle -> stop recovered typing ({reason})")
                 self.stop_repl_typing()
                 return True
@@ -3019,26 +3964,39 @@ class Bridge:
         log("TG", f"{label} -> Codex footer")
         self.begin_repl_typing()
         try:
-            # Prefer the always-visible footer so we do not touch the composer for
-            # a read-only status probe. Fall back to injecting /status only when
-            # the footer is not parseable.
-            screen = self.head.capture_pane(30)
+            screen = self.repl.capture_pane(30)
             answer = (
                 extract_codex_footer_context_text(screen)
                 if context_only
                 else extract_codex_footer_status_text(screen)
             )
+            footer_answer = bool(answer)
             if not answer:
                 log("TG", f"{label} footer unavailable -> Codex REPL fallback")
-                self.clear_and_paste_prompt("/status", label)
-                time.sleep(1.0)
-                screen = self.head.capture_pane(120)
+                wide_context = getattr(self.repl, "temporary_window_width", None)
+                if callable(wide_context):
+                    with wide_context(STATUS_WIDE_CAPTURE_COLUMNS):
+                        self.clear_and_paste_prompt("/status", label)
+                        time.sleep(1.0)
+                        screen = self.repl.capture_pane(120)
+                else:
+                    self.clear_and_paste_prompt("/status", label)
+                    time.sleep(1.0)
+                    screen = self.repl.capture_pane(120)
                 answer = (
                     extract_codex_context_text(screen)
                     if context_only
                     else extract_codex_status_text(screen)
+            )
+            if not context_only and footer_answer:
+                answer = append_rate_limit_resets(answer, self.repl.session_file())
+            if context_only:
+                self.telegram.send(answer)
+            else:
+                self.telegram.send_restart_button(
+                    answer,
+                    f"{BRIDGE_RESTART_CALLBACK_PREFIX}:{self.config.node}",
                 )
-            self.telegram.send(answer)
         except Exception as exc:  # noqa: BLE001
             log("REPL", f"{label} failed: {exc}")
             self.telegram.send(f"codex {label} failed: {exc}")
@@ -3047,9 +4005,6 @@ class Bridge:
         return True
 
     def clear_and_paste_prompt(self, prompt: str, label: str = "telegram input") -> None:
-        # Hold the composer lock across BOTH clear and paste so no other writer
-        # (status probe, recovery, copy-payload repair) can interleave keystrokes
-        # between clearing stale text and pasting the new prompt.
         composer_lock = getattr(self.repl, "composer_lock", None)
         clear_unlocked = getattr(self.repl, "_clear_composer_unlocked", None)
         paste_unlocked = getattr(self.repl, "_paste_prompt_unlocked", None)
@@ -3065,7 +4020,7 @@ class Bridge:
 
     def clear_composer_before_telegram_input(self, label: str = "telegram input") -> None:
         try:
-            self.head.clear_composer()
+            self.repl.clear_composer()
             log("REPL", f"cleared composer before {label}")
         except Exception as exc:  # noqa: BLE001
             log("REPL", f"composer clear failed before {label}: {exc}")
@@ -3081,7 +4036,7 @@ class Bridge:
         command = slash_command_token(text)
         if not command:
             return False
-        screen = self.head.capture_pane(120)
+        screen = self.repl.capture_pane(120)
         error = extract_unrecognized_slash_error(screen, command)
         if error:
             self.needs_composer_clear = True
@@ -3092,20 +4047,18 @@ class Bridge:
             )
             self.clear_composer_before_telegram_input("slash command error")
             return True
+        if is_fast_slash_command(text):
+            notice = extract_fast_mode_notice(screen)
+            if notice:
+                self.telegram.send(notice)
         return False
 
     def approval_loop(self) -> None:
         while not self.stop_event.is_set():
             try:
-                screen = self.head.capture_pane()
-                prompt = parse_approval_prompt(
-                    screen,
-                    ttl_seconds=self.config.approval_ttl_seconds,
-                )
-                choice_prompt = None if prompt else parse_choice_prompt(
-                    screen,
-                    ttl_seconds=self.config.approval_ttl_seconds,
-                )
+                screen = self.repl.capture_pane()
+                prompt = parse_approval_prompt(screen)
+                choice_prompt = None if prompt else parse_choice_prompt(screen)
                 should_send = False
                 if prompt:
                     with self.choice_lock:
@@ -3113,7 +4066,7 @@ class Bridge:
                         choice_message_id = self.pending_choice_message_id
                         if choice_to_clear is not None:
                             log("CHOICE", "choice prompt cleared by approval")
-                            if choice_to_clear.choice_id not in self.resolved_choice_ids:
+                            if choice_to_clear.signature not in self.resolved_choice_ids:
                                 self.telegram.update_choice_prompt(
                                     choice_message_id,
                                     choice_to_clear,
@@ -3123,7 +4076,7 @@ class Bridge:
                         self.pending_choice_message_id = None
                     with self.approval_lock:
                         previous = self.pending_approval
-                        if previous is None or previous.approval_id != prompt.approval_id:
+                        if previous is None or previous.signature != prompt.signature:
                             self.pending_approval = prompt
                             self.pending_approval_message_id = None
                             should_send = True
@@ -3131,10 +4084,7 @@ class Bridge:
                         log("APPROV", f"approval prompt detected {prompt.short_signature}")
                         message_id = self.telegram.send_approval_prompt(prompt)
                         with self.approval_lock:
-                            if (
-                                self.pending_approval
-                                and self.pending_approval.approval_id == prompt.approval_id
-                            ):
+                            if self.pending_approval and self.pending_approval.signature == prompt.signature:
                                 self.pending_approval_message_id = message_id
                 elif choice_prompt:
                     with self.approval_lock:
@@ -3142,7 +4092,7 @@ class Bridge:
                         message_id = self.pending_approval_message_id
                         if prompt_to_clear is not None:
                             log("APPROV", "approval prompt cleared by choice")
-                            if prompt_to_clear.approval_id not in self.resolved_approval_ids:
+                            if prompt_to_clear.signature not in self.resolved_approval_ids:
                                 self.telegram.update_approval_prompt(
                                     message_id,
                                     prompt_to_clear,
@@ -3152,10 +4102,7 @@ class Bridge:
                         self.pending_approval_message_id = None
                     with self.choice_lock:
                         previous_choice = self.pending_choice
-                        if (
-                            previous_choice is None
-                            or previous_choice.choice_id != choice_prompt.choice_id
-                        ):
+                        if previous_choice is None or previous_choice.signature != choice_prompt.signature:
                             self.pending_choice = choice_prompt
                             self.pending_choice_message_id = None
                             should_send = True
@@ -3163,10 +4110,7 @@ class Bridge:
                         log("CHOICE", f"choice prompt detected {choice_prompt.short_signature}")
                         message_id = self.telegram.send_choice_prompt(choice_prompt)
                         with self.choice_lock:
-                            if (
-                                self.pending_choice
-                                and self.pending_choice.choice_id == choice_prompt.choice_id
-                            ):
+                            if self.pending_choice and self.pending_choice.signature == choice_prompt.signature:
                                 self.pending_choice_message_id = message_id
                 else:
                     with self.approval_lock:
@@ -3174,7 +4118,7 @@ class Bridge:
                         message_id = self.pending_approval_message_id
                         if prompt_to_clear is not None:
                             log("APPROV", "approval prompt cleared")
-                            if prompt_to_clear.approval_id not in self.resolved_approval_ids:
+                            if prompt_to_clear.signature not in self.resolved_approval_ids:
                                 self.telegram.update_approval_prompt(
                                     message_id,
                                     prompt_to_clear,
@@ -3187,7 +4131,7 @@ class Bridge:
                         message_id = self.pending_choice_message_id
                         if choice_to_clear is not None:
                             log("CHOICE", "choice prompt cleared")
-                            if choice_to_clear.choice_id not in self.resolved_choice_ids:
+                            if choice_to_clear.signature not in self.resolved_choice_ids:
                                 self.telegram.update_choice_prompt(
                                     message_id,
                                     choice_to_clear,
@@ -3254,8 +4198,6 @@ class Bridge:
     ) -> bool:
         with self.approval_lock:
             prompt = self.pending_approval
-            if prompt and not prompt.is_active():
-                self.pending_approval = prompt.cancel()
             message_id = self.pending_approval_message_id
         if not prompt:
             if callback_query_id:
@@ -3265,19 +4207,6 @@ class Bridge:
                     text="No active Codex approval prompt.",
                 )
             return False
-        if not prompt.is_active():
-            self.telegram.update_approval_prompt(
-                message_id,
-                prompt,
-                "⏳ Approval expired. Please trigger the command again if you still want it.",
-            )
-            if callback_query_id:
-                self.telegram.call(
-                    "answerCallbackQuery",
-                    callback_query_id=callback_query_id,
-                    text="That approval prompt expired.",
-                )
-            return True
         if signature and signature != prompt.short_signature:
             if callback_query_id:
                 self.telegram.call(
@@ -3286,7 +4215,19 @@ class Bridge:
                     text="That approval prompt is no longer active.",
                 )
             return True
-        if prompt.approval_id in self.resolved_approval_ids:
+        if getattr(prompt, "is_expired", lambda: False)():
+            with self.approval_lock:
+                if self.pending_approval and self.pending_approval.signature == prompt.signature:
+                    self.pending_approval = None
+                    self.pending_approval_message_id = None
+            if callback_query_id:
+                self.telegram.call(
+                    "answerCallbackQuery",
+                    callback_query_id=callback_query_id,
+                    text="That approval prompt expired.",
+                )
+            return True
+        if prompt.signature in self.resolved_approval_ids:
             if callback_query_id:
                 self.telegram.call(
                     "answerCallbackQuery",
@@ -3295,11 +4236,11 @@ class Bridge:
                 )
             return True
 
-        option = prompt.option(choice)
+        option = next((item for item in prompt.options if item.number == choice), None)
         if option is None:
             return False
         try:
-            self.head.inject_approval(option)
+            self.repl.send_approval_key(option.key)
         except Exception as exc:  # noqa: BLE001
             log("APPROV", f"choice failed: {exc}")
             self.telegram.send(f"Codex approval choice failed: {exc}")
@@ -3319,9 +4260,9 @@ class Bridge:
             selected=option,
         )
         with self.approval_lock:
-            if self.pending_approval and self.pending_approval.approval_id == prompt.approval_id:
-                self.resolved_approval_ids.add(prompt.approval_id)
-                self.pending_approval = prompt.cancel()
+            if self.pending_approval and self.pending_approval.signature == prompt.signature:
+                self.resolved_approval_ids.add(prompt.signature)
+                self.pending_approval = prompt
                 self.pending_approval_message_id = None
         if callback_query_id:
             self.telegram.call(
@@ -3347,6 +4288,34 @@ class Bridge:
                     text="업데이트를 시작합니다…",
                 )
             perform_self_update(data.split("::", 1)[1])
+            return True
+        if data.startswith(f"{BRIDGE_RESTART_CALLBACK_PREFIX}:"):
+            message = callback.get("message") if isinstance(callback.get("message"), dict) else {}
+            chat = message.get("chat") if isinstance(message.get("chat"), dict) else {}
+            if str(chat.get("id")) != self.config.chat_id:
+                return True
+            _prefix, _, target_node = data.partition(":")
+            callback_query_id = str(callback.get("id") or "")
+            if target_node != self.config.node:
+                if callback_query_id:
+                    self.telegram.call(
+                        "answerCallbackQuery",
+                        callback_query_id=callback_query_id,
+                        text="다른 노드의 재시작 버튼입니다.",
+                    )
+                return True
+            if callback_query_id:
+                self.telegram.call(
+                    "answerCallbackQuery",
+                    callback_query_id=callback_query_id,
+                    text="코덱스 브릿지를 재시작합니다…",
+                )
+            self.telegram.send("코덱스 브릿지 재시작합니다. 잠깐 끊겼다가 다시 붙습니다.")
+            try:
+                restart_codex_bridge(self.config.node)
+            except Exception as exc:  # noqa: BLE001
+                log("TG", f"bridge restart failed: {exc}")
+                self.telegram.send(f"코덱스 브릿지 재시작 실패: {exc}")
             return True
         if data.startswith(f"{CHOICE_CALLBACK_PREFIX}:"):
             return self.handle_choice_callback_query(callback)
@@ -3417,8 +4386,6 @@ class Bridge:
     ) -> bool:
         with self.choice_lock:
             prompt = self.pending_choice
-            if prompt and not prompt.is_active():
-                self.pending_choice = prompt.cancel()
             message_id = self.pending_choice_message_id
         if not prompt:
             if callback_query_id:
@@ -3428,19 +4395,6 @@ class Bridge:
                     text="No active Codex selection prompt.",
                 )
             return False
-        if not prompt.is_active():
-            self.telegram.update_choice_prompt(
-                message_id,
-                prompt,
-                "⏳ Selection expired. Please trigger it again if you still need it.",
-            )
-            if callback_query_id:
-                self.telegram.call(
-                    "answerCallbackQuery",
-                    callback_query_id=callback_query_id,
-                    text="That selection prompt expired.",
-                )
-            return True
         if signature and signature != prompt.short_signature:
             if callback_query_id:
                 self.telegram.call(
@@ -3449,7 +4403,19 @@ class Bridge:
                     text="That selection prompt is no longer active.",
                 )
             return True
-        if prompt.choice_id in self.resolved_choice_ids:
+        if getattr(prompt, "is_expired", lambda: False)():
+            with self.choice_lock:
+                if self.pending_choice and self.pending_choice.signature == prompt.signature:
+                    self.pending_choice = None
+                    self.pending_choice_message_id = None
+            if callback_query_id:
+                self.telegram.call(
+                    "answerCallbackQuery",
+                    callback_query_id=callback_query_id,
+                    text="That selection prompt expired.",
+                )
+            return True
+        if prompt.signature in self.resolved_choice_ids:
             if callback_query_id:
                 self.telegram.call(
                     "answerCallbackQuery",
@@ -3482,9 +4448,9 @@ class Bridge:
             selected=option,
         )
         with self.choice_lock:
-            if self.pending_choice and self.pending_choice.choice_id == prompt.choice_id:
-                self.resolved_choice_ids.add(prompt.choice_id)
-                self.pending_choice = prompt.cancel()
+            if self.pending_choice and self.pending_choice.signature == prompt.signature:
+                self.resolved_choice_ids.add(prompt.signature)
+                self.pending_choice = prompt
                 self.pending_choice_message_id = None
         if callback_query_id:
             self.telegram.call(
@@ -4116,6 +5082,78 @@ class Bridge:
         except Exception as exc:  # noqa: BLE001
             log("UPDATE", f"update offer failed: {exc}")
 
+    def telegram_loop(self) -> None:
+        offset_raw = read_text(self.config.offset_file)
+        offset = int(offset_raw) if offset_raw.isdigit() else 0
+        self.offer_update_if_available()
+        while not self.stop_event.is_set():
+            response = self.telegram.call("getUpdates", offset=offset, timeout=self.config.poll_timeout)
+            if not response or not response.get("ok"):
+                time.sleep(2)
+                continue
+            for update in response.get("result", []):
+                if not isinstance(update, dict) or "update_id" not in update:
+                    continue
+                offset = int(update["update_id"]) + 1
+                write_text_atomic(self.config.offset_file, offset)
+
+                callback = update.get("callback_query")
+                if isinstance(callback, dict):
+                    if self.handle_callback_query(callback):
+                        continue
+
+                message = update.get("message") or update.get("edited_message")
+                if not isinstance(message, dict):
+                    continue
+                chat = message.get("chat") if isinstance(message.get("chat"), dict) else {}
+                if str(chat.get("id")) != self.config.chat_id:
+                    continue
+                raw_text = message.get("text")
+                if isinstance(raw_text, str):
+                    hold_response = release_hold_response(raw_text.strip())
+                    if hold_response:
+                        self.telegram.send(hold_response)
+                        continue
+                try:
+                    prompt = self.prompt_from_telegram_message(message, int(update["update_id"]))
+                except Exception as exc:  # noqa: BLE001
+                    log("TG", f"media download failed: {exc}")
+                    self.telegram.send(f"codex REPL media delivery failed: {exc}")
+                    continue
+                if not prompt.text.strip():
+                    continue
+                if self.handle_approval_text(prompt.text):
+                    continue
+                if self.handle_choice_text(prompt.text):
+                    continue
+                if prompt.image_path and self.config.image_mode == "exec":
+                    self.handle_image_prompt(prompt)
+                    continue
+                if prompt.text.strip().lower() in {"/start", "/ping"}:
+                    self.telegram.send("codex REPL bridge running")
+                    continue
+                if self.handle_status_command(prompt.text):
+                    continue
+                log("TG", "prompt -> Codex REPL")
+                self.begin_repl_typing()
+                slash_command = is_codex_slash_command(prompt.text)
+                self.begin_telegram_prompt_tracking(prompt.text)
+                try:
+                    self.clear_and_paste_prompt(prompt.text, "telegram prompt")
+                    if slash_command:
+                        time.sleep(0.8)
+                        had_slash_error = self.handle_slash_command_result(prompt.text)
+                        if should_stop_typing_after_slash_command(prompt.text, had_slash_error):
+                            self.stop_repl_typing()
+                            self.stop_long_running_progress()
+                            self.clear_active_telegram_prompt()
+                except Exception as exc:  # noqa: BLE001
+                    self.stop_repl_typing()
+                    self.stop_long_running_progress()
+                    self.clear_active_telegram_prompt()
+                    log("REPL", f"paste failed: {exc}")
+                    self.telegram.send(f"codex REPL delivery failed: {exc}")
+
     def ensure_signal_fifo(self) -> None:
         path = self.config.signal_path
         if path is None:
@@ -4179,74 +5217,8 @@ class Bridge:
             return False
         return True
 
-    def telegram_loop(self) -> None:
-        offset_raw = read_text(self.config.offset_file)
-        offset = int(offset_raw) if offset_raw.isdigit() else 0
-        self.offer_update_if_available()
-        while not self.stop_event.is_set():
-            response = self.telegram.call("getUpdates", offset=offset, timeout=self.config.poll_timeout)
-            if not response or not response.get("ok"):
-                time.sleep(2)
-                continue
-            for update in response.get("result", []):
-                if not isinstance(update, dict) or "update_id" not in update:
-                    continue
-                offset = int(update["update_id"]) + 1
-                write_text_atomic(self.config.offset_file, offset)
-
-                callback = update.get("callback_query")
-                if isinstance(callback, dict):
-                    if self.handle_callback_query(callback):
-                        continue
-
-                message = update.get("message") or update.get("edited_message")
-                if not isinstance(message, dict):
-                    continue
-                chat = message.get("chat") if isinstance(message.get("chat"), dict) else {}
-                if str(chat.get("id")) != self.config.chat_id:
-                    continue
-                try:
-                    prompt = self.prompt_from_telegram_message(message, int(update["update_id"]))
-                except Exception as exc:  # noqa: BLE001
-                    log("TG", f"media download failed: {exc}")
-                    self.telegram.send(f"codex REPL media delivery failed: {exc}")
-                    continue
-                if not prompt.text.strip():
-                    continue
-                if self.handle_approval_text(prompt.text):
-                    continue
-                if self.handle_choice_text(prompt.text):
-                    continue
-                if prompt.image_path and self.config.image_mode == "exec":
-                    self.handle_image_prompt(prompt)
-                    continue
-                if prompt.text.strip().lower() in {"/start", "/ping"}:
-                    self.telegram.send("codex REPL bridge running")
-                    continue
-                if self.handle_status_command(prompt.text):
-                    continue
-                log("TG", "prompt -> Codex REPL")
-                self.begin_repl_typing()
-                slash_command = is_codex_slash_command(prompt.text)
-                self.begin_telegram_prompt_tracking(prompt.text)
-                try:
-                    self.clear_and_paste_prompt(prompt.text, "telegram prompt")
-                    if slash_command:
-                        time.sleep(0.8)
-                        had_slash_error = self.handle_slash_command_result(prompt.text)
-                        if should_stop_typing_after_slash_command(prompt.text, had_slash_error):
-                            self.stop_repl_typing()
-                            self.stop_long_running_progress()
-                            self.clear_active_telegram_prompt()
-                except Exception as exc:  # noqa: BLE001
-                    self.stop_repl_typing()
-                    self.stop_long_running_progress()
-                    self.clear_active_telegram_prompt()
-                    log("REPL", f"paste failed: {exc}")
-                    self.telegram.send(f"codex REPL delivery failed: {exc}")
-
     def run(self) -> None:
-        self.head.spawn()
+        self.repl.verify()
         self.ensure_session_file()
         self.acquire_lock()
         jsonl_thread = threading.Thread(target=self.jsonl_loop, daemon=True)
