@@ -12,8 +12,8 @@ locking separated.
 - Keep text-only `codex exec` mode as the lightweight fallback path.
 - Prevent stale approval buttons and overlapping Codex workdir mutations.
 - Keep setup, service files, docs, and diagnostics focused on Codex behavior.
-- Preserve legacy `~/.claude` and `claude-automations` paths as compatibility
-  shims where needed, not as the source of truth.
+- Preserve legacy private-deployment paths as compatibility shims where
+  needed, not as the source of truth.
 
 ## Codex Adapter Contract
 
@@ -87,10 +87,10 @@ separate worktrees rather than bypassing the lock.
 
 ## Legacy Cutoff
 
-New installs should use this repo as the source of truth. Existing `~/.claude`
-and `claude-automations` deployments may forward to the new runtime during
-migration, but new Codex Telegram Bridge features should land here first and be
-copied to live legacy scripts only as temporary shims.
+New installs should use this repo as the source of truth. Existing private
+legacy deployments may forward to the new runtime during migration, but new
+Codex Telegram Bridge features should land here first and be copied to live
+legacy scripts only as temporary shims.
 
 Cutoff rule:
 
