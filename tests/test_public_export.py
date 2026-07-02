@@ -39,6 +39,12 @@ class PublicExportTest(unittest.TestCase):
         self.assertIn("10 min", progress)
         self.assertIn("final answer", progress)
         self.assertIn("checks running", progress)
+        source = path.read_text(encoding="utf-8")
+        self.assertNotIn("asc-release-hold", source)
+        self.assertIsNone(mod.release_hold_response("출시 멈춰 memoyo"))
+        # T-260701-68: stripped mesh layer must leave working no-op stubs
+        self.assertIsNone(mod.mesh_cutover_call("sendMessage", {}))
+        self.assertIsNone(mod.mesh_ledger_record())
 
 
 if __name__ == "__main__":

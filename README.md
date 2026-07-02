@@ -575,6 +575,14 @@ These are product directions, not promises in the current release:
 - Prefer a limited working directory in `TAB_WORKDIR` when possible.
 - This daemon uses Telegram polling, not a public inbound webhook. You do not need to expose a local port.
 
+## Advanced Settings
+
+Beyond the keys documented above, the bridges read further tuning knobs
+(direct `CRB_BOT_TOKEN`/`CRB_CHAT_ID` overrides, `CRB_TOKEN_FILE`, media
+helper binaries, generated-image autosend, watchdog probe tuning, and the
+exec-backend tmux fallbacks). Every key ships with a safe default; the full
+annotated list lives at the bottom of `config.example.env`.
+
 ## Development
 
 The core runtime uses only the Python standard library. The optional `asr`

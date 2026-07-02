@@ -138,25 +138,8 @@ def env(name: str, default: str | None = None) -> str | None:
 
 
 def release_hold_response(text: str) -> str | None:
-    if not re.match(r"^\s*출시\s*멈춰\s+\S+", text or ""):
-        return None
-    helper = Path(__file__).resolve().parent / "asc-release-hold.sh"
-    try:
-        proc = subprocess.run(
-            [str(helper), text],
-            capture_output=True,
-            text=True,
-            timeout=10,
-            stdin=subprocess.DEVNULL,
-        )
-    except (OSError, subprocess.SubprocessError) as exc:
-        return f"출시 보류 신호 기록 실패: {exc}"
-    if proc.returncode == 0:
-        return (proc.stdout or "출시 보류 신호 기록됨").strip()
-    if proc.returncode == 2:
-        return None
-    detail = (proc.stderr or proc.stdout or "").strip()
-    return f"출시 보류 신호 기록 실패: {detail[:200]}"
+    # Personal release-hold automation is stripped from the public export.
+    return None
 
 
 def int_env(name: str, default: int, minimum: int = 0) -> int:
@@ -218,6 +201,32 @@ def parse_signal_prompt(raw: str) -> str:
 
 def now_ts() -> str:
     return time.strftime("%H:%M:%S")
+
+
+def run_midreport_obligation(args: list[str]) -> None:
+    if not bool_env("CRB_PROGRESS_OBLIGATION", True):
+        return
+    raw_cmd = env("CRB_PROGRESS_OBLIGATION_CMD")
+    if raw_cmd:
+        cmd = shlex.split(raw_cmd)
+        if len(cmd) == 1 and cmd[0].endswith(".py"):
+            cmd = [sys.executable, cmd[0]]
+    else:
+        helper = Path(__file__).resolve().parent / "midreport-obligation.py"
+        if not helper.exists():
+            return
+        cmd = [sys.executable, str(helper)]
+    try:
+        subprocess.run(
+            [*cmd, *args],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            timeout=5,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        log("PROG", f"midreport obligation failed: {exc}")
 
 
 def log(label: str, message: str) -> None:
@@ -340,6 +349,17 @@ _NODE_HOST_LABELS: list[tuple[str, tuple[str, str]]] = []
 def node_label_emoji(token: str) -> tuple[str, str]:
     raw = (token or "").strip()
     return (raw, "🤖") if raw else ("", "🤖")
+
+
+# T-260701-68: the internal mesh bus/ledger layer is stripped from the public
+# export, but call sites survive newer internal commits. Documented no-op stubs
+# keep the public bridge on the direct Telegram API path (None => legacy send).
+def mesh_ledger_record(*args, **kwargs):
+    return None
+
+
+def mesh_cutover_call(method, params):
+    return None
 
 
 def read_text(path: Path) -> str:
@@ -1619,6 +1639,9 @@ class TelegramClient:
         _retry_delay: float = 2.0,
         **params: Any,
     ) -> dict[str, Any] | None:
+        cutover_payload = mesh_cutover_call(method, params)
+        if cutover_payload is not None:
+            return cutover_payload
         data = urllib.parse.urlencode(params).encode()
         url = f"{self.api}/{method}"
         attempts = max(1, _attempts)
@@ -1627,10 +1650,12 @@ class TelegramClient:
                 request = urllib.request.Request(url, data=data)
                 with urllib.request.urlopen(request, timeout=_request_timeout) as response:
                     payload = json.load(response)
+                mesh_ledger_record(method, params.get("chat_id"), params.get("text"), payload, message_id=params.get("message_id"))
                 return payload if isinstance(payload, dict) else None
             except Exception as exc:  # noqa: BLE001
                 if attempt == attempts - 1:
                     log("TGERR", f"{method} failed: {exc}")
+                    mesh_ledger_record(method, params.get("chat_id"), params.get("text"), None, message_id=params.get("message_id"))
                     return None
                 if _retry_delay > 0:
                     time.sleep(_retry_delay)
@@ -3092,6 +3117,7 @@ class Bridge:
             return
         if self.bridge_state and ring_contains(self.bridge_state, key):
             log("SEND", "skip duplicate reasoning mirror")
+            mesh_ledger_record("sendMessage", self.config.chat_id, message, result="suppressed")
             return
         with self.lock:
             self.last_public_progress = format_progress_summary(text, 220)
@@ -3114,6 +3140,7 @@ class Bridge:
         dedup_key = flow_key or key
         if self.bridge_state and ring_contains(self.bridge_state, dedup_key):
             log("SEND", "skip duplicate flow mirror")
+            mesh_ledger_record("sendMessage", self.config.chat_id, text, result="suppressed")
             return
         # Collapse each flow event to a single short line (claude parity).
         # Full narration was overflowing FLOW_MIRROR_LIMIT after 1-2 steps and
@@ -3183,6 +3210,7 @@ class Bridge:
             return
         message, key = pending
         if self.bridge_state and ring_contains(self.bridge_state, key):
+            mesh_ledger_record("sendMessage", self.config.chat_id, message, result="suppressed")
             return
         if self.config.bridge_kill:
             log("SEND", "reasoning mirror blocked by CRB_KILL=1")
@@ -3201,6 +3229,7 @@ class Bridge:
             key = self.copy_payload_dedup_key_for_turn(message)
             if key and self.bridge_state and ring_contains(self.bridge_state, key):
                 log("SEND", "skip duplicate copy payload part")
+                mesh_ledger_record("sendMessage", self.config.chat_id, message, result="suppressed")
                 self.record_copy_payload_pair_part(message)
                 continue
             log("SEND", "Telegram copy payload from commentary")
@@ -3218,6 +3247,7 @@ class Bridge:
         self.stop_long_running_progress()
         self.stop_telegram_fallback()
         if self.suppress_until_user:
+            mesh_ledger_record("sendMessage", self.config.chat_id, text, result="suppressed")
             return True
         answer = (text or "").strip()
         if not answer:
@@ -3236,6 +3266,7 @@ class Bridge:
             if not self.send_answer(answer):
                 return False
             self.send_pending_reasoning_mirror()
+        self.resolve_midreport_obligation("complete", "final answer sent")
         if self.request_incomplete_copy_payload_pair_repair_if_needed():
             return True
         self.warn_incomplete_copy_payload_pair_if_needed()
@@ -3250,6 +3281,7 @@ class Bridge:
     def send_answer(self, answer: str) -> bool:
         if self.config.bridge_kill:
             log("SEND", "blocked by CRB_KILL=1")
+            mesh_ledger_record("sendMessage", self.config.chat_id, answer, result="suppressed")
             return False
         attachments = extract_local_attachment_paths(
             answer,
@@ -3500,6 +3532,7 @@ class Bridge:
                         self.persist_state(line_end)
                     return True
                 self.warn_incomplete_copy_payload_pair_if_needed()
+                self.resolve_midreport_obligation("complete", "duplicate final already handled")
                 self.clear_active_telegram_prompt()
                 if line_end is not None:
                     self.persist_state(line_end)
@@ -3509,6 +3542,7 @@ class Bridge:
                 self.stop_repl_typing()
                 self.stop_long_running_progress()
                 self.stop_telegram_fallback()
+                self.resolve_midreport_obligation("complete", "duplicate final already handled")
                 self.clear_active_telegram_prompt()
                 if line_end is not None:
                     self.persist_state(line_end)
@@ -3835,7 +3869,10 @@ class Bridge:
             while not stop_event.wait(interval):
                 elapsed = time.monotonic() - started
                 log("PROG", f"send long-running update after {int(elapsed)}s")
-                if not self.telegram.send(self.long_running_progress_message(prompt, elapsed)):
+                message = self.long_running_progress_message(prompt, elapsed)
+                if self.telegram.send(message):
+                    self.record_midreport_obligation(prompt, elapsed, message)
+                else:
                     log("PROG", "send failed")
 
         with self.long_running_progress_lock:
@@ -3880,7 +3917,10 @@ class Bridge:
             log("PROG", "telegram fallback blocked by CRB_KILL=1")
             return
         log("PROG", f"send telegram fallback after {int(elapsed_seconds)}s")
-        if not self.telegram.send(self.long_running_progress_message(prompt, elapsed_seconds)):
+        message = self.long_running_progress_message(prompt, elapsed_seconds)
+        if self.telegram.send(message):
+            self.record_midreport_obligation(prompt, elapsed_seconds, message)
+        else:
             log("PROG", "telegram fallback send failed")
 
     def current_task_id(self, prompt: str) -> str:
@@ -3892,6 +3932,56 @@ class Bridge:
             return ""
         candidate = state_task[0].strip()
         return candidate if TASK_ID_RE.fullmatch(candidate) else ""
+
+    def record_midreport_obligation(
+        self,
+        prompt: str,
+        elapsed_seconds: float,
+        message: str,
+    ) -> None:
+        prompt = normalize_prompt(prompt)
+        if not prompt:
+            return
+        run_midreport_obligation(
+            [
+                "record",
+                "--source",
+                "codex-progress",
+                "--node",
+                self.config.node,
+                "--task",
+                self.current_task_id(prompt),
+                "--title",
+                "중간보고",
+                "--detail",
+                f"elapsed={int(elapsed_seconds)}s prompt={format_progress_summary(prompt, 120)}\n{message}",
+            ]
+        )
+
+    def resolve_midreport_obligation(self, status: str, title: str) -> None:
+        with self.lock:
+            if self.current_origin == "terminal":
+                return
+        prompt = self.active_prompt_for_recovery()
+        if not prompt:
+            return
+        run_midreport_obligation(
+            [
+                "resolve",
+                "--source",
+                "codex-progress",
+                "--node",
+                self.config.node,
+                "--task",
+                self.current_task_id(prompt),
+                "--status",
+                status,
+                "--title",
+                title,
+                "--detail",
+                f"prompt={format_progress_summary(prompt, 120)}",
+            ]
+        )
 
     def long_running_progress_message(self, prompt: str, elapsed_seconds: float) -> str:
         with self.lock:
@@ -5150,8 +5240,9 @@ class Bridge:
                 except Exception as exc:  # noqa: BLE001
                     self.stop_repl_typing()
                     self.stop_long_running_progress()
-                    self.clear_active_telegram_prompt()
                     log("REPL", f"paste failed: {exc}")
+                    self.resolve_midreport_obligation("blocked", "codex REPL delivery failed")
+                    self.clear_active_telegram_prompt()
                     self.telegram.send(f"codex REPL delivery failed: {exc}")
 
     def ensure_signal_fifo(self) -> None:
@@ -5211,8 +5302,9 @@ class Bridge:
         except Exception as exc:  # noqa: BLE001
             self.stop_repl_typing()
             self.stop_long_running_progress()
-            self.clear_active_telegram_prompt()
             log("SIGNAL", f"paste failed: {exc}")
+            self.resolve_midreport_obligation("blocked", "codex signal delivery failed")
+            self.clear_active_telegram_prompt()
             self.telegram.send(f"codex signal delivery failed: {exc}")
             return False
         return True
