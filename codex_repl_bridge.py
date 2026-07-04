@@ -804,12 +804,31 @@ def format_ambient_directive(
     from_node: str | None = None,
     task: str | None = None,
     self_emoji: str | None = None,
+    self_alias: str | None = None,
 ) -> str:
     # ⚙️ A2 받은-지시 카드 본문 — directive-received-ack.sh 가 신호로 남긴 디렉티브 gist
     # (이미 보일러플레이트 헤더 제거된 1~2줄)에 "발신 → 수신 · task" 라우트 줄을 얹는다.
     # from/task 는 신호 메타. claude-telegram-bridge.py format_ambient_directive 동형
     # (claude 는 full text 파싱, codex 는 신호 메타 사용). (T-260630-33)
     body = (gist or "").strip()
+    # alt3 이야기체 (spec v0.2 매트릭스 directive_sent aniki_dm 동형, claude PR#358 이관 —
+    # T-260703-14): 라우트 줄을 사람 문장으로. 발신·수신 라벨이 둘 다 해석될 때만 —
+    # 못 읽으면 아래 v0.1 카드 그대로 (fallback, 유실 0).
+    if from_node and alt3_narrative_enabled():
+        s_label, s_emoji = node_label_emoji(from_node)
+        recv_token = self_alias or node_defaults()[0]
+        r_label, r_emoji = node_label_emoji(recv_token)
+        if s_label and r_label:
+            sentence = (
+                f"{s_emoji} {s_label}{subject_particle(s_label)} "
+                f"{r_emoji} {r_label}에게 맡겼어요"
+            )
+            if task:
+                sentence = f"{sentence} ({task})"
+            parts = [sentence]
+            if body:
+                parts.append(body)
+            return "\n".join(parts)[:AMBIENT_DIRECTIVE_LIMIT].strip()
     route_line = ""
     if from_node:
         label, emoji = node_label_emoji(from_node)
@@ -1769,10 +1788,16 @@ class TelegramClient:
             rest = rest[self.chunk_size :]
         return out
 
-    def send(self, text: str) -> bool:
+    def send(self, text: str, reply_to_message_id: int | None = None) -> bool:
         ok = True
-        for chunk in self.chunks(text):
-            payload = self.call("sendMessage", chat_id=self.chat_id, text=chunk)
+        for idx, chunk in enumerate(self.chunks(text)):
+            params: dict[str, Any] = {"chat_id": self.chat_id, "text": chunk}
+            if reply_to_message_id and idx == 0:
+                # alt3 타래 (spec v0.2 §5, T-260703-14): 분할 시 첫 chunk 만 루트에 단다.
+                # §5-4 — 루트 삭제 등 거부 케이스 포함 유실 0.
+                params["reply_to_message_id"] = reply_to_message_id
+                params["allow_sending_without_reply"] = "true"
+            payload = self.call("sendMessage", **params)
             ok = ok and bool(payload and payload.get("ok"))
         return ok
 
@@ -3025,6 +3050,8 @@ class Bridge:
         self.session_identity: SessionIdentity | None = None
         self.bridge_state: dict[str, Any] | None = None
         self.session_pos = 0
+        self.pid_handle = None
+        self.pid_lock_acquired = False
         # ⚙️ A2 받은-지시 신호 tail 오프셋 (T-260630-22). None=미초기화 → 첫 poll 에서
         # 파일 END 로 seek(기존 엔트리 skip, 새 append 만 카드화).
         self.directive_signal_pos: int | None = None
@@ -3040,7 +3067,13 @@ class Bridge:
         try:
             fcntl.flock(self.pid_handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
         except BlockingIOError as exc:
+            try:
+                self.pid_handle.close()
+            except OSError:
+                pass
+            self.pid_handle = None
             raise RuntimeError(f"bridge already running for pid file {self.config.pid_file}") from exc
+        self.pid_lock_acquired = True
         self.pid_handle.seek(0)
         self.pid_handle.truncate()
         self.pid_handle.write(f"{os.getpid()}\n")
@@ -3049,20 +3082,19 @@ class Bridge:
 
     def release_lock(self) -> None:
         handle = getattr(self, "pid_handle", None)
+        owns_lock = bool(getattr(self, "pid_lock_acquired", False))
         if handle is not None:
-            try:
-                fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
-            except OSError:
-                pass
+            if owns_lock:
+                try:
+                    fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+                except OSError:
+                    pass
             try:
                 handle.close()
             except OSError:
                 pass
             self.pid_handle = None
-        try:
-            self.config.pid_file.unlink()
-        except OSError:
-            pass
+        self.pid_lock_acquired = False
 
     def add_pending_telegram(self, prompt: str) -> None:
         with self.lock:
@@ -3323,7 +3355,19 @@ class Bridge:
         # 앵커를 edit 해 받은지시→코덱스답을 1장 통합. 첨부 있으면(편집 불가)/길이 4000 초과/edit 실패
         # 시 폴백 send → 답 1장 보장(0장도 2장폭발도 아님). 텔레그램-origin 답은 영향 없음.
         anchor = self.ambient_directive_message_id
-        if self.current_origin != "telegram" and anchor and not attachments:
+        sent_via_reply = False
+        if self.current_origin != "telegram" and anchor and alt3_narrative_enabled():
+            # alt3 (spec v0.2 §6, T-260703-14 — claude PR#358 동형): 받은지시 카드 edit-통합
+            # 폐기 → 코덱스 답은 받은지시 루트에 native reply (같은 chat·같은 봇, §5-3 충족).
+            # reply 실패 시 아래 공통 send 폴백 (답 1장 보장). 첨부는 reply 여부 무관 아래 루프.
+            self.ambient_directive_message_id = 0
+            self.ambient_directive_body = ""
+            sent_via_reply = bool(self.telegram.send(outgoing, reply_to_message_id=anchor))
+            if sent_via_reply:
+                log("SEND", f"sent codex answer as reply to directive root mid={anchor}")
+            else:
+                log("SEND", "codex answer reply to directive root failed → fallback plain send")
+        elif self.current_origin != "telegram" and anchor and not attachments:
             unified = f"{self.ambient_directive_body}\n\n{outgoing}"
             self.ambient_directive_message_id = 0
             self.ambient_directive_body = ""
@@ -3331,7 +3375,7 @@ class Bridge:
                 log("SEND", f"edited codex answer into directive anchor mid={anchor}")
                 return True
             # 폴백: 길이초과/edit실패 → 아래에서 새 카드 send
-        ok = self.telegram.send(outgoing)
+        ok = sent_via_reply or self.telegram.send(outgoing)
         for path in attachments:
             log("ATTACH", f"send {path}")
             if not self.telegram.send_local_attachment(path, self.config.max_attachment_bytes):
