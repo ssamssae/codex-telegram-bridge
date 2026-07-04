@@ -113,6 +113,8 @@ REPL_BUSY_RE = re.compile(
     r"esc to interrupt|interrupt to stop|\bWorking\b|tokens used",
     re.IGNORECASE,
 )
+REPL_IDLE_DONE_RE = re.compile(r"\bGoal achieved\b", re.IGNORECASE)
+REPL_PROMPT_READY_RE = re.compile(r"^[›>]\s*(?:$|.+)")
 FOOTER_CONTEXT_RE = re.compile(r"\bContext\s+(?P<used>\d{1,3})%\s+used\b", re.IGNORECASE)
 FOOTER_FIVE_HOUR_RE = re.compile(r"\b5h\s+(?P<left>\d{1,3})%\s+left\b", re.IGNORECASE)
 FOOTER_WEEKLY_RE = re.compile(
@@ -2619,15 +2621,43 @@ def clean_pane_lines(screen: str) -> list[str]:
 
 
 def screen_has_repl_busy_marker(screen: str) -> bool:
-    for line in clean_pane_lines(screen)[-20:]:
-        cleaned = line.strip()
-        if not cleaned:
-            continue
+    lines = clean_pane_lines(screen)[-20:]
+    tail = [line.strip() for line in lines if line.strip()]
+    for cleaned in tail[-8:]:
+        if REPL_IDLE_DONE_RE.search(cleaned) or REPL_PROMPT_READY_RE.search(cleaned):
+            return False
+    for cleaned in tail:
         if "clear to save" in cleaned.lower():
             continue
         if REPL_BUSY_RE.search(cleaned):
             return True
     return False
+
+
+def repl_typing_stop_signal_from_screen(screen: str) -> str:
+    lines = [ln.strip() for ln in clean_pane_lines(screen or "") if ln.strip()]
+    tail = lines[-6:]
+    if any(REPL_IDLE_DONE_RE.search(ln) or REPL_PROMPT_READY_RE.search(ln) for ln in tail):
+        return "idle"
+    if any(any(marker in ln for marker in CODEX_INTERRUPT_MARKERS) for ln in tail):
+        return "interrupt"
+    return ""
+
+
+def update_typing_watch_hits(
+    signal: str,
+    marker_hits: int,
+    capture_error_hits: int,
+) -> tuple[bool, int, int]:
+    if signal == "idle":
+        return True, 0, 0
+    if signal == "interrupt":
+        marker_hits += 1
+        return marker_hits >= 2, marker_hits, 0
+    if signal == "capture_error":
+        capture_error_hits += 1
+        return capture_error_hits >= 3, 0, capture_error_hits
+    return False, 0, 0
 
 
 @dataclass(frozen=True)
@@ -3304,11 +3334,30 @@ class Bridge:
         self.warn_incomplete_copy_payload_pair_if_needed()
         self.clear_active_telegram_prompt()
         self.reset_flow_card()
-        self.current_origin = None
-        self.current_flow_scope = ""
-        self.last_repl_activity_at = 0.0
-        self.suppress_until_user = True
+        self.mark_repl_turn_finished()
         return True
+
+    def mark_repl_turn_finished(self) -> None:
+        with self.lock:
+            self.current_origin = None
+            self.current_flow_scope = ""
+            self.last_repl_activity_at = 0.0
+            self.suppress_until_user = True
+
+    def completed_turn_blocks_liveness_recovery(self, prompt: str) -> bool:
+        with self.lock:
+            return (
+                self.suppress_until_user
+                and not prompt
+                and not self.current_origin
+                and not self.current_flow_scope
+                and self.last_repl_activity_at <= 0
+            )
+
+    def finish_duplicate_final_turn(self) -> None:
+        self.clear_active_telegram_prompt()
+        self.reset_flow_card()
+        self.mark_repl_turn_finished()
 
     def send_answer(self, answer: str) -> bool:
         if self.config.bridge_kill:
@@ -3577,7 +3626,7 @@ class Bridge:
                     return True
                 self.warn_incomplete_copy_payload_pair_if_needed()
                 self.resolve_midreport_obligation("complete", "duplicate final already handled")
-                self.clear_active_telegram_prompt()
+                self.finish_duplicate_final_turn()
                 if line_end is not None:
                     self.persist_state(line_end)
                 return True
@@ -3587,7 +3636,7 @@ class Bridge:
                 self.stop_long_running_progress()
                 self.stop_telegram_fallback()
                 self.resolve_midreport_obligation("complete", "duplicate final already handled")
-                self.clear_active_telegram_prompt()
+                self.finish_duplicate_final_turn()
                 if line_end is not None:
                     self.persist_state(line_end)
                 return True
@@ -3766,9 +3815,14 @@ class Bridge:
             screen = self.repl.capture_pane(15)
         except Exception:  # noqa: BLE001
             return False
-        lines = [ln.strip() for ln in (screen or "").splitlines() if ln.strip()]
-        tail = lines[-6:]
-        return any(any(m in ln for m in CODEX_INTERRUPT_MARKERS) for ln in tail)
+        return repl_typing_stop_signal_from_screen(screen) == "interrupt"
+
+    def repl_typing_stop_signal(self) -> str:
+        try:
+            screen = self.repl.capture_pane(15)
+        except Exception:  # noqa: BLE001
+            return "capture_error"
+        return repl_typing_stop_signal_from_screen(screen)
 
     def abort_typing_on_interrupt(self, owner: threading.Event) -> None:
         """Stop the REPL typing loop + clear zombie turn state on codex interrupt.
@@ -3793,19 +3847,21 @@ class Bridge:
             pulse_count = 0
             last_ok: bool | None = None
             interrupt_hits = 0
+            capture_error_hits = 0
             while not stop_event.is_set():
                 if deadline is not None and time.monotonic() >= deadline:
                     break
                 # Every other pulse (~8s), check whether codex aborted the turn.
-                # Require 2 consecutive hits before aborting to ignore transients.
+                # Require consecutive hits for interrupt/capture failures to ignore transients.
                 if watch_interrupt and pulse_count >= 1 and pulse_count % 2 == 0:
-                    if self.repl_interrupted():
-                        interrupt_hits += 1
-                        if interrupt_hits >= 2:
-                            self.abort_typing_on_interrupt(stop_event)
-                            break
-                    else:
-                        interrupt_hits = 0
+                    abort, interrupt_hits, capture_error_hits = update_typing_watch_hits(
+                        self.repl_typing_stop_signal(),
+                        interrupt_hits,
+                        capture_error_hits,
+                    )
+                    if abort:
+                        self.abort_typing_on_interrupt(stop_event)
+                        break
                 pulse_count += 1
                 try:
                     ok = self.telegram.send_typing()
@@ -3880,6 +3936,25 @@ class Bridge:
             if not prompt and self.bridge_state is not None:
                 prompt = str(self.bridge_state.get("active_telegram_prompt") or "")
         return normalize_prompt(prompt)
+
+    def active_prompt_started_at_for_recovery(self) -> float:
+        with self.lock:
+            started_at = self.active_telegram_prompt_started_at
+            if started_at <= 0 and self.bridge_state is not None:
+                try:
+                    started_at = float(self.bridge_state.get("active_telegram_prompt_started_at") or 0)
+                except (TypeError, ValueError):
+                    started_at = 0.0
+        return started_at
+
+    def startup_recovery_has_recent_active_prompt(self, prompt: str) -> bool:
+        if not prompt:
+            return False
+        started_at = self.active_prompt_started_at_for_recovery()
+        if started_at <= 0:
+            return False
+        max_age = max(30.0, float(getattr(self.config, "typing_max_seconds", 0) or 0))
+        return time.time() - started_at <= max_age
 
     def copy_payload_dedup_key_for_turn(self, text: str) -> str:
         return copy_payload_dedup_key(text, self.active_prompt_for_recovery())
@@ -4061,22 +4136,32 @@ class Bridge:
         return screen_has_repl_busy_marker(screen)
 
     def recover_repl_liveness(self, reason: str = "poll") -> bool:
-        if not self.repl_is_working():
+        repl_working = self.repl_is_working()
+        prompt = self.active_prompt_for_recovery()
+        if reason == "startup" and (
+            not repl_working or not self.startup_recovery_has_recent_active_prompt(prompt)
+        ):
+            log("LIVE", "skip startup stale typing recovery")
+            self.clear_active_telegram_prompt()
+            return False
+        if not repl_working:
             if (
                 self.has_repl_typing()
-                and not self.active_prompt_for_recovery()
+                and not prompt
                 and not self.has_recent_repl_activity()
             ):
                 log("LIVE", f"idle -> stop recovered typing ({reason})")
                 self.stop_repl_typing()
                 return True
             return False
+        if self.completed_turn_blocks_liveness_recovery(prompt):
+            log("LIVE", f"skip stale typing recovery ({reason})")
+            return False
         recovered = False
         if not self.has_repl_typing():
             log("LIVE", f"recover typing ({reason})")
             self.begin_repl_typing()
             recovered = True
-        prompt = self.active_prompt_for_recovery()
         if prompt and not self.has_long_running_progress():
             log("LIVE", f"recover progress ({reason})")
             self.start_long_running_progress(prompt)
