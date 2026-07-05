@@ -69,6 +69,7 @@ DIRECTIVE_SIGNAL_ENV = "CRB_DIRECTIVE_SIGNAL_PATH"
 # watches for these and self-terminates. (T-260628-15)
 CODEX_INTERRUPT_MARKERS = ("Conversation interrupted", "Something went wrong")
 TASK_ID_RE = re.compile(r"\bT-\d{6}-\d+\b")
+CODE_FENCE_RE = re.compile(r"```([^\n`]*)\n(.*?)```", re.DOTALL)
 IMAGE_DELIVERY_CLAIM_IMAGE_RE = re.compile(
     r"(이미지|사진|그림|첨부|파일|image|photo|picture|attachment|png|jpe?g|webp)",
     re.IGNORECASE,
@@ -83,6 +84,46 @@ IMAGE_DELIVERY_CLAIM_NEGATIVE_RE = re.compile(
     r"failed\s+to\s+(?:send|upload|attach))",
     re.IGNORECASE,
 )
+
+
+def utf16_code_units(text: str) -> int:
+    return len(text.encode("utf-16-le")) // 2
+
+
+def split_answer_for_code_blocks(text: str) -> list[dict[str, Any]]:
+    segments: list[dict[str, Any]] = []
+    cursor = 0
+    for match in CODE_FENCE_RE.finditer(text):
+        before = text[cursor : match.start()].strip()
+        if before:
+            segments.append({"body": before, "code": False})
+        language = match.group(1).strip()
+        code = match.group(2)
+        if code.endswith("\n"):
+            code = code[:-1]
+        if code:
+            segment: dict[str, Any] = {"body": code, "code": True}
+            if language:
+                segment["language"] = language
+            segments.append(segment)
+        cursor = match.end()
+    tail = text[cursor:].strip()
+    if tail:
+        segments.append({"body": tail, "code": False})
+    return segments or [{"body": text, "code": False}]
+
+
+def pre_entities_json(text: str, language: str = "") -> str:
+    entity: dict[str, Any] = {
+        "type": "pre",
+        "offset": 0,
+        "length": utf16_code_units(text),
+    }
+    if language:
+        entity["language"] = language
+    return json.dumps([entity], ensure_ascii=False)
+
+
 IMAGE_DELIVERY_PROMPT_OBJECT_RE = re.compile(
     r"(이미지|사진|그림|표지|로고|배너|썸네일|포스터|카드뉴스|짤|"
     r"image|photo|picture|cover|logo|banner|thumbnail|poster|png|jpe?g|webp)",
@@ -1790,17 +1831,38 @@ class TelegramClient:
             rest = rest[self.chunk_size :]
         return out
 
+    def raw_chunks(self, text: str) -> list[str]:
+        text = text or "(empty response)"
+        out = [text[: self.chunk_size]]
+        rest = text[self.chunk_size :]
+        while rest:
+            out.append(rest[: self.chunk_size])
+            rest = rest[self.chunk_size :]
+        return out
+
     def send(self, text: str, reply_to_message_id: int | None = None) -> bool:
         ok = True
-        for idx, chunk in enumerate(self.chunks(text)):
-            params: dict[str, Any] = {"chat_id": self.chat_id, "text": chunk}
-            if reply_to_message_id and idx == 0:
-                # alt3 타래 (spec v0.2 §5, T-260703-14): 분할 시 첫 chunk 만 루트에 단다.
-                # §5-4 — 루트 삭제 등 거부 케이스 포함 유실 0.
-                params["reply_to_message_id"] = reply_to_message_id
-                params["allow_sending_without_reply"] = "true"
-            payload = self.call("sendMessage", **params)
-            ok = ok and bool(payload and payload.get("ok"))
+        sent_count = 0
+        for segment in split_answer_for_code_blocks(text or "(empty response)"):
+            body = str(segment.get("body") or "")
+            if segment.get("code"):
+                language = str(segment.get("language") or "")
+                chunks = self.raw_chunks(body)
+            else:
+                language = ""
+                chunks = self.chunks(body)
+            for chunk in chunks:
+                params: dict[str, Any] = {"chat_id": self.chat_id, "text": chunk}
+                if segment.get("code"):
+                    params["entities"] = pre_entities_json(chunk, language)
+                if reply_to_message_id and sent_count == 0:
+                    # alt3 타래 (spec v0.2 §5, T-260703-14): 분할 시 첫 chunk 만 루트에 단다.
+                    # §5-4 — 루트 삭제 등 거부 케이스 포함 유실 0.
+                    params["reply_to_message_id"] = reply_to_message_id
+                    params["allow_sending_without_reply"] = "true"
+                payload = self.call("sendMessage", **params)
+                ok = ok and bool(payload and payload.get("ok"))
+                sent_count += 1
         return ok
 
     def send_update_button(self, text: str, callback_data: str) -> None:

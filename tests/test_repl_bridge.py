@@ -89,6 +89,30 @@ class ConfigDefaultsTest(unittest.TestCase):
             "🏭\nㅎㅇ 잘 지내, 대기 중입니다.",
         )
 
+    def test_code_fence_sends_native_pre_entity(self):
+        telegram = repl.TelegramClient("token", "1234", "BOT", 4096)
+        calls = []
+        telegram.call = lambda method, **params: calls.append((method, params)) or {"ok": True}
+
+        self.assertTrue(telegram.send("before\n```text\na😀b\n```\nafter"))
+
+        messages = [
+            params
+            for method, params in calls
+            if method == "sendMessage"
+        ]
+        self.assertEqual(
+            [params["text"] for params in messages],
+            ["BOT\nbefore", "a😀b", "BOT\nafter"],
+        )
+        self.assertNotIn("entities", messages[0])
+        self.assertEqual(
+            json.loads(messages[1]["entities"]),
+            [{"type": "pre", "offset": 0, "length": 4, "language": "text"}],
+        )
+        self.assertNotIn("parse_mode", messages[1])
+        self.assertNotIn("entities", messages[2])
+
     def test_long_running_progress_message_is_prose_card(self):
         message = repl.format_long_running_progress_message(
             "T-260624-11 deploy bridge",
