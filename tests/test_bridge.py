@@ -113,6 +113,31 @@ class BridgeTests(unittest.TestCase):
 
             self.assertEqual(bridge.telegram_chunks("answer"), ["BOT\nanswer"])
 
+    def test_code_fence_sends_native_pre_entity(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            cfg = config(tmpdir, telegram_chunk=4096)
+            telegram = FakeTelegram()
+            bridge = tab.Bridge(cfg, tab.CodexBackend(cfg), telegram)
+
+            bridge.send("before\n```text\na😀b\n```\nafter")
+
+            messages = [
+                params
+                for method, params in telegram.calls
+                if method == "sendMessage"
+            ]
+            self.assertEqual(
+                [params["text"] for params in messages],
+                ["BOT before", "a😀b", "BOT after"],
+            )
+            self.assertNotIn("entities", messages[0])
+            self.assertEqual(
+                json.loads(messages[1]["entities"]),
+                [{"type": "pre", "offset": 0, "length": 4, "language": "text"}],
+            )
+            self.assertNotIn("parse_mode", messages[1])
+            self.assertNotIn("entities", messages[2])
+
     def test_telegram_message_enqueues_without_running_agent(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             cfg = config(tmpdir)

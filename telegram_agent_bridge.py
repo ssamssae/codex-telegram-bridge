@@ -10,6 +10,7 @@ from __future__ import annotations
 import json
 import os
 import queue
+import re
 import shlex
 import stat
 import subprocess
@@ -83,6 +84,47 @@ def write_text_atomic(path: Path, value: str | int) -> None:
     tmp = path.with_name(path.name + ".tmp")
     tmp.write_text(str(value), encoding="utf-8")
     tmp.replace(path)
+
+
+CODE_FENCE_RE = re.compile(r"```([^\n`]*)\n(.*?)```", re.DOTALL)
+
+
+def utf16_code_units(text: str) -> int:
+    return len(text.encode("utf-16-le")) // 2
+
+
+def split_answer_for_code_blocks(text: str) -> list[dict[str, Any]]:
+    segments: list[dict[str, Any]] = []
+    cursor = 0
+    for match in CODE_FENCE_RE.finditer(text):
+        before = text[cursor : match.start()].strip()
+        if before:
+            segments.append({"body": before, "code": False})
+        language = match.group(1).strip()
+        code = match.group(2)
+        if code.endswith("\n"):
+            code = code[:-1]
+        if code:
+            segment: dict[str, Any] = {"body": code, "code": True}
+            if language:
+                segment["language"] = language
+            segments.append(segment)
+        cursor = match.end()
+    tail = text[cursor:].strip()
+    if tail:
+        segments.append({"body": tail, "code": False})
+    return segments or [{"body": text, "code": False}]
+
+
+def pre_entities_json(text: str, language: str = "") -> str:
+    entity: dict[str, Any] = {
+        "type": "pre",
+        "offset": 0,
+        "length": utf16_code_units(text),
+    }
+    if language:
+        entity["language"] = language
+    return json.dumps([entity], ensure_ascii=False)
 
 
 @dataclass(frozen=True)
@@ -325,9 +367,28 @@ class Bridge:
             chunks.append(rest[i : i + self.config.telegram_chunk])
         return chunks
 
+    def raw_chunks(self, text: str) -> list[str]:
+        text = text or "(empty response)"
+        return [
+            text[i : i + self.config.telegram_chunk]
+            for i in range(0, len(text), self.config.telegram_chunk)
+        ] or ["(empty response)"]
+
     def send(self, text: str) -> None:
-        for chunk in self.telegram_chunks(text):
-            self.telegram.call("sendMessage", chat_id=self.config.chat_id, text=chunk)
+        for segment in split_answer_for_code_blocks(text or "(empty response)"):
+            body = str(segment.get("body") or "")
+            if segment.get("code"):
+                language = str(segment.get("language") or "")
+                for chunk in self.raw_chunks(body):
+                    self.telegram.call(
+                        "sendMessage",
+                        chat_id=self.config.chat_id,
+                        text=chunk,
+                        entities=pre_entities_json(chunk, language),
+                    )
+                continue
+            for chunk in self.telegram_chunks(body):
+                self.telegram.call("sendMessage", chat_id=self.config.chat_id, text=chunk)
 
     def print_local(self, text: str) -> None:
         print(text, flush=True)
