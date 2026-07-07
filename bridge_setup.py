@@ -13,9 +13,11 @@ import shutil
 import stat
 import subprocess
 import sys
+import tempfile
 import time
 import urllib.parse
 import urllib.request
+import xml.etree.ElementTree as ET
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable
@@ -640,30 +642,105 @@ def detect_windows_bash_host(
 
 
 def powershell_hidden_start_action(executable: str, args: list[str]) -> str:
+    command, arguments = windows_scheduled_task_exec(executable, args)
+    return f"{command} {arguments}"
+
+
+def windows_scheduled_task_exec(executable: str, args: list[str]) -> tuple[str, str]:
     quoted_args = ", ".join(powershell_single_quote(arg) for arg in args)
     script = f"Start-Process -WindowStyle Hidden -FilePath {powershell_single_quote(executable)}"
     if quoted_args:
         script += f" -ArgumentList @({quoted_args})"
     script_arg = '"' + script.replace('"', '`"') + '"'
-    return (
-        "powershell.exe -NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass "
-        f"-Command {script_arg}"
-    )
+    return "powershell.exe", f"-NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -Command {script_arg}"
 
 
 def windows_scheduled_task_action(host: WindowsBashHost, runner_file: Path) -> str:
+    command, arguments = windows_scheduled_task_command(host, runner_file)
+    return f"{command} {arguments}"
+
+
+def windows_scheduled_task_command(host: WindowsBashHost, runner_file: Path) -> tuple[str, str]:
     if host.kind == "wsl":
         args: list[str] = []
         if host.distro:
             args.extend(["-d", host.distro])
         args.extend(["--", "bash", "-lc", f"exec {shell_quote(windows_path_for_wsl(runner_file))}"])
-        return powershell_hidden_start_action(host.executable, args)
+        return windows_scheduled_task_exec(host.executable, args)
 
     if host.kind == "git-bash":
         args = ["-lc", f"exec {shell_quote(windows_path_for_git_bash(runner_file))}"]
-        return powershell_hidden_start_action(host.executable, args)
+        return windows_scheduled_task_exec(host.executable, args)
 
     raise SetupError(f"unsupported Windows bash host: {host.kind}")
+
+
+def windows_scheduled_task_xml(host: WindowsBashHost, runner_file: Path) -> str:
+    command, arguments = windows_scheduled_task_command(host, runner_file)
+    ns = "http://schemas.microsoft.com/windows/2004/02/mit/task"
+    ET.register_namespace("", ns)
+    task = ET.Element(f"{{{ns}}}Task", {"version": "1.4"})
+    registration = ET.SubElement(task, f"{{{ns}}}RegistrationInfo")
+    ET.SubElement(registration, f"{{{ns}}}Author").text = "codex-telegram-bridge setup"
+    ET.SubElement(registration, f"{{{ns}}}Description").text = (
+        "Codex Telegram Bridge logon autostart"
+    )
+    triggers = ET.SubElement(task, f"{{{ns}}}Triggers")
+    logon = ET.SubElement(triggers, f"{{{ns}}}LogonTrigger")
+    ET.SubElement(logon, f"{{{ns}}}Enabled").text = "true"
+    principals = ET.SubElement(task, f"{{{ns}}}Principals")
+    principal = ET.SubElement(principals, f"{{{ns}}}Principal", {"id": "Author"})
+    ET.SubElement(principal, f"{{{ns}}}LogonType").text = "InteractiveToken"
+    ET.SubElement(principal, f"{{{ns}}}RunLevel").text = "LeastPrivilege"
+    settings = ET.SubElement(task, f"{{{ns}}}Settings")
+    ET.SubElement(settings, f"{{{ns}}}MultipleInstancesPolicy").text = "IgnoreNew"
+    ET.SubElement(settings, f"{{{ns}}}DisallowStartIfOnBatteries").text = "false"
+    ET.SubElement(settings, f"{{{ns}}}StopIfGoingOnBatteries").text = "false"
+    ET.SubElement(settings, f"{{{ns}}}AllowHardTerminate").text = "true"
+    ET.SubElement(settings, f"{{{ns}}}StartWhenAvailable").text = "true"
+    ET.SubElement(settings, f"{{{ns}}}RunOnlyIfNetworkAvailable").text = "false"
+    ET.SubElement(settings, f"{{{ns}}}Enabled").text = "true"
+    ET.SubElement(settings, f"{{{ns}}}Hidden").text = "true"
+    ET.SubElement(settings, f"{{{ns}}}ExecutionTimeLimit").text = "PT0S"
+    actions = ET.SubElement(task, f"{{{ns}}}Actions", {"Context": "Author"})
+    exec_el = ET.SubElement(actions, f"{{{ns}}}Exec")
+    ET.SubElement(exec_el, f"{{{ns}}}Command").text = command
+    ET.SubElement(exec_el, f"{{{ns}}}Arguments").text = arguments
+    return ET.tostring(task, encoding="unicode", xml_declaration=True)
+
+
+def windows_command_quote(value: str) -> str:
+    if not value or any(ch.isspace() for ch in value) or '"' in value:
+        return '"' + value.replace('"', r'\"') + '"'
+    return value
+
+
+def windows_manual_start_command(host: WindowsBashHost, runner_file: Path) -> str:
+    if host.kind == "wsl":
+        args: list[str] = []
+        if host.distro:
+            args.extend(["-d", host.distro])
+        args.extend(["--", "bash", "-lc", f"exec {shell_quote(windows_path_for_wsl(runner_file))}"])
+        return " ".join([windows_command_quote(host.executable), *[windows_command_quote(arg) for arg in args]])
+    if host.kind == "git-bash":
+        args = ["-lc", f"exec {shell_quote(windows_path_for_git_bash(runner_file))}"]
+        return " ".join([windows_command_quote(host.executable), *[windows_command_quote(arg) for arg in args]])
+    return str(runner_file)
+
+
+def manual_start_command_for_runner(
+    runner_file: Path,
+    *,
+    os_name: str | None = None,
+    run: Callable[..., subprocess.CompletedProcess[str]] = run_command,
+) -> str:
+    os_name = os_name or platform.system()
+    if os_name == "Windows":
+        try:
+            return windows_manual_start_command(detect_windows_bash_host(run=run), runner_file)
+        except SetupError:
+            return str(runner_file)
+    return str(runner_file)
 
 
 def install_windows_scheduled_task(
@@ -673,13 +750,30 @@ def install_windows_scheduled_task(
     task_name: str,
     run: Callable[..., subprocess.CompletedProcess[str]],
     bash_host: WindowsBashHost | None = None,
-) -> str:
-    host = bash_host or detect_windows_bash_host(run=run)
-    action = windows_scheduled_task_action(host, runner_file)
-    create = run(["schtasks", "/Create", "/TN", task_name, "/SC", "ONLOGON", "/TR", action, "/F"])
-    if create.returncode != 0:
-        detail = command_output(create) or "unknown error"
-        raise SetupError(f"failed to create Windows Scheduled Task {task_name}: {detail}")
+) -> str | None:
+    try:
+        host = bash_host or detect_windows_bash_host(run=run)
+    except SetupError as exc:
+        warn(str(exc))
+        return None
+
+    xml_file: Path | None = None
+    try:
+        with tempfile.NamedTemporaryFile("w", suffix=".xml", delete=False, encoding="utf-8") as tmp:
+            tmp.write(windows_scheduled_task_xml(host, runner_file))
+            xml_file = Path(tmp.name)
+        create = run(["schtasks", "/Create", "/TN", task_name, "/XML", str(xml_file), "/F"])
+        if create.returncode != 0:
+            detail = command_output(create) or "unknown error"
+            warn(f"failed to create Windows Scheduled Task {task_name}: {detail}")
+            return None
+    finally:
+        if xml_file is not None:
+            try:
+                xml_file.unlink()
+            except OSError:
+                pass
+
     if start:
         started = run(["schtasks", "/Run", "/TN", task_name])
         if started.returncode != 0:
@@ -1076,14 +1170,19 @@ def setup_bridge(options: SetupOptions, api_call: ApiCall = telegram_call) -> in
     setup_step(5, "Install the background service")
     service_state: str | None = None
     start_command: str | None = None
+    current_os = platform.system()
     if options.install_service:
         installed = install_service(options.runner_file, start=options.start_service)
-        start_command = service_start_command(runner_file=options.runner_file)
         if installed:
+            start_command = service_start_command(os_name=current_os, runner_file=options.runner_file)
             ok(f"installed service: {installed}")
             service_state = service_status()
             if options.start_service:
                 ok(f"service status: {service_state}")
+        else:
+            start_command = manual_start_command_for_runner(options.runner_file, os_name=current_os)
+            warn("service install did not complete; run the bridge manually")
+            setup_command(start_command)
         watchdog = install_watchdog(start=options.start_service)
         if watchdog:
             ok(f"installed watchdog: {watchdog}")
