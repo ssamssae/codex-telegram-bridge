@@ -190,7 +190,8 @@ The wizard will:
 - show what it is doing at each step
 - write a private `~/.config/telegram-agent-bridge.env` with mode `0600`
 - install `~/.local/bin/telegram-agent-bridge-run`
-- install and start a user service with systemd on Linux/WSL or launchd on macOS
+- install and start a user service with systemd on Linux/WSL, launchd on macOS,
+  or a per-user Windows Scheduled Task
 - install a watchdog timer/LaunchAgent that recovers an inactive bridge service
 - send a setup-complete test message
 
@@ -448,6 +449,10 @@ service was restarting.
 
 When the setup wizard installs a background service, it also installs a small
 watchdog.
+
+On Windows, the wizard writes a per-user `telegram-agent-bridge` Scheduled Task
+that runs at logon and starts once immediately after setup. `doctor` reports the
+task status from `schtasks /query`.
 
 On Linux and WSL, the wizard writes:
 

@@ -24,6 +24,7 @@ from typing import Any, Callable
 APP_NAME = "telegram-agent-bridge"
 SERVICE_NAME = "telegram-agent-bridge.service"
 LAUNCHD_LABEL = "com.user.telegram-agent-bridge"
+WINDOWS_TASK_NAME = APP_NAME
 WATCHDOG_SERVICE_NAME = "telegram-agent-bridge-watchdog.service"
 WATCHDOG_TIMER_NAME = "telegram-agent-bridge-watchdog.timer"
 WATCHDOG_LAUNCHD_LABEL = "com.user.telegram-agent-bridge-watchdog"
@@ -37,6 +38,13 @@ SETUP_TOTAL_STEPS = 6
 
 class SetupError(RuntimeError):
     """Expected setup error."""
+
+
+@dataclass(frozen=True)
+class WindowsBashHost:
+    kind: str
+    executable: str
+    distro: str | None = None
 
 
 def expand_path(raw: str | Path) -> Path:
@@ -266,13 +274,34 @@ def wait_for_chat_id(
     )
 
 
-def send_test_message(token: str, chat_id: str, api_call: ApiCall = telegram_call) -> bool:
+def service_is_running(status: str | None) -> bool:
+    return (status or "").strip().lower() in {"active", "running"}
+
+
+def send_test_message(
+    token: str,
+    chat_id: str,
+    api_call: ApiCall = telegram_call,
+    *,
+    service_status_text: str | None = None,
+    start_command: str | None = None,
+) -> bool:
+    if service_status_text and service_is_running(service_status_text):
+        text = "telegram-agent-bridge setup complete. Background service is running. Send /ping to test the bridge."
+    elif start_command:
+        status = service_status_text or "unknown"
+        text = (
+            "telegram-agent-bridge setup complete. Background service is not running "
+            f"({status}). Start it with: {start_command}. Then send /ping to test the bridge."
+        )
+    else:
+        text = "telegram-agent-bridge setup complete. Send /ping to test the bridge."
     payload = api_call(
         token,
         "sendMessage",
         timeout=30,
         chat_id=chat_id,
-        text="telegram-agent-bridge setup complete. Send /ping to test the bridge.",
+        text=text,
     )
     return bool(payload and payload.get("ok"))
 
@@ -550,13 +579,160 @@ def run_command(cmd: list[str], check: bool = False) -> subprocess.CompletedProc
     return subprocess.run(cmd, capture_output=True, text=True, check=check)
 
 
+def command_output(proc: subprocess.CompletedProcess[str]) -> str:
+    return (proc.stdout or proc.stderr or "").strip()
+
+
+def powershell_single_quote(value: str | Path) -> str:
+    return "'" + str(value).replace("'", "''") + "'"
+
+
+def windows_path_for_wsl(path: Path) -> str:
+    raw = str(path).replace("\\", "/")
+    if len(raw) >= 2 and raw[1] == ":" and raw[0].isalpha():
+        tail = raw[2:]
+        if not tail.startswith("/"):
+            tail = "/" + tail
+        return f"/mnt/{raw[0].lower()}{tail}"
+    return raw
+
+
+def windows_path_for_git_bash(path: Path) -> str:
+    raw = str(path).replace("\\", "/")
+    if len(raw) >= 2 and raw[1] == ":" and raw[0].isalpha():
+        tail = raw[2:]
+        if not tail.startswith("/"):
+            tail = "/" + tail
+        return f"/{raw[0].lower()}{tail}"
+    return raw
+
+
+def parse_wsl_distro_name(output: str) -> str | None:
+    cleaned = output.replace("\x00", "")
+    for line in cleaned.splitlines():
+        distro = line.strip()
+        if distro:
+            return distro
+    return None
+
+
+def detect_windows_bash_host(
+    *,
+    run: Callable[..., subprocess.CompletedProcess[str]] = run_command,
+    environ: dict[str, str] | None = None,
+    which: Callable[[str], str | None] = shutil.which,
+) -> WindowsBashHost:
+    environ = environ or os.environ
+    wsl_exe = which("wsl.exe") or which("wsl")
+    if wsl_exe:
+        distro = environ.get("WSL_DISTRO_NAME", "").strip()
+        if not distro:
+            proc = run([wsl_exe, "-l", "-q"])
+            if proc.returncode == 0:
+                distro = parse_wsl_distro_name(proc.stdout or proc.stderr or "") or ""
+        return WindowsBashHost(kind="wsl", executable=wsl_exe, distro=distro or None)
+
+    bash_exe = which("bash.exe") or which("bash")
+    if bash_exe:
+        return WindowsBashHost(kind="git-bash", executable=bash_exe)
+
+    raise SetupError("Windows service install requires WSL or Git Bash on PATH")
+
+
+def powershell_hidden_start_action(executable: str, args: list[str]) -> str:
+    quoted_args = ", ".join(powershell_single_quote(arg) for arg in args)
+    script = f"Start-Process -WindowStyle Hidden -FilePath {powershell_single_quote(executable)}"
+    if quoted_args:
+        script += f" -ArgumentList @({quoted_args})"
+    script_arg = '"' + script.replace('"', '`"') + '"'
+    return (
+        "powershell.exe -NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass "
+        f"-Command {script_arg}"
+    )
+
+
+def windows_scheduled_task_action(host: WindowsBashHost, runner_file: Path) -> str:
+    if host.kind == "wsl":
+        args: list[str] = []
+        if host.distro:
+            args.extend(["-d", host.distro])
+        args.extend(["--", "bash", "-lc", f"exec {shell_quote(windows_path_for_wsl(runner_file))}"])
+        return powershell_hidden_start_action(host.executable, args)
+
+    if host.kind == "git-bash":
+        args = ["-lc", f"exec {shell_quote(windows_path_for_git_bash(runner_file))}"]
+        return powershell_hidden_start_action(host.executable, args)
+
+    raise SetupError(f"unsupported Windows bash host: {host.kind}")
+
+
+def install_windows_scheduled_task(
+    runner_file: Path,
+    *,
+    start: bool,
+    task_name: str,
+    run: Callable[..., subprocess.CompletedProcess[str]],
+    bash_host: WindowsBashHost | None = None,
+) -> str:
+    host = bash_host or detect_windows_bash_host(run=run)
+    action = windows_scheduled_task_action(host, runner_file)
+    create = run(["schtasks", "/Create", "/TN", task_name, "/SC", "ONLOGON", "/TR", action, "/F"])
+    if create.returncode != 0:
+        detail = command_output(create) or "unknown error"
+        raise SetupError(f"failed to create Windows Scheduled Task {task_name}: {detail}")
+    if start:
+        started = run(["schtasks", "/Run", "/TN", task_name])
+        if started.returncode != 0:
+            warn(f"could not start Windows Scheduled Task {task_name}: {command_output(started)}")
+    return f"Scheduled Task: {task_name}"
+
+
+def parse_windows_scheduled_task_status(output: str) -> str:
+    for line in output.replace("\r\n", "\n").splitlines():
+        if ":" not in line:
+            continue
+        key, value = line.split(":", 1)
+        if key.strip().lower() == "status":
+            return value.strip() or "unknown"
+    return "unknown"
+
+
+def windows_scheduled_task_status(
+    *,
+    task_name: str,
+    run: Callable[..., subprocess.CompletedProcess[str]],
+) -> str:
+    proc = run(["schtasks", "/Query", "/TN", task_name, "/FO", "LIST", "/V"])
+    if proc.returncode != 0:
+        return "not-installed"
+    return parse_windows_scheduled_task_status(proc.stdout or proc.stderr or "")
+
+
+def service_start_command(
+    *,
+    os_name: str | None = None,
+    runner_file: Path | None = None,
+    task_name: str = WINDOWS_TASK_NAME,
+) -> str:
+    os_name = os_name or platform.system()
+    if os_name == "Windows":
+        return f"schtasks /Run /TN {task_name}"
+    if os_name == "Linux":
+        return f"systemctl --user start {SERVICE_NAME}"
+    if os_name == "Darwin":
+        return f"launchctl kickstart -k gui/$(id -u)/{LAUNCHD_LABEL}"
+    return str(runner_file) if runner_file else ""
+
+
 def install_service(
     runner_file: Path,
     *,
     start: bool = True,
     os_name: str | None = None,
     run: Callable[..., subprocess.CompletedProcess[str]] = run_command,
-) -> Path | None:
+    task_name: str = WINDOWS_TASK_NAME,
+    bash_host: WindowsBashHost | None = None,
+) -> Path | str | None:
     os_name = os_name or platform.system()
     if os_name == "Linux":
         unit_file = default_systemd_unit_file()
@@ -575,6 +751,15 @@ def install_service(
             run(["launchctl", "bootout", domain])
             run(["launchctl", "bootstrap", f"gui/{os.getuid()}", str(plist_file)])
         return plist_file
+
+    if os_name == "Windows":
+        return install_windows_scheduled_task(
+            runner_file,
+            start=start,
+            task_name=task_name,
+            run=run,
+            bash_host=bash_host,
+        )
 
     warn(f"service install is not automated for {os_name}; use the runner manually")
     return None
@@ -608,6 +793,9 @@ def install_watchdog(
             run(["launchctl", "bootstrap", f"gui/{os.getuid()}", str(plist_file)])
         return plist_file
 
+    if os_name == "Windows":
+        return None
+
     warn(f"watchdog install is not automated for {os_name}")
     return None
 
@@ -635,6 +823,11 @@ def uninstall_service(
             default_launchd_plist_file().unlink()
         except OSError:
             pass
+        return
+
+    if os_name == "Windows":
+        run(["schtasks", "/End", "/TN", WINDOWS_TASK_NAME])
+        run(["schtasks", "/Delete", "/TN", WINDOWS_TASK_NAME, "/F"])
         return
 
     warn(f"service uninstall is not automated for {os_name}")
@@ -672,6 +865,7 @@ def service_status(
     *,
     os_name: str | None = None,
     run: Callable[..., subprocess.CompletedProcess[str]] = run_command,
+    task_name: str = WINDOWS_TASK_NAME,
 ) -> str:
     os_name = os_name or platform.system()
     if os_name == "Linux":
@@ -685,6 +879,8 @@ def service_status(
             if stripped.startswith("state = "):
                 return stripped.removeprefix("state = ").strip()
         return "unknown"
+    if os_name == "Windows":
+        return windows_scheduled_task_status(task_name=task_name, run=run)
     return "manual"
 
 
@@ -692,6 +888,7 @@ def watchdog_status(
     *,
     os_name: str | None = None,
     run: Callable[..., subprocess.CompletedProcess[str]] = run_command,
+    task_name: str = WINDOWS_TASK_NAME,
 ) -> str:
     os_name = os_name or platform.system()
     if os_name == "Linux":
@@ -708,6 +905,8 @@ def watchdog_status(
                 state = stripped.removeprefix("state = ").strip()
                 return "loaded" if state == "not running" else state
         return "loaded"
+    if os_name == "Windows":
+        return windows_scheduled_task_status(task_name=task_name, run=run)
     return "manual"
 
 
@@ -875,12 +1074,16 @@ def setup_bridge(options: SetupOptions, api_call: ApiCall = telegram_call) -> in
     ok(f"installed runner: {options.runner_file}")
 
     setup_step(5, "Install the background service")
+    service_state: str | None = None
+    start_command: str | None = None
     if options.install_service:
         installed = install_service(options.runner_file, start=options.start_service)
+        start_command = service_start_command(runner_file=options.runner_file)
         if installed:
             ok(f"installed service: {installed}")
+            service_state = service_status()
             if options.start_service:
-                ok(f"service status: {service_status()}")
+                ok(f"service status: {service_state}")
         watchdog = install_watchdog(start=options.start_service)
         if watchdog:
             ok(f"installed watchdog: {watchdog}")
@@ -888,11 +1091,18 @@ def setup_bridge(options: SetupOptions, api_call: ApiCall = telegram_call) -> in
                 ok(f"watchdog status: {watchdog_status()}")
     else:
         warn("service install skipped; run the runner manually")
+        start_command = str(options.runner_file)
         setup_command(str(options.runner_file))
 
     setup_step(6, "Send a setup-complete test message")
     if options.send_test:
-        if send_test_message(token, chat_id, api_call=api_call):
+        if send_test_message(
+            token,
+            chat_id,
+            api_call=api_call,
+            service_status_text=service_state,
+            start_command=None if service_is_running(service_state) else start_command,
+        ):
             ok("sent setup-complete test message")
         else:
             warn("could not send setup-complete test message")
@@ -903,9 +1113,16 @@ def setup_bridge(options: SetupOptions, api_call: ApiCall = telegram_call) -> in
     out("")
     out("Setup complete.")
     out("Try it now:")
-    out("  1. In Telegram, send /ping to your bot.")
-    out("  2. If /ping works, send a normal Codex prompt.")
-    out(f"  3. Run a health check any time: {doctor_command_hint()}")
+    if start_command and not service_is_running(service_state):
+        out("  1. Start the background bridge:")
+        out(f"     {start_command}")
+        out("  2. In Telegram, send /ping to your bot.")
+        out("  3. If /ping works, send a normal Codex prompt.")
+        out(f"  4. Run a health check any time: {doctor_command_hint()}")
+    else:
+        out("  1. In Telegram, send /ping to your bot.")
+        out("  2. If /ping works, send a normal Codex prompt.")
+        out(f"  3. Run a health check any time: {doctor_command_hint()}")
     return 0
 
 
@@ -990,14 +1207,14 @@ def doctor(config_file: Path, runner_file: Path, api_call: ApiCall = telegram_ca
             warnings += 1
 
     status = service_status()
-    if status in {"active", "running"}:
+    if service_is_running(status):
         ok(f"service status: {status}")
     else:
         warn(f"service status: {status}")
         warnings += 1
 
     wd_status = watchdog_status()
-    if wd_status in {"active", "running", "loaded"}:
+    if wd_status.strip().lower() in {"active", "running", "loaded", "ready"}:
         ok(f"watchdog status: {wd_status}")
     else:
         warn(f"watchdog status: {wd_status}")
