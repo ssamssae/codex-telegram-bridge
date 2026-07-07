@@ -136,29 +136,67 @@ class SetupWizardTests(unittest.TestCase):
 
     def test_install_service_windows_creates_and_runs_scheduled_task(self):
         commands = []
+        xml_text = ""
 
         def run(cmd, check=False):
+            nonlocal xml_text
             commands.append(tuple(cmd))
+            if "/XML" in cmd:
+                xml_path = Path(cmd[cmd.index("/XML") + 1])
+                xml_text = xml_path.read_text(encoding="utf-8")
             return completed(cmd)
 
+        long_runner = Path(
+            r"C:\Users\Ada\very-long-profile-segment\repos\codex-telegram-bridge"
+            + (r"\nested" * 24)
+            + r"\telegram-agent-bridge-run"
+        )
         installed = setup.install_service(
-            Path(r"C:\Users\Ada\.local\bin\telegram-agent-bridge-run"),
+            long_runner,
             os_name="Windows",
             run=run,
             task_name="tab-test-autostart",
-            bash_host=setup.WindowsBashHost(kind="wsl", executable="wsl.exe", distro="Ubuntu"),
+            bash_host=setup.WindowsBashHost(
+                kind="wsl",
+                executable=r"C:\Windows\System32\wsl.exe",
+                distro="Ubuntu",
+            ),
         )
 
         self.assertEqual(installed, "Scheduled Task: tab-test-autostart")
-        self.assertEqual(commands[0][:6], ("schtasks", "/Create", "/TN", "tab-test-autostart", "/SC", "ONLOGON"))
-        self.assertIn("/TR", commands[0])
-        action = commands[0][commands[0].index("/TR") + 1]
-        self.assertIn("powershell.exe", action)
-        self.assertIn("Start-Process", action)
-        self.assertIn("wsl.exe", action)
-        self.assertIn("bash", action)
-        self.assertIn("-lc", action)
+        self.assertEqual(commands[0][:4], ("schtasks", "/Create", "/TN", "tab-test-autostart"))
+        self.assertIn("/XML", commands[0])
+        self.assertNotIn("/TR", commands[0])
+        self.assertNotIn(str(long_runner), " ".join(commands[0]))
+        self.assertIn("<Command>powershell.exe</Command>", xml_text)
+        self.assertIn("Start-Process", xml_text)
+        self.assertIn("C:\\Windows\\System32\\wsl.exe", xml_text)
+        self.assertIn("/mnt/c/Users/Ada/very-long-profile-segment", xml_text)
         self.assertIn(("schtasks", "/Run", "/TN", "tab-test-autostart"), commands)
+
+    def test_install_service_windows_create_failure_returns_manual_fallback(self):
+        commands = []
+
+        def run(cmd, check=False):
+            commands.append(tuple(cmd))
+            if cmd[:2] == ["schtasks", "/Create"]:
+                return completed(
+                    cmd,
+                    returncode=1,
+                    stderr="ERROR: Value for '/TR' option cannot be more than 261 character(s).\r\n",
+                )
+            return completed(cmd)
+
+        installed = setup.install_service(
+            Path(r"C:\Users\gb\.local\bin\telegram-agent-bridge-run"),
+            os_name="Windows",
+            run=run,
+            task_name="telegram-agent-bridge",
+            bash_host=setup.WindowsBashHost(kind="git-bash", executable=r"C:\Program Files\Git\bin\bash.exe"),
+        )
+
+        self.assertIsNone(installed)
+        self.assertNotIn(("schtasks", "/Run", "/TN", "telegram-agent-bridge"), commands)
 
     def test_windows_service_status_parses_schtasks_query(self):
         def running(cmd, check=False):
