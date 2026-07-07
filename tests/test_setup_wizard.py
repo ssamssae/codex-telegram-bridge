@@ -1,11 +1,16 @@
 #!/usr/bin/env python3
 import contextlib
 import io
+import subprocess
 import tempfile
 import unittest
 from pathlib import Path
 
 import bridge_setup as setup
+
+
+def completed(cmd, returncode=0, stdout="", stderr=""):
+    return subprocess.CompletedProcess(cmd, returncode, stdout, stderr)
 
 
 class FakeApi:
@@ -111,13 +116,91 @@ class SetupWizardTests(unittest.TestCase):
         runner = Path("/tmp/telegram-agent-bridge-run")
         self.assertIn(str(runner), setup.systemd_unit_content(runner))
         self.assertIn(str(runner), setup.launchd_plist_content(runner))
+        action = setup.windows_scheduled_task_action(
+            setup.WindowsBashHost(kind="wsl", executable="wsl.exe", distro="Ubuntu"),
+            Path(r"C:\Users\Ada\.local\bin\telegram-agent-bridge-run"),
+        )
+        self.assertIn("powershell.exe", action)
+        self.assertIn("-WindowStyle Hidden", action)
+        self.assertIn("wsl.exe", action)
+        self.assertIn("Ubuntu", action)
+        self.assertIn("/mnt/c/Users/Ada/.local/bin/telegram-agent-bridge-run", action)
         self.assertIn("telegram-agent-bridge-watchdog.service", setup.watchdog_systemd_timer_content())
         self.assertIn(str(setup.WATCHDOG_SCRIPT), setup.watchdog_systemd_service_content())
         self.assertIn(str(setup.WATCHDOG_SCRIPT), setup.watchdog_launchd_plist_content())
         self.assertNotIn("TAB_BOT_TOKEN", setup.systemd_unit_content(runner))
         self.assertNotIn("TAB_BOT_TOKEN", setup.launchd_plist_content(runner))
+        self.assertNotIn("TAB_BOT_TOKEN", action)
         self.assertNotIn("TAB_BOT_TOKEN", setup.watchdog_systemd_service_content())
         self.assertNotIn("TAB_BOT_TOKEN", setup.watchdog_launchd_plist_content())
+
+    def test_install_service_windows_creates_and_runs_scheduled_task(self):
+        commands = []
+
+        def run(cmd, check=False):
+            commands.append(tuple(cmd))
+            return completed(cmd)
+
+        installed = setup.install_service(
+            Path(r"C:\Users\Ada\.local\bin\telegram-agent-bridge-run"),
+            os_name="Windows",
+            run=run,
+            task_name="tab-test-autostart",
+            bash_host=setup.WindowsBashHost(kind="wsl", executable="wsl.exe", distro="Ubuntu"),
+        )
+
+        self.assertEqual(installed, "Scheduled Task: tab-test-autostart")
+        self.assertEqual(commands[0][:6], ("schtasks", "/Create", "/TN", "tab-test-autostart", "/SC", "ONLOGON"))
+        self.assertIn("/TR", commands[0])
+        action = commands[0][commands[0].index("/TR") + 1]
+        self.assertIn("powershell.exe", action)
+        self.assertIn("Start-Process", action)
+        self.assertIn("wsl.exe", action)
+        self.assertIn("bash", action)
+        self.assertIn("-lc", action)
+        self.assertIn(("schtasks", "/Run", "/TN", "tab-test-autostart"), commands)
+
+    def test_windows_service_status_parses_schtasks_query(self):
+        def running(cmd, check=False):
+            self.assertEqual(cmd[:4], ["schtasks", "/Query", "/TN", "tab-test-autostart"])
+            return completed(cmd, stdout="TaskName: tab-test-autostart\r\nStatus: Running\r\n")
+
+        def ready(cmd, check=False):
+            return completed(cmd, stdout="TaskName: tab-test-autostart\r\nStatus: Ready\r\n")
+
+        def missing(cmd, check=False):
+            return completed(cmd, returncode=1, stderr="ERROR: The system cannot find the file specified.\r\n")
+
+        self.assertEqual(
+            setup.service_status(os_name="Windows", run=running, task_name="tab-test-autostart"),
+            "Running",
+        )
+        self.assertEqual(
+            setup.service_status(os_name="Windows", run=ready, task_name="tab-test-autostart"),
+            "Ready",
+        )
+        self.assertEqual(
+            setup.service_status(os_name="Windows", run=missing, task_name="tab-test-autostart"),
+            "not-installed",
+        )
+
+    def test_setup_complete_message_includes_manual_start_when_not_running(self):
+        api = FakeApi()
+
+        self.assertTrue(
+            setup.send_test_message(
+                "token",
+                "12345",
+                api_call=api,
+                service_status_text="Ready",
+                start_command="schtasks /Run /TN telegram-agent-bridge",
+            )
+        )
+
+        _token, method, _timeout, params = api.calls[-1]
+        self.assertEqual(method, "sendMessage")
+        self.assertIn("/ping", params["text"])
+        self.assertIn("schtasks /Run /TN telegram-agent-bridge", params["text"])
 
     def test_noninteractive_setup_writes_config_and_runner(self):
         with tempfile.TemporaryDirectory() as tmpdir:
