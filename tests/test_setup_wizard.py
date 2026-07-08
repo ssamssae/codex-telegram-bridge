@@ -151,9 +151,9 @@ class SetupWizardTests(unittest.TestCase):
             + (r"\nested" * 24)
             + r"\telegram-agent-bridge-run"
         )
-        installed = setup.install_service(
+        installed = setup.install_windows_scheduled_task(
             long_runner,
-            os_name="Windows",
+            start=True,
             run=run,
             task_name="tab-test-autostart",
             bash_host=setup.WindowsBashHost(
@@ -174,29 +174,59 @@ class SetupWizardTests(unittest.TestCase):
         self.assertIn("/mnt/c/Users/Ada/very-long-profile-segment", xml_text)
         self.assertIn(("schtasks", "/Run", "/TN", "tab-test-autostart"), commands)
 
-    def test_install_service_windows_create_failure_returns_manual_fallback(self):
+    def test_install_service_windows_installs_startup_launcher_without_schtasks(self):
         commands = []
 
         def run(cmd, check=False):
             commands.append(tuple(cmd))
-            if cmd[:2] == ["schtasks", "/Create"]:
-                return completed(
-                    cmd,
-                    returncode=1,
-                    stderr="ERROR: Value for '/TR' option cannot be more than 261 character(s).\r\n",
-                )
             return completed(cmd)
 
-        installed = setup.install_service(
-            Path(r"C:\Users\gb\.local\bin\telegram-agent-bridge-run"),
-            os_name="Windows",
-            run=run,
-            task_name="telegram-agent-bridge",
-            bash_host=setup.WindowsBashHost(kind="git-bash", executable=r"C:\Program Files\Git\bin\bash.exe"),
-        )
+        with tempfile.TemporaryDirectory() as tmpdir:
+            startup_dir = Path(tmpdir) / "Startup"
+            installed = setup.install_service(
+                Path(r"C:\Users\gb\.local\bin\telegram-agent-bridge-run"),
+                os_name="Windows",
+                run=run,
+                task_name="telegram-agent-bridge",
+                bash_host=setup.WindowsBashHost(kind="git-bash", executable=r"C:\Program Files\Git\bin\bash.exe"),
+                windows_startup_dir=startup_dir,
+            )
 
-        self.assertIsNone(installed)
+            launcher = startup_dir / "telegram-agent-bridge.bat"
+            self.assertEqual(installed, launcher)
+            self.assertTrue(launcher.exists())
+            launcher_text = launcher.read_text(encoding="utf-8")
+            self.assertIn("Start-Process", launcher_text)
+            self.assertIn("C:\\Program Files\\Git\\bin\\bash.exe", launcher_text)
+            self.assertIn("/c/Users/gb/.local/bin/telegram-agent-bridge-run", launcher_text)
+            self.assertIn(">NUL 2>NUL", launcher_text)
+
+        self.assertNotIn(("schtasks", "/Create"), [cmd[:2] for cmd in commands])
         self.assertNotIn(("schtasks", "/Run", "/TN", "telegram-agent-bridge"), commands)
+        self.assertEqual(commands[-1][0], "powershell.exe")
+        self.assertIn("Start-Process", commands[-1][-1])
+        self.assertIn(str(launcher), commands[-1][-1])
+
+    def test_windows_service_status_reports_startup_launcher_when_task_missing(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            startup_dir = Path(tmpdir) / "Startup"
+            launcher = startup_dir / "telegram-agent-bridge.bat"
+            startup_dir.mkdir(parents=True)
+            launcher.write_text("@echo off\n", encoding="utf-8")
+
+            def missing_task(cmd, check=False):
+                self.assertEqual(cmd[:4], ["schtasks", "/Query", "/TN", "telegram-agent-bridge"])
+                return completed(cmd, returncode=1, stderr="ERROR: Access is denied.\r\n")
+
+            self.assertEqual(
+                setup.service_status(
+                    os_name="Windows",
+                    run=missing_task,
+                    task_name="telegram-agent-bridge",
+                    windows_startup_dir=startup_dir,
+                ),
+                "startup-installed",
+            )
 
     def test_windows_service_status_parses_schtasks_query(self):
         def running(cmd, check=False):
@@ -217,10 +247,16 @@ class SetupWizardTests(unittest.TestCase):
             setup.service_status(os_name="Windows", run=ready, task_name="tab-test-autostart"),
             "Ready",
         )
-        self.assertEqual(
-            setup.service_status(os_name="Windows", run=missing, task_name="tab-test-autostart"),
-            "not-installed",
-        )
+        with tempfile.TemporaryDirectory() as tmpdir:
+            self.assertEqual(
+                setup.service_status(
+                    os_name="Windows",
+                    run=missing,
+                    task_name="tab-test-autostart",
+                    windows_startup_dir=Path(tmpdir) / "Startup",
+                ),
+                "not-installed",
+            )
 
     def test_setup_complete_message_includes_manual_start_when_not_running(self):
         api = FakeApi()
@@ -239,6 +275,25 @@ class SetupWizardTests(unittest.TestCase):
         self.assertEqual(method, "sendMessage")
         self.assertIn("/ping", params["text"])
         self.assertIn("schtasks /Run /TN telegram-agent-bridge", params["text"])
+
+    def test_setup_complete_message_treats_windows_startup_launcher_as_ready(self):
+        api = FakeApi()
+
+        self.assertTrue(
+            setup.send_test_message(
+                "token",
+                "12345",
+                api_call=api,
+                service_status_text="startup-installed",
+                start_command='cmd.exe /c start "" "telegram-agent-bridge.bat"',
+            )
+        )
+
+        _token, method, _timeout, params = api.calls[-1]
+        self.assertEqual(method, "sendMessage")
+        self.assertIn("Windows Startup autostart is installed", params["text"])
+        self.assertIn("/ping", params["text"])
+        self.assertNotIn("Start it with", params["text"])
 
     def test_noninteractive_setup_writes_config_and_runner(self):
         with tempfile.TemporaryDirectory() as tmpdir:

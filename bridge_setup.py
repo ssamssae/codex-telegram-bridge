@@ -85,6 +85,37 @@ def default_watchdog_launchd_plist_file() -> Path:
     return Path.home() / "Library" / "LaunchAgents" / f"{WATCHDOG_LAUNCHD_LABEL}.plist"
 
 
+def default_windows_startup_dir() -> Path:
+    appdata = os.environ.get("APPDATA")
+    if appdata:
+        return (
+            Path(appdata)
+            / "Microsoft"
+            / "Windows"
+            / "Start Menu"
+            / "Programs"
+            / "Startup"
+        )
+    return (
+        Path.home()
+        / "AppData"
+        / "Roaming"
+        / "Microsoft"
+        / "Windows"
+        / "Start Menu"
+        / "Programs"
+        / "Startup"
+    )
+
+
+def default_windows_startup_launcher_file(
+    startup_dir: Path | None = None,
+    *,
+    app_name: str = APP_NAME,
+) -> Path:
+    return (startup_dir or default_windows_startup_dir()) / f"{app_name}.bat"
+
+
 def out(message: str = "") -> None:
     print(message, flush=True)
 
@@ -277,7 +308,7 @@ def wait_for_chat_id(
 
 
 def service_is_running(status: str | None) -> bool:
-    return (status or "").strip().lower() in {"active", "running"}
+    return (status or "").strip().lower() in {"active", "running", "startup-installed"}
 
 
 def send_test_message(
@@ -288,7 +319,12 @@ def send_test_message(
     service_status_text: str | None = None,
     start_command: str | None = None,
 ) -> bool:
-    if service_status_text and service_is_running(service_status_text):
+    if (service_status_text or "").strip().lower() == "startup-installed":
+        text = (
+            "telegram-agent-bridge setup complete. Windows Startup autostart is installed "
+            "and was launched. Send /ping to test the bridge."
+        )
+    elif service_status_text and service_is_running(service_status_text):
         text = "telegram-agent-bridge setup complete. Background service is running. Send /ping to test the bridge."
     elif start_command:
         status = service_status_text or "unknown"
@@ -660,19 +696,24 @@ def windows_scheduled_task_action(host: WindowsBashHost, runner_file: Path) -> s
     return f"{command} {arguments}"
 
 
-def windows_scheduled_task_command(host: WindowsBashHost, runner_file: Path) -> tuple[str, str]:
+def windows_bash_host_runner_command(host: WindowsBashHost, runner_file: Path) -> tuple[str, list[str]]:
     if host.kind == "wsl":
         args: list[str] = []
         if host.distro:
             args.extend(["-d", host.distro])
         args.extend(["--", "bash", "-lc", f"exec {shell_quote(windows_path_for_wsl(runner_file))}"])
-        return windows_scheduled_task_exec(host.executable, args)
+        return host.executable, args
 
     if host.kind == "git-bash":
         args = ["-lc", f"exec {shell_quote(windows_path_for_git_bash(runner_file))}"]
-        return windows_scheduled_task_exec(host.executable, args)
+        return host.executable, args
 
     raise SetupError(f"unsupported Windows bash host: {host.kind}")
+
+
+def windows_scheduled_task_command(host: WindowsBashHost, runner_file: Path) -> tuple[str, str]:
+    executable, args = windows_bash_host_runner_command(host, runner_file)
+    return windows_scheduled_task_exec(executable, args)
 
 
 def windows_scheduled_task_xml(host: WindowsBashHost, runner_file: Path) -> str:
@@ -781,6 +822,70 @@ def install_windows_scheduled_task(
     return f"Scheduled Task: {task_name}"
 
 
+def powershell_invoke_command(executable: str, args: list[str]) -> str:
+    return " ".join(["&", powershell_single_quote(executable), *[powershell_single_quote(arg) for arg in args]])
+
+
+def windows_startup_launcher_command(host: WindowsBashHost, runner_file: Path) -> tuple[str, str]:
+    executable, args = windows_bash_host_runner_command(host, runner_file)
+    inner = powershell_invoke_command(executable, args)
+    nested_args = [
+        "-NoProfile",
+        "-ExecutionPolicy",
+        "Bypass",
+        "-Command",
+        inner,
+    ]
+    quoted_args = ", ".join(powershell_single_quote(arg) for arg in nested_args)
+    script = (
+        "Start-Process -WindowStyle Hidden "
+        f"-FilePath {powershell_single_quote('powershell.exe')} "
+        f"-ArgumentList @({quoted_args})"
+    )
+    script_arg = '"' + script.replace('"', '`"') + '"'
+    return "powershell.exe", f"-NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -Command {script_arg}"
+
+
+def windows_startup_launcher_content(host: WindowsBashHost, runner_file: Path) -> str:
+    command, arguments = windows_startup_launcher_command(host, runner_file)
+    return "\r\n".join(
+        [
+            "@echo off",
+            "rem Installed by codex-telegram-bridge setup. Runs at Windows logon.",
+            f"{windows_command_quote(command)} {arguments} >NUL 2>NUL",
+            "",
+        ]
+    )
+
+
+def install_windows_startup_launcher(
+    runner_file: Path,
+    *,
+    start: bool,
+    run: Callable[..., subprocess.CompletedProcess[str]],
+    bash_host: WindowsBashHost | None = None,
+    startup_dir: Path | None = None,
+    app_name: str = APP_NAME,
+) -> Path | None:
+    try:
+        host = bash_host or detect_windows_bash_host(run=run)
+    except SetupError as exc:
+        warn(str(exc))
+        return None
+
+    launcher_file = default_windows_startup_launcher_file(startup_dir, app_name=app_name)
+    write_text_atomic(
+        launcher_file,
+        windows_startup_launcher_content(host, runner_file),
+        mode=0o644,
+    )
+    if start:
+        started = run(windows_startup_launcher_start_command(launcher_file))
+        if started.returncode != 0:
+            warn(f"could not launch Windows Startup bridge launcher: {command_output(started)}")
+    return launcher_file
+
+
 def parse_windows_scheduled_task_status(output: str) -> str:
     for line in output.replace("\r\n", "\n").splitlines():
         if ":" not in line:
@@ -802,15 +907,43 @@ def windows_scheduled_task_status(
     return parse_windows_scheduled_task_status(proc.stdout or proc.stderr or "")
 
 
+def windows_startup_launcher_status(
+    startup_dir: Path | None = None,
+    *,
+    app_name: str = APP_NAME,
+) -> str:
+    return (
+        "startup-installed"
+        if default_windows_startup_launcher_file(startup_dir, app_name=app_name).exists()
+        else "not-installed"
+    )
+
+
+def windows_startup_launcher_start_command(launcher_file: Path) -> list[str]:
+    script = f"Start-Process -WindowStyle Hidden -FilePath {powershell_single_quote(launcher_file)}"
+    return [
+        "powershell.exe",
+        "-NoProfile",
+        "-WindowStyle",
+        "Hidden",
+        "-ExecutionPolicy",
+        "Bypass",
+        "-Command",
+        script,
+    ]
+
+
 def service_start_command(
     *,
     os_name: str | None = None,
     runner_file: Path | None = None,
     task_name: str = WINDOWS_TASK_NAME,
+    windows_startup_dir: Path | None = None,
 ) -> str:
     os_name = os_name or platform.system()
     if os_name == "Windows":
-        return f"schtasks /Run /TN {task_name}"
+        launcher_file = default_windows_startup_launcher_file(windows_startup_dir, app_name=task_name)
+        return " ".join(windows_command_quote(part) for part in windows_startup_launcher_start_command(launcher_file))
     if os_name == "Linux":
         return f"systemctl --user start {SERVICE_NAME}"
     if os_name == "Darwin":
@@ -826,6 +959,7 @@ def install_service(
     run: Callable[..., subprocess.CompletedProcess[str]] = run_command,
     task_name: str = WINDOWS_TASK_NAME,
     bash_host: WindowsBashHost | None = None,
+    windows_startup_dir: Path | None = None,
 ) -> Path | str | None:
     os_name = os_name or platform.system()
     if os_name == "Linux":
@@ -847,12 +981,13 @@ def install_service(
         return plist_file
 
     if os_name == "Windows":
-        return install_windows_scheduled_task(
+        return install_windows_startup_launcher(
             runner_file,
             start=start,
-            task_name=task_name,
             run=run,
             bash_host=bash_host,
+            startup_dir=windows_startup_dir,
+            app_name=task_name,
         )
 
     warn(f"service install is not automated for {os_name}; use the runner manually")
@@ -922,6 +1057,10 @@ def uninstall_service(
     if os_name == "Windows":
         run(["schtasks", "/End", "/TN", WINDOWS_TASK_NAME])
         run(["schtasks", "/Delete", "/TN", WINDOWS_TASK_NAME, "/F"])
+        try:
+            default_windows_startup_launcher_file().unlink()
+        except OSError:
+            pass
         return
 
     warn(f"service uninstall is not automated for {os_name}")
@@ -960,6 +1099,7 @@ def service_status(
     os_name: str | None = None,
     run: Callable[..., subprocess.CompletedProcess[str]] = run_command,
     task_name: str = WINDOWS_TASK_NAME,
+    windows_startup_dir: Path | None = None,
 ) -> str:
     os_name = os_name or platform.system()
     if os_name == "Linux":
@@ -974,7 +1114,10 @@ def service_status(
                 return stripped.removeprefix("state = ").strip()
         return "unknown"
     if os_name == "Windows":
-        return windows_scheduled_task_status(task_name=task_name, run=run)
+        task_status = windows_scheduled_task_status(task_name=task_name, run=run)
+        if task_status != "not-installed":
+            return task_status
+        return windows_startup_launcher_status(windows_startup_dir, app_name=task_name)
     return "manual"
 
 
