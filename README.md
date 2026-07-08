@@ -450,9 +450,13 @@ service was restarting.
 When the setup wizard installs a background service, it also installs a small
 watchdog.
 
-On Windows, the wizard writes a per-user `telegram-agent-bridge` Scheduled Task
-that runs at logon and starts once immediately after setup. `doctor` reports the
-task status from `schtasks /query`.
+On Windows, the wizard writes a per-user Startup launcher at
+`%APPDATA%\Microsoft\Windows\Start Menu\Programs\Startup\telegram-agent-bridge.bat`.
+This does not require administrator rights. Setup also starts that launcher once
+immediately so you can send `/ping` without logging out and back in. If an older
+per-user `telegram-agent-bridge` Scheduled Task exists, `doctor` still reports
+its `schtasks /query` status; otherwise it reports whether the Startup launcher
+is installed.
 
 On Linux and WSL, the wizard writes:
 
