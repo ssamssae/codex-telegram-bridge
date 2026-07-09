@@ -37,6 +37,7 @@ REPL_BRIDGE_SCRIPT = REPO_DIR / "codex_repl_bridge.py"
 AUDIO_TRANSCRIBE_SCRIPT = REPO_DIR / "codex_audio_transcribe.py"
 WATCHDOG_SCRIPT = REPO_DIR / "bridge_watchdog.py"
 SETUP_TOTAL_STEPS = 6
+WINDOWS_BATCH_EXTENSIONS = {".bat", ".cmd"}
 
 
 class SetupError(RuntimeError):
@@ -48,6 +49,46 @@ class WindowsBashHost:
     kind: str
     executable: str
     distro: str | None = None
+
+
+@dataclass(frozen=True)
+class AgentCommandCheck:
+    ok: bool
+    message: str
+
+
+def is_windows_platform(os_name: str | None = None) -> bool:
+    return (os_name or platform.system()) == "Windows" or os.name == "nt" or sys.platform == "win32"
+
+
+def agent_command_spawn_check(
+    agent_cmd: str,
+    *,
+    os_name: str | None = None,
+    which: Callable[[str], str | None] | None = None,
+    environ: dict[str, str] | None = None,
+) -> AgentCommandCheck:
+    which = which or shutil.which
+    try:
+        first = shlex.split(agent_cmd)[0]
+    except (ValueError, IndexError):
+        return AgentCommandCheck(False, f"Codex command is invalid: {agent_cmd}")
+
+    resolved = which(first)
+    if not resolved:
+        return AgentCommandCheck(False, f"Codex command not found on PATH: {agent_cmd}")
+
+    if is_windows_platform(os_name) and Path(resolved).suffix.lower() in WINDOWS_BATCH_EXTENSIONS:
+        env_map = environ or os.environ
+        cmd_exe = env_map.get("COMSPEC") or which("cmd.exe") or which("cmd")
+        if not cmd_exe:
+            return AgentCommandCheck(
+                False,
+                f"Codex command is a Windows batch shim but cmd.exe was not found: {resolved}",
+            )
+        return AgentCommandCheck(True, f"Codex command spawnable: {first} -> {resolved} via {cmd_exe}")
+
+    return AgentCommandCheck(True, f"Codex command spawnable: {first} -> {resolved}")
 
 
 def expand_path(raw: str | Path) -> Path:
@@ -375,6 +416,8 @@ def write_env_config(
 ) -> None:
     if agent != "codex":
         raise SetupError("agent supports only codex")
+    local_input_value = "off" if is_windows_platform() else str(local_input)
+    codex_extra_args = "--skip-git-repo-check" if mode == "exec" else ""
     lines = [
         "# telegram-agent-bridge private config",
         "# Keep this file out of git. It contains your Telegram bot token.",
@@ -390,10 +433,10 @@ def write_env_config(
         "TAB_TIMEOUT=600",
         "TAB_TG_CHUNK=4096",
         "TAB_TYPING_INTERVAL=4",
-        f"TAB_LOCAL_INPUT={shell_quote(local_input)}",
+        f"TAB_LOCAL_INPUT={shell_quote(local_input_value)}",
         "TAB_STDIN_INPUT=0",
         f"TAB_CODEX_DANGEROUS_BYPASS={'1' if dangerous_bypass else '0'}",
-        "TAB_CODEX_EXTRA_ARGS=",
+        f"TAB_CODEX_EXTRA_ARGS={shell_quote(codex_extra_args)}",
     ]
     if mode == "repl":
         lines.extend(
@@ -402,7 +445,7 @@ def write_env_config(
                 "# REPL mode: paste Telegram prompts into an existing Codex TUI tmux session",
                 "# and mirror final answers from Codex JSONL session logs.",
                 "# BYO signal: local FIFO for cron/webhook/task-queue prompt injection.",
-                f"CRB_SIGNAL_PATH={shell_quote(local_input)}",
+                f"CRB_SIGNAL_PATH={shell_quote(local_input_value)}",
                 f"CRB_TMUX_SOCKET={shell_quote(tmux_socket)}",
                 f"CRB_TMUX_SESSION={shell_quote(tmux_session)}",
                 f"CRB_TMUX_SUBMIT_KEY={shell_quote(submit_key)}",
@@ -461,6 +504,7 @@ def python_runner_content(env_file: Path) -> str:
             "    raise SystemExit(2)",
             "",
             "os.environ.setdefault('PYTHONUNBUFFERED', '1')",
+            "os.environ.setdefault('PYTHONUTF8', '1')",
             "raise SystemExit(subprocess.call([sys.executable, str(script)]))",
             "",
         ]
@@ -1370,12 +1414,11 @@ def setup_bridge(options: SetupOptions, api_call: ApiCall = telegram_call) -> in
         setup_command(options.agent_cmd)
     else:
         setup_note("Exec mode runs one text-only Codex turn per Telegram prompt.")
-    try:
-        agent_binary = shlex.split(options.agent_cmd)[0]
-    except (ValueError, IndexError):
-        agent_binary = ""
-    if agent_binary and not shutil.which(agent_binary):
-        warn(f"Codex command not found on PATH now: {options.agent_cmd}")
+    agent_check = agent_command_spawn_check(options.agent_cmd, os_name=platform.system())
+    if agent_check.ok:
+        ok(agent_check.message)
+    else:
+        warn(agent_check.message)
     if options.mode == "repl" and not shutil.which("tmux"):
         warn("tmux was not found on PATH. REPL mode requires an existing tmux Codex session.")
     if options.mode == "repl":
@@ -1535,14 +1578,11 @@ def doctor(config_file: Path, runner_file: Path, api_call: ApiCall = telegram_ca
 
     agent_cmd = config.get("TAB_AGENT_CMD", "")
     if agent_cmd:
-        try:
-            first = shlex.split(agent_cmd)[0]
-        except (ValueError, IndexError):
-            first = ""
-        if first and shutil.which(first):
-            ok(f"Codex command found: {first}")
+        agent_check = agent_command_spawn_check(agent_cmd, os_name=current_os)
+        if agent_check.ok:
+            ok(agent_check.message)
         else:
-            warn(f"Codex command not found on PATH: {agent_cmd}")
+            warn(agent_check.message)
             warnings += 1
 
     if runner_file.exists():

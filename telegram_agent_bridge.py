@@ -12,6 +12,7 @@ import os
 import queue
 import re
 import shlex
+import shutil
 import stat
 import subprocess
 import sys
@@ -72,9 +73,30 @@ def expand_path(value: str) -> Path:
     return Path(os.path.expandvars(os.path.expanduser(value))).resolve()
 
 
+WINDOWS_BATCH_EXTENSIONS = {".bat", ".cmd"}
+
+
+def is_windows_runtime() -> bool:
+    return os.name == "nt" or sys.platform == "win32"
+
+
+def resolve_agent_cmd_for_spawn(agent_cmd: list[str]) -> list[str]:
+    if not agent_cmd or not is_windows_runtime():
+        return agent_cmd
+
+    first, *rest = agent_cmd
+    resolved = shutil.which(first) or first
+    if Path(resolved).suffix.lower() in WINDOWS_BATCH_EXTENSIONS:
+        cmd_exe = os.environ.get("COMSPEC") or shutil.which("cmd.exe") or shutil.which("cmd") or "cmd.exe"
+        return [cmd_exe, "/c", resolved, *rest]
+    if resolved != first:
+        return [resolved, *rest]
+    return agent_cmd
+
+
 def read_text(path: Path) -> str:
     try:
-        return path.read_text(encoding="utf-8").strip()
+        return path.read_text(encoding="utf-8", errors="replace").strip()
     except OSError:
         return ""
 
@@ -168,6 +190,7 @@ class Config:
             raise BridgeError(f"invalid shell-style config: {exc}") from exc
         if not agent_cmd:
             raise BridgeError("TAB_AGENT_CMD must contain at least one command word")
+        agent_cmd = resolve_agent_cmd_for_spawn(agent_cmd)
 
         local_input_default = (
             "~/.local/state/telegram-agent-bridge/input.fifo"
@@ -456,6 +479,8 @@ class Bridge:
                         cmd,
                         capture_output=True,
                         text=True,
+                        encoding="utf-8",
+                        errors="replace",
                         timeout=self.config.timeout,
                         stdin=subprocess.DEVNULL,
                         cwd=str(self.config.workdir),

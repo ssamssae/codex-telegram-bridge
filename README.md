@@ -408,7 +408,7 @@ Required settings are intentionally small and explicit.
 | `TAB_LOCAL_INPUT` | no | `~/.local/state/telegram-agent-bridge/input.fifo` on POSIX | Compatibility FIFO path for local terminal prompts and `CRB_SIGNAL_PATH` fallback. Set to `0`/`off` to disable. |
 | `TAB_STDIN_INPUT` | no | auto | Read local prompts from stdin. Defaults to on only when stdin is a TTY. |
 | `TAB_CODEX_DANGEROUS_BYPASS` | no | `0` | When `1`, adds `--dangerously-bypass-approvals-and-sandbox` to Codex. |
-| `TAB_CODEX_EXTRA_ARGS` | no | empty | Extra arguments inserted after `codex exec --json -o <tmp>`. |
+| `TAB_CODEX_EXTRA_ARGS` | no | empty | Extra arguments inserted after `codex exec --json -o <tmp>`. `setup --mode exec` writes `--skip-git-repo-check` by default. |
 | `CRB_TMUX_SOCKET` | repl only | `codex` | tmux socket for the visible Codex TUI. |
 | `CRB_TMUX_SESSION` | repl only | `codex` | tmux session or target for the visible Codex TUI. |
 | `CRB_TMUX_SUBMIT_KEY` | repl only | `Tab` | key sent after pasting Telegram prompts into Codex. |
