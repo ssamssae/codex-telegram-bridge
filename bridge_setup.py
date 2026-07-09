@@ -27,6 +27,7 @@ APP_NAME = "telegram-agent-bridge"
 SERVICE_NAME = "telegram-agent-bridge.service"
 LAUNCHD_LABEL = "com.user.telegram-agent-bridge"
 WINDOWS_TASK_NAME = APP_NAME
+WINDOWS_WATCHDOG_TASK_NAME = f"{APP_NAME}-watchdog"
 WATCHDOG_SERVICE_NAME = "telegram-agent-bridge-watchdog.service"
 WATCHDOG_TIMER_NAME = "telegram-agent-bridge-watchdog.timer"
 WATCHDOG_LAUNCHD_LABEL = "com.user.telegram-agent-bridge-watchdog"
@@ -834,6 +835,44 @@ def install_windows_scheduled_task(
     return f"Scheduled Task: {task_name}"
 
 
+def windows_watchdog_task_action() -> str:
+    python_bin = sys.executable or shutil.which("python") or shutil.which("python3") or "python"
+    return " ".join(windows_command_quote(part) for part in [str(python_bin), str(WATCHDOG_SCRIPT)])
+
+
+def install_windows_watchdog_task(
+    *,
+    start: bool,
+    task_name: str,
+    run: Callable[..., subprocess.CompletedProcess[str]],
+) -> str | None:
+    create = run(
+        [
+            "schtasks",
+            "/Create",
+            "/TN",
+            task_name,
+            "/SC",
+            "MINUTE",
+            "/MO",
+            "1",
+            "/TR",
+            windows_watchdog_task_action(),
+            "/F",
+        ]
+    )
+    if create.returncode != 0:
+        detail = command_output(create) or "unknown error"
+        warn(f"failed to create Windows watchdog Scheduled Task {task_name}: {detail}")
+        return None
+
+    if start:
+        started = run(["schtasks", "/Run", "/TN", task_name])
+        if started.returncode != 0:
+            warn(f"could not start Windows watchdog Scheduled Task {task_name}: {command_output(started)}")
+    return f"Scheduled Task: {task_name}"
+
+
 def powershell_invoke_command(executable: str, args: list[str]) -> str:
     return " ".join(["&", powershell_single_quote(executable), *[powershell_single_quote(arg) for arg in args]])
 
@@ -1035,11 +1074,11 @@ def install_watchdog(
         return plist_file
 
     if os_name == "Windows":
-        warn(
-            "Windows watchdog install is not automated; "
-            "setup installs the Startup launcher autostart only"
+        return install_windows_watchdog_task(
+            start=start,
+            task_name=WINDOWS_WATCHDOG_TASK_NAME,
+            run=run,
         )
-        return None
 
     warn(f"watchdog install is not automated for {os_name}")
     return None
@@ -1107,6 +1146,11 @@ def uninstall_watchdog(
             pass
         return
 
+    if os_name == "Windows":
+        run(["schtasks", "/End", "/TN", WINDOWS_WATCHDOG_TASK_NAME])
+        run(["schtasks", "/Delete", "/TN", WINDOWS_WATCHDOG_TASK_NAME, "/F"])
+        return
+
     warn(f"watchdog uninstall is not automated for {os_name}")
 
 
@@ -1141,7 +1185,7 @@ def watchdog_status(
     *,
     os_name: str | None = None,
     run: Callable[..., subprocess.CompletedProcess[str]] = run_command,
-    task_name: str = WINDOWS_TASK_NAME,
+    task_name: str = WINDOWS_WATCHDOG_TASK_NAME,
 ) -> str:
     os_name = os_name or platform.system()
     if os_name == "Linux":
@@ -1509,10 +1553,7 @@ def doctor(config_file: Path, runner_file: Path, api_call: ApiCall = telegram_ca
         warn(f"watchdog status: {wd_status}")
         if wd_status == "not-installed":
             if current_os == "Windows":
-                setup_note(
-                    "Windows watchdog install is not automated; "
-                    "the Startup launcher covers logon autostart but not periodic recovery."
-                )
+                add_next_step(f"Run setup again to install Windows watchdog: {setup_command_hint()}")
             else:
                 add_next_step(f"Run setup again to install service/watchdog: {setup_command_hint()}")
         warnings += 1

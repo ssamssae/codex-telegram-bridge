@@ -15,6 +15,7 @@ from typing import Callable
 APP_NAME = "telegram-agent-bridge"
 SERVICE_NAME = "telegram-agent-bridge.service"
 LAUNCHD_LABEL = "com.user.telegram-agent-bridge"
+WINDOWS_TASK_NAME = APP_NAME
 
 RunCommand = Callable[[list[str]], subprocess.CompletedProcess[str]]
 
@@ -39,6 +40,83 @@ def run_command(cmd: list[str]) -> subprocess.CompletedProcess[str]:
 
 def status_text(proc: subprocess.CompletedProcess[str]) -> str:
     return (proc.stdout or proc.stderr or "").strip()
+
+
+def default_windows_startup_dir() -> Path:
+    appdata = os.environ.get("APPDATA")
+    if appdata:
+        return (
+            Path(appdata)
+            / "Microsoft"
+            / "Windows"
+            / "Start Menu"
+            / "Programs"
+            / "Startup"
+        )
+    return (
+        Path.home()
+        / "AppData"
+        / "Roaming"
+        / "Microsoft"
+        / "Windows"
+        / "Start Menu"
+        / "Programs"
+        / "Startup"
+    )
+
+
+def default_windows_startup_launcher_file(
+    startup_dir: Path | None = None,
+    *,
+    app_name: str = APP_NAME,
+) -> Path:
+    return (startup_dir or default_windows_startup_dir()) / f"{app_name}.bat"
+
+
+def powershell_single_quote(value: str | Path) -> str:
+    return "'" + str(value).replace("'", "''") + "'"
+
+
+def windows_startup_launcher_start_command(launcher_file: Path) -> list[str]:
+    script = f"Start-Process -WindowStyle Hidden -FilePath {powershell_single_quote(launcher_file)}"
+    return [
+        "powershell.exe",
+        "-NoProfile",
+        "-ExecutionPolicy",
+        "Bypass",
+        "-Command",
+        script,
+    ]
+
+
+def parse_windows_scheduled_task_status(output: str) -> str:
+    for line in output.replace("\r\n", "\n").splitlines():
+        if ":" not in line:
+            continue
+        key, value = line.split(":", 1)
+        if key.strip().lower() == "status":
+            return value.strip() or "unknown"
+    return "unknown"
+
+
+def windows_scheduled_task_status(*, task_name: str, run: RunCommand) -> str:
+    proc = run(["schtasks", "/Query", "/TN", task_name, "/FO", "LIST", "/V"])
+    if proc.returncode != 0:
+        return "not-installed"
+    return parse_windows_scheduled_task_status(proc.stdout or proc.stderr or "")
+
+
+def windows_bridge_process_running(run: RunCommand) -> bool:
+    script = (
+        "$ErrorActionPreference='SilentlyContinue'; "
+        "$p = Get-CimInstance Win32_Process | Where-Object { "
+        "$_.ProcessId -ne $PID -and $_.CommandLine -and "
+        "$_.CommandLine -match 'telegram_agent_bridge\\.py|codex_repl_bridge\\.py|telegram-agent-bridge-run' "
+        "}; "
+        "if ($p) { 'running'; exit 0 } else { 'missing'; exit 1 }"
+    )
+    proc = run(["powershell.exe", "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", script])
+    return proc.returncode == 0
 
 
 def launchd_state(output: str) -> str:
@@ -130,12 +208,54 @@ def watch_macos(
     return 1
 
 
+def watch_windows(
+    *,
+    service_task_name: str,
+    startup_launcher: Path | None,
+    status_file: Path,
+    run: RunCommand,
+    settle_seconds: float,
+) -> int:
+    if windows_bridge_process_running(run):
+        write_status(status_file, "active", "windows-process")
+        return 0
+
+    task_status = windows_scheduled_task_status(task_name=service_task_name, run=run)
+    if task_status != "not-installed":
+        start = run(["schtasks", "/Run", "/TN", service_task_name])
+        if settle_seconds > 0:
+            time.sleep(settle_seconds)
+        if windows_bridge_process_running(run):
+            write_status(status_file, "recovered", f"windows-task:{service_task_name}")
+            return 0
+        detail = status_text(start) or f"windows-task:{service_task_name}:{task_status}:start-failed"
+        write_status(status_file, "failed", detail)
+        return 1
+
+    launcher = startup_launcher or default_windows_startup_launcher_file()
+    if launcher.exists():
+        start = run(windows_startup_launcher_start_command(launcher))
+        if settle_seconds > 0:
+            time.sleep(settle_seconds)
+        if windows_bridge_process_running(run):
+            write_status(status_file, "recovered", f"windows-startup:{launcher}")
+            return 0
+        detail = status_text(start) or f"windows-startup:{launcher}:process-not-detected"
+        write_status(status_file, "failed", detail)
+        return 1
+
+    write_status(status_file, "failed", "windows:not-installed")
+    return 1
+
+
 def watch_once(
     *,
     os_name: str | None = None,
     service_name: str = SERVICE_NAME,
     launchd_label: str = LAUNCHD_LABEL,
     launchd_plist: Path | None = None,
+    windows_service_task_name: str = WINDOWS_TASK_NAME,
+    windows_startup_launcher: Path | None = None,
     status_file: Path | None = None,
     run: RunCommand = run_command,
     settle_seconds: float = 2.0,
@@ -154,6 +274,14 @@ def watch_once(
             label=launchd_label,
             plist_file=launchd_plist
             or Path.home() / "Library" / "LaunchAgents" / f"{launchd_label}.plist",
+            status_file=status_file,
+            run=run,
+            settle_seconds=settle_seconds,
+        )
+    if os_name == "Windows":
+        return watch_windows(
+            service_task_name=windows_service_task_name,
+            startup_launcher=windows_startup_launcher,
             status_file=status_file,
             run=run,
             settle_seconds=settle_seconds,
