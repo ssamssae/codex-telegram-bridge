@@ -6,9 +6,6 @@ __pycache__/
 
 .venv/
 venv/
-build/
-dist/
-*.egg-info/
 
 .env
 *.env
@@ -17,5 +14,9 @@ dist/
 state/
 .state/
 *.log
+
+dist/
+build/
+*.egg-info/
 
 .DS_Store

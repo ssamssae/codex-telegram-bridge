@@ -281,9 +281,14 @@ class RecordingCodexRepl(repl.CodexRepl):
 
 
 def without_sent_directive_cards(messages):
-    # Terminal-origin prompts mirror one "sent directive" card; filter it out
-    # when a test only cares about the messages that follow.
-    return [message for message in messages if not message.startswith("📤 보낸 지시\n")]
+    # Terminal-origin prompts mirror one echo card (⌨️ for self-typed input,
+    # 📤 for cross-node directives); filter it out when a test only cares
+    # about the messages that follow.
+    return [
+        message
+        for message in messages
+        if not message.startswith(("📤 보낸 지시\n", "⌨️ 터미널 입력\n"))
+    ]
 
 
 class ReplBridgeTests(unittest.TestCase):
@@ -1293,11 +1298,11 @@ class ReplBridgeTests(unittest.TestCase):
             bridge.handle_user_event("typed directly in terminal")
             bridge.send_telegram_fallback("typed directly in terminal", 95)
 
-            # Terminal-origin prompts mirror a single "sent directive" card;
+            # Terminal-origin prompts mirror a single terminal-input echo card;
             # the fallback itself must not add anything on top of it.
             self.assertEqual(
                 telegram.sent,
-                ["📤 보낸 지시\n🤖 testnode → 🤖 testnode\ntyped directly in terminal"],
+                ["⌨️ 터미널 입력\ntyped directly in terminal"],
             )
 
     def test_liveness_recovers_typing_when_repl_is_busy(self):

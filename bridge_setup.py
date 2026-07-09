@@ -154,6 +154,17 @@ def doctor_command_hint() -> str:
     return "codex-telegram-bridge doctor"
 
 
+def setup_command_hint(*, mode: str | None = None) -> str:
+    invoked = Path(sys.argv[0]).name
+    if invoked in {"codex-telegram-bridge", "telegram-agent-bridge"}:
+        command = f"{invoked} setup"
+    else:
+        command = "python bridge_setup.py setup"
+    if mode:
+        command += f" --mode {mode}"
+    return command
+
+
 def shell_quote(value: str | Path | int | bool) -> str:
     return shlex.quote(str(value))
 
@@ -1371,12 +1382,18 @@ def setup_bridge(options: SetupOptions, api_call: ApiCall = telegram_call) -> in
 def doctor(config_file: Path, runner_file: Path, api_call: ApiCall = telegram_call) -> int:
     failures = 0
     warnings = 0
+    next_steps: list[str] = []
+
+    def add_next_step(command: str) -> None:
+        if command not in next_steps:
+            next_steps.append(command)
 
     if config_file.exists():
         ok(f"config exists: {config_file}")
         mode = file_mode(config_file)
-        if mode is not None and mode & 0o077:
+        if sys.platform != "win32" and mode is not None and mode & 0o077:
             warn(f"config permissions are too open: {oct(mode)}; run chmod 600")
+            add_next_step(f"chmod 600 {shell_quote(config_file)}")
             warnings += 1
     else:
         fail(f"config missing: {config_file}")
@@ -1437,15 +1454,34 @@ def doctor(config_file: Path, runner_file: Path, api_call: ApiCall = telegram_ca
     if mode == "repl":
         tmux_socket = config.get("CRB_TMUX_SOCKET", "codex")
         tmux_session = config.get("CRB_TMUX_SESSION", "codex")
-        if shutil.which("tmux"):
+        if sys.platform == "win32":
+            add_next_step(f"Windows native mode has no tmux; use exec mode: {setup_command_hint(mode='exec')}")
+        elif shutil.which("tmux"):
             proc = run_command(["tmux", "-L", tmux_socket, "has-session", "-t", f"={tmux_session}"])
             if proc.returncode == 0:
                 ok(f"tmux Codex session found: {tmux_socket}/{tmux_session}")
             else:
                 warn(f"tmux Codex session not found: {tmux_socket}/{tmux_session}")
+                codex_command = config.get("TAB_AGENT_CMD", "codex") or "codex"
+                add_next_step(
+                    " ".join(
+                        [
+                            "tmux",
+                            "-L",
+                            shell_quote(tmux_socket),
+                            "new",
+                            "-d",
+                            "-s",
+                            shell_quote(tmux_session),
+                            codex_command,
+                        ]
+                    )
+                )
+                add_next_step(f"To use it without tmux, switch to exec mode: {setup_command_hint(mode='exec')}")
                 warnings += 1
         else:
             warn("tmux not found on PATH; REPL mode requires tmux")
+            add_next_step(f"To use it without tmux, switch to exec mode: {setup_command_hint(mode='exec')}")
             warnings += 1
 
     status = service_status()
@@ -1453,6 +1489,8 @@ def doctor(config_file: Path, runner_file: Path, api_call: ApiCall = telegram_ca
         ok(f"service status: {status}")
     else:
         warn(f"service status: {status}")
+        if status == "not-installed":
+            add_next_step(f"Run setup again to install service/watchdog: {setup_command_hint()}")
         warnings += 1
 
     wd_status = watchdog_status()
@@ -1460,9 +1498,16 @@ def doctor(config_file: Path, runner_file: Path, api_call: ApiCall = telegram_ca
         ok(f"watchdog status: {wd_status}")
     else:
         warn(f"watchdog status: {wd_status}")
+        if wd_status == "not-installed":
+            add_next_step(f"Run setup again to install service/watchdog: {setup_command_hint()}")
         warnings += 1
 
     out("")
+    if next_steps:
+        out("Next steps:")
+        for command in next_steps:
+            out(f"  {command}")
+        out("")
     out(f"doctor complete: {failures} failure(s), {warnings} warning(s)")
     return 2 if failures else 0
 

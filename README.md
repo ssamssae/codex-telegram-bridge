@@ -215,6 +215,35 @@ python3 bridge_setup.py doctor
 
 5. Send `/ping` to the bot. Then send a normal prompt.
 
+## Windows quickstart (5 min)
+
+On native Windows, use `exec` mode unless you are already running Codex inside
+WSL with tmux. Open PowerShell:
+
+```powershell
+py -m pip install --user pipx
+py -m pipx ensurepath
+```
+
+Close and reopen PowerShell if `pipx` was just added to PATH, then install and
+run the setup wizard:
+
+```powershell
+pipx install codex-telegram-bridge
+codex-telegram-bridge setup --mode exec
+codex-telegram-bridge doctor
+```
+
+If you installed from a clone instead, run the same flow from the clone folder:
+
+```powershell
+py bridge_setup.py setup --mode exec
+py bridge_setup.py doctor
+```
+
+`doctor` should finish with zero failures. If it prints a warning, follow the
+`Next steps` command printed above the summary, then run `doctor` again.
+
 Token safety rule: BotFather shows the token in Telegram, but you should copy it
 from BotFather and paste it into the local setup wizard in your terminal. In
 Telegram, send only `/start` or normal prompts to your bot.

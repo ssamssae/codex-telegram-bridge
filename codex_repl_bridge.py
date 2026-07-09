@@ -63,6 +63,9 @@ FLOW_MIRROR_EDIT_MIN_SECONDS = 1.0
 # 토글 게이트. claude-telegram-bridge.py 의 '📥 받은 지시'(PR#248, node-origin 직접감지)와 한 쌍.
 AMBIENT_DIRECTIVE_HEADER = "📥 받은 지시"
 SENT_DIRECTIVE_HEADER = "📤 보낸 지시"
+# T-260709-56: 터미널 에코(자기→자기)는 라우팅 줄이 "라이덴 → 라이덴" 으로 읽혀 혼선 —
+# 자기 노드 입력은 ⌨️ 헤더 + 본문만. 노드간(from≠to)은 📤 라우팅 카드 유지.
+TERMINAL_INPUT_HEADER = "⌨️ 터미널 입력"
 AMBIENT_DIRECTIVE_LIMIT = 400
 DIRECTIVE_SIGNAL_ENV = "CRB_DIRECTIVE_SIGNAL_PATH"
 # Codex REPL "dead/interrupted mid-turn" markers. When these appear at the
@@ -920,6 +923,9 @@ def format_sent_directive(text: str, from_alias: str, to_alias: str) -> str:
     body = strip_inline_node_emoji_header(strip_node_emoji_header(text or "")).strip()
     if not body:
         return ""
+    if (from_alias or "").strip() == (to_alias or "").strip():
+        gist = body[:AMBIENT_DIRECTIVE_LIMIT].strip()
+        return f"{TERMINAL_INPUT_HEADER}\n{gist}" if gist else ""
     sender_label, sender_emoji = node_label_emoji(from_alias)
     receiver_label, receiver_emoji = node_label_emoji(to_alias)
     sender = f"{sender_emoji} {sender_label}".strip()
@@ -3598,6 +3604,15 @@ class Bridge:
                     return True
         return False
 
+    def active_telegram_prompt_matches(self, prompt: str) -> bool:
+        normalized = normalize_prompt(prompt)
+        if not normalized:
+            return False
+        active = self.active_prompt_for_recovery()
+        if active != normalized:
+            return False
+        return self.startup_recovery_has_recent_active_prompt(active)
+
     def mark_repl_activity(self) -> None:
         with self.lock:
             self.last_repl_activity_at = time.monotonic()
@@ -3619,6 +3634,11 @@ class Bridge:
             self.current_origin = "telegram"
             log("JSONL", "matched Telegram-origin prompt")
             self.begin_repl_typing()
+        elif self.active_telegram_prompt_matches(text):
+            self.current_origin = "telegram"
+            log("JSONL", "matched active Telegram-origin prompt")
+            self.emit_received_telegram_directive_card(text)
+            self.begin_repl_typing()
         else:
             self.current_origin = "terminal"
             self.stop_telegram_fallback()
@@ -3638,6 +3658,17 @@ class Bridge:
             log("SEND", "sent-directive echo failed")
             return
         log("SEND", "sent terminal-origin directive card")
+
+    def emit_received_telegram_directive_card(self, text: str) -> None:
+        if self.config.bridge_kill:
+            return
+        message = format_ambient_directive(text, from_node=None, task=None)
+        if not message:
+            return
+        if not self.telegram.send(message):
+            log("SEND", "received-directive telegram echo failed")
+            return
+        log("SEND", "sent received-directive telegram echo")
 
     def handle_reasoning_event(self, text: str, key: str) -> None:
         if is_copy_payload_message(text):
