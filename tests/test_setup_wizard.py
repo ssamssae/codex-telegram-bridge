@@ -5,6 +5,7 @@ import subprocess
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 import bridge_setup as setup
 
@@ -174,7 +175,23 @@ class SetupWizardTests(unittest.TestCase):
         self.assertIn("/mnt/c/Users/Ada/very-long-profile-segment", xml_text)
         self.assertIn(("schtasks", "/Run", "/TN", "tab-test-autostart"), commands)
 
-    def test_install_service_windows_installs_startup_launcher_without_schtasks(self):
+    def test_install_runner_windows_writes_python_runner_with_lf(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            runner = Path(tmpdir) / "telegram-agent-bridge-run"
+            env_file = Path(r"C:\Users\gb\.config\telegram-agent-bridge.env")
+
+            setup.install_runner(runner, env_file, os_name="Windows")
+
+            raw = runner.read_bytes()
+            text = raw.decode("utf-8")
+            self.assertNotIn(b"\r", raw)
+            self.assertIn("import os", text)
+            self.assertIn("shlex.split", text)
+            self.assertIn(repr(str(env_file)), text)
+            self.assertIn("telegram_agent_bridge.py", text)
+            self.assertNotIn("set -euo pipefail", text)
+
+    def test_install_service_windows_installs_native_startup_launcher_without_bash(self):
         commands = []
 
         def run(cmd, check=False):
@@ -183,22 +200,26 @@ class SetupWizardTests(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as tmpdir:
             startup_dir = Path(tmpdir) / "Startup"
-            installed = setup.install_service(
-                Path(r"C:\Users\gb\.local\bin\telegram-agent-bridge-run"),
-                os_name="Windows",
-                run=run,
-                task_name="telegram-agent-bridge",
-                bash_host=setup.WindowsBashHost(kind="git-bash", executable=r"C:\Program Files\Git\bin\bash.exe"),
-                windows_startup_dir=startup_dir,
-            )
+            with mock.patch.object(setup.sys, "executable", r"C:\Python312\python.exe"):
+                installed = setup.install_service(
+                    Path(r"C:\Users\gb\.local\bin\telegram-agent-bridge-run"),
+                    os_name="Windows",
+                    run=run,
+                    task_name="telegram-agent-bridge",
+                    bash_host=setup.WindowsBashHost(kind="git-bash", executable=r"C:\Program Files\Git\bin\bash.exe"),
+                    windows_startup_dir=startup_dir,
+                )
 
             launcher = startup_dir / "telegram-agent-bridge.bat"
             self.assertEqual(installed, launcher)
             self.assertTrue(launcher.exists())
             launcher_text = launcher.read_text(encoding="utf-8")
             self.assertIn("Start-Process", launcher_text)
-            self.assertIn("C:\\Program Files\\Git\\bin\\bash.exe", launcher_text)
-            self.assertIn("/c/Users/gb/.local/bin/telegram-agent-bridge-run", launcher_text)
+            self.assertIn(r"C:\Python312\python.exe", launcher_text)
+            self.assertIn(r"C:\Users\gb\.local\bin\telegram-agent-bridge-run", launcher_text)
+            self.assertNotIn("bash.exe", launcher_text)
+            self.assertNotIn("wsl.exe", launcher_text)
+            self.assertNotIn("/c/Users/gb", launcher_text)
             self.assertIn(">NUL 2>NUL", launcher_text)
 
         self.assertNotIn(("schtasks", "/Create"), [cmd[:2] for cmd in commands])
@@ -215,8 +236,11 @@ class SetupWizardTests(unittest.TestCase):
             launcher.write_text("@echo off\n", encoding="utf-8")
 
             def missing_task(cmd, check=False):
-                self.assertEqual(cmd[:4], ["schtasks", "/Query", "/TN", "telegram-agent-bridge"])
-                return completed(cmd, returncode=1, stderr="ERROR: Access is denied.\r\n")
+                if cmd[:4] == ["schtasks", "/Query", "/TN", "telegram-agent-bridge"]:
+                    return completed(cmd, returncode=1, stderr="ERROR: Access is denied.\r\n")
+                if cmd[0] == "powershell.exe" and "Get-CimInstance" in cmd[-1]:
+                    return completed(cmd, returncode=1, stdout="missing")
+                self.fail(f"unexpected command: {cmd}")
 
             self.assertEqual(
                 setup.service_status(
@@ -227,6 +251,26 @@ class SetupWizardTests(unittest.TestCase):
                 ),
                 "startup-installed",
             )
+
+            def running_process(cmd, check=False):
+                if cmd[:4] == ["schtasks", "/Query", "/TN", "telegram-agent-bridge"]:
+                    return completed(cmd, returncode=1, stderr="ERROR: Access is denied.\r\n")
+                if cmd[0] == "powershell.exe" and "Get-CimInstance" in cmd[-1]:
+                    return completed(cmd, returncode=0, stdout="running")
+                self.fail(f"unexpected command: {cmd}")
+
+            self.assertEqual(
+                setup.service_status(
+                    os_name="Windows",
+                    run=running_process,
+                    task_name="telegram-agent-bridge",
+                    windows_startup_dir=startup_dir,
+                ),
+                "running",
+            )
+
+    def test_windows_startup_installed_is_not_running(self):
+        self.assertFalse(setup.service_is_running("startup-installed"))
 
     def test_windows_service_status_parses_schtasks_query(self):
         def running(cmd, check=False):
@@ -276,7 +320,7 @@ class SetupWizardTests(unittest.TestCase):
         self.assertIn("/ping", params["text"])
         self.assertIn("schtasks /Run /TN telegram-agent-bridge", params["text"])
 
-    def test_setup_complete_message_treats_windows_startup_launcher_as_ready(self):
+    def test_setup_complete_message_treats_windows_startup_launcher_as_not_confirmed_running(self):
         api = FakeApi()
 
         self.assertTrue(
@@ -291,9 +335,9 @@ class SetupWizardTests(unittest.TestCase):
 
         _token, method, _timeout, params = api.calls[-1]
         self.assertEqual(method, "sendMessage")
-        self.assertIn("Windows Startup autostart is installed", params["text"])
+        self.assertIn("Background service is not running (startup-installed)", params["text"])
         self.assertIn("/ping", params["text"])
-        self.assertNotIn("Start it with", params["text"])
+        self.assertIn("Start it with", params["text"])
 
     def test_noninteractive_setup_writes_config_and_runner(self):
         with tempfile.TemporaryDirectory() as tmpdir:

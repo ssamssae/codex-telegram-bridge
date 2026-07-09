@@ -149,7 +149,7 @@ def setup_command(command: str) -> None:
 def doctor_command_hint() -> str:
     invoked = Path(sys.argv[0]).name
     if invoked == "bridge_setup.py":
-        python_cmd = "python" if platform.system() == "Windows" else "python3"
+        python_cmd = windows_command_quote(sys.executable or "python") if platform.system() == "Windows" else "python3"
         return f"{python_cmd} bridge_setup.py doctor"
     if invoked in {"codex-telegram-bridge", "telegram-agent-bridge"}:
         return f"{invoked} doctor"
@@ -160,6 +160,8 @@ def setup_command_hint(*, mode: str | None = None) -> str:
     invoked = Path(sys.argv[0]).name
     if invoked in {"codex-telegram-bridge", "telegram-agent-bridge"}:
         command = f"{invoked} setup"
+    elif platform.system() == "Windows":
+        command = f"{windows_command_quote(sys.executable or 'python')} bridge_setup.py setup"
     else:
         command = "python bridge_setup.py setup"
     if mode:
@@ -188,7 +190,7 @@ def chmod_private(path: Path) -> None:
 def write_text_atomic(path: Path, value: str, mode: int | None = None) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_name(path.name + ".tmp")
-    tmp.write_text(value, encoding="utf-8")
+    tmp.write_text(value, encoding="utf-8", newline="\n")
     if mode is not None:
         tmp.chmod(mode)
     tmp.replace(path)
@@ -321,7 +323,7 @@ def wait_for_chat_id(
 
 
 def service_is_running(status: str | None) -> bool:
-    return (status or "").strip().lower() in {"active", "running", "startup-installed"}
+    return (status or "").strip().lower() in {"active", "running"}
 
 
 def send_test_message(
@@ -332,12 +334,7 @@ def send_test_message(
     service_status_text: str | None = None,
     start_command: str | None = None,
 ) -> bool:
-    if (service_status_text or "").strip().lower() == "startup-installed":
-        text = (
-            "telegram-agent-bridge setup complete. Windows Startup autostart is installed "
-            "and was launched. Send /ping to test the bridge."
-        )
-    elif service_status_text and service_is_running(service_status_text):
+    if service_status_text and service_is_running(service_status_text):
         text = "telegram-agent-bridge setup complete. Background service is running. Send /ping to test the bridge."
     elif start_command:
         status = service_status_text or "unknown"
@@ -421,7 +418,61 @@ def write_env_config(
     write_text_atomic(path, content, mode=0o600)
 
 
-def install_runner(runner_file: Path, env_file: Path) -> None:
+def python_runner_content(env_file: Path) -> str:
+    return "\n".join(
+        [
+            "#!/usr/bin/env python3",
+            "import os",
+            "import shlex",
+            "import subprocess",
+            "import sys",
+            "from pathlib import Path",
+            "",
+            f"ENV_FILE = Path({str(env_file)!r})",
+            f"REPL_SCRIPT = Path({str(REPL_BRIDGE_SCRIPT)!r})",
+            f"EXEC_SCRIPT = Path({str(EXEC_BRIDGE_SCRIPT)!r})",
+            "",
+            "if not ENV_FILE.exists():",
+            "    print(f\"config file not found: {ENV_FILE}\", file=sys.stderr)",
+            "    raise SystemExit(2)",
+            "",
+            "for raw_line in ENV_FILE.read_text(encoding='utf-8').splitlines():",
+            "    line = raw_line.strip()",
+            "    if not line or line.startswith('#') or '=' not in line:",
+            "        continue",
+            "    key, raw_value = line.split('=', 1)",
+            "    key = key.strip()",
+            "    raw_value = raw_value.strip()",
+            "    try:",
+            "        parts = shlex.split(raw_value)",
+            "        value = parts[0] if parts else ''",
+            "    except ValueError:",
+            "        value = raw_value.strip(\"'\\\"\")",
+            "    if key:",
+            "        os.environ[key] = value",
+            "",
+            "mode = os.environ.get('TAB_BRIDGE_MODE', 'repl')",
+            "if mode == 'repl':",
+            "    script = REPL_SCRIPT",
+            "elif mode == 'exec':",
+            "    script = EXEC_SCRIPT",
+            "else:",
+            "    print(f\"unknown TAB_BRIDGE_MODE: {mode}\", file=sys.stderr)",
+            "    raise SystemExit(2)",
+            "",
+            "os.environ.setdefault('PYTHONUNBUFFERED', '1')",
+            "raise SystemExit(subprocess.call([sys.executable, str(script)]))",
+            "",
+        ]
+    )
+
+
+def install_runner(runner_file: Path, env_file: Path, *, os_name: str | None = None) -> None:
+    os_name = os_name or platform.system()
+    if os_name == "Windows":
+        write_text_atomic(runner_file, python_runner_content(env_file), mode=0o755)
+        return
+
     runner = "\n".join(
         [
             "#!/usr/bin/env bash",
@@ -769,6 +820,14 @@ def windows_command_quote(value: str) -> str:
     return value
 
 
+def windows_python_executable() -> str:
+    return sys.executable or shutil.which("python") or "python"
+
+
+def windows_python_runner_command(runner_file: Path) -> tuple[str, list[str]]:
+    return windows_python_executable(), [str(runner_file)]
+
+
 def windows_manual_start_command(host: WindowsBashHost, runner_file: Path) -> str:
     if host.kind == "wsl":
         args: list[str] = []
@@ -790,10 +849,8 @@ def manual_start_command_for_runner(
 ) -> str:
     os_name = os_name or platform.system()
     if os_name == "Windows":
-        try:
-            return windows_manual_start_command(detect_windows_bash_host(run=run), runner_file)
-        except SetupError:
-            return str(runner_file)
+        executable, args = windows_python_runner_command(runner_file)
+        return " ".join(windows_command_quote(part) for part in [executable, *args])
     return str(runner_file)
 
 
@@ -877,28 +934,13 @@ def powershell_invoke_command(executable: str, args: list[str]) -> str:
     return " ".join(["&", powershell_single_quote(executable), *[powershell_single_quote(arg) for arg in args]])
 
 
-def windows_startup_launcher_command(host: WindowsBashHost, runner_file: Path) -> tuple[str, str]:
-    executable, args = windows_bash_host_runner_command(host, runner_file)
-    inner = powershell_invoke_command(executable, args)
-    nested_args = [
-        "-NoProfile",
-        "-ExecutionPolicy",
-        "Bypass",
-        "-Command",
-        inner,
-    ]
-    quoted_args = ", ".join(powershell_single_quote(arg) for arg in nested_args)
-    script = (
-        "Start-Process -WindowStyle Hidden "
-        f"-FilePath {powershell_single_quote('powershell.exe')} "
-        f"-ArgumentList @({quoted_args})"
-    )
-    script_arg = '"' + script.replace('"', '`"') + '"'
-    return "powershell.exe", f"-NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -Command {script_arg}"
+def windows_startup_launcher_command(runner_file: Path) -> tuple[str, str]:
+    executable, args = windows_python_runner_command(runner_file)
+    return windows_scheduled_task_exec(executable, args)
 
 
-def windows_startup_launcher_content(host: WindowsBashHost, runner_file: Path) -> str:
-    command, arguments = windows_startup_launcher_command(host, runner_file)
+def windows_startup_launcher_content(runner_file: Path) -> str:
+    command, arguments = windows_startup_launcher_command(runner_file)
     return "\r\n".join(
         [
             "@echo off",
@@ -918,16 +960,12 @@ def install_windows_startup_launcher(
     startup_dir: Path | None = None,
     app_name: str = APP_NAME,
 ) -> Path | None:
-    try:
-        host = bash_host or detect_windows_bash_host(run=run)
-    except SetupError as exc:
-        warn(str(exc))
-        return None
+    _ = bash_host
 
     launcher_file = default_windows_startup_launcher_file(startup_dir, app_name=app_name)
     write_text_atomic(
         launcher_file,
-        windows_startup_launcher_content(host, runner_file),
+        windows_startup_launcher_content(runner_file),
         mode=0o644,
     )
     if start:
@@ -956,6 +994,19 @@ def windows_scheduled_task_status(
     if proc.returncode != 0:
         return "not-installed"
     return parse_windows_scheduled_task_status(proc.stdout or proc.stderr or "")
+
+
+def windows_bridge_process_running(run: Callable[..., subprocess.CompletedProcess[str]]) -> bool:
+    script = (
+        "$ErrorActionPreference='SilentlyContinue'; "
+        "$p = Get-CimInstance Win32_Process | Where-Object { "
+        "$_.ProcessId -ne $PID -and $_.CommandLine -and "
+        "$_.CommandLine -match 'telegram_agent_bridge\\.py|codex_repl_bridge\\.py|telegram-agent-bridge-run' "
+        "} | Select-Object -First 1; "
+        "if ($p) { 'running'; exit 0 } else { 'missing'; exit 1 }"
+    )
+    proc = run(["powershell.exe", "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", script])
+    return proc.returncode == 0
 
 
 def windows_startup_launcher_status(
@@ -1177,6 +1228,8 @@ def service_status(
         task_status = windows_scheduled_task_status(task_name=task_name, run=run)
         if task_status != "not-installed":
             return task_status
+        if windows_bridge_process_running(run):
+            return "running"
         return windows_startup_launcher_status(windows_startup_dir, app_name=task_name)
     return "manual"
 
@@ -1367,13 +1420,13 @@ def setup_bridge(options: SetupOptions, api_call: ApiCall = telegram_call) -> in
     ok(f"wrote private config: {options.config_file}")
     setup_note("The config file is chmod 600 and should stay out of git.")
 
-    install_runner(options.runner_file, options.config_file)
+    current_os = platform.system()
+    install_runner(options.runner_file, options.config_file, os_name=current_os)
     ok(f"installed runner: {options.runner_file}")
 
     setup_step(5, "Install the background service")
     service_state: str | None = None
     start_command: str | None = None
-    current_os = platform.system()
     if options.install_service:
         installed = install_service(options.runner_file, start=options.start_service)
         if installed:
@@ -1381,7 +1434,12 @@ def setup_bridge(options: SetupOptions, api_call: ApiCall = telegram_call) -> in
             ok(f"installed service: {installed}")
             service_state = service_status()
             if options.start_service:
-                ok(f"service status: {service_state}")
+                if service_is_running(service_state):
+                    ok(f"service status: {service_state}")
+                else:
+                    warn(f"service status: {service_state}")
+                    if current_os == "Windows" and service_state == "startup-installed":
+                        setup_note("Windows Startup autostart exists, but the bridge process is not confirmed running.")
         else:
             start_command = manual_start_command_for_runner(options.runner_file, os_name=current_os)
             warn("service install did not complete; run the bridge manually")
@@ -1544,6 +1602,8 @@ def doctor(config_file: Path, runner_file: Path, api_call: ApiCall = telegram_ca
                 add_next_step(f"Install Windows Startup autostart: {setup_command_hint()}")
             else:
                 add_next_step(f"Run setup again to install service/watchdog: {setup_command_hint()}")
+        elif current_os == "Windows" and status == "startup-installed":
+            add_next_step(f"Start Windows Startup launcher: {service_start_command(os_name=current_os, runner_file=runner_file)}")
         warnings += 1
 
     wd_status = watchdog_status()
