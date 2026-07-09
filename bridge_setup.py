@@ -148,7 +148,8 @@ def setup_command(command: str) -> None:
 def doctor_command_hint() -> str:
     invoked = Path(sys.argv[0]).name
     if invoked == "bridge_setup.py":
-        return "python3 bridge_setup.py doctor"
+        python_cmd = "python" if sys.platform == "win32" else "python3"
+        return f"{python_cmd} bridge_setup.py doctor"
     if invoked in {"codex-telegram-bridge", "telegram-agent-bridge"}:
         return f"{invoked} doctor"
     return "codex-telegram-bridge doctor"
@@ -1494,7 +1495,9 @@ def doctor(config_file: Path, runner_file: Path, api_call: ApiCall = telegram_ca
         warnings += 1
 
     wd_status = watchdog_status()
-    if wd_status.strip().lower() in {"active", "running", "loaded", "ready"}:
+    if sys.platform == "win32" and wd_status == "not-installed":
+        ok("watchdog status: not-installed (Windows Startup autostart does not use watchdog)")
+    elif wd_status.strip().lower() in {"active", "running", "loaded", "ready"}:
         ok(f"watchdog status: {wd_status}")
     else:
         warn(f"watchdog status: {wd_status}")

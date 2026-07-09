@@ -4,6 +4,7 @@ import io
 import subprocess
 import tempfile
 import unittest
+from unittest import mock
 from pathlib import Path
 
 import bridge_setup as setup
@@ -294,6 +295,87 @@ class SetupWizardTests(unittest.TestCase):
         self.assertIn("Windows Startup autostart is installed", params["text"])
         self.assertIn("/ping", params["text"])
         self.assertNotIn("Start it with", params["text"])
+
+    def test_win32_try_it_now_uses_python_not_python3(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            base = Path(tmpdir)
+            api = FakeApi()
+            buffer = io.StringIO()
+            with mock.patch.object(setup.sys, "platform", "win32"), \
+                    mock.patch.object(setup.sys, "argv", ["bridge_setup.py"]), \
+                    mock.patch.object(setup.shutil, "which", return_value="/usr/bin/codex"), \
+                    contextlib.redirect_stdout(buffer):
+                rc = setup.setup_bridge(
+                    setup.SetupOptions(
+                        config_file=base / "bridge.env",
+                        runner_file=base / "bridge-run",
+                        mode="exec",
+                        token="token",
+                        chat_id="12345",
+                        agent="codex",
+                        agent_cmd="codex",
+                        workdir=base,
+                        prefix="BOT",
+                        prefix_line=False,
+                        state_dir=base / "state",
+                        dangerous_bypass=False,
+                        tmux_socket="codex",
+                        tmux_session="codex",
+                        submit_key="Tab",
+                        install_asr=False,
+                        wait_timeout=1,
+                        install_service=False,
+                        start_service=False,
+                        send_test=False,
+                        non_interactive=True,
+                        yes=True,
+                    ),
+                    api_call=api,
+                )
+
+            output = buffer.getvalue()
+            self.assertEqual(rc, 0)
+            self.assertIn("Run a health check any time: python bridge_setup.py doctor", output)
+            self.assertNotIn("python3 bridge_setup.py doctor", output)
+
+    def test_win32_doctor_does_not_prescribe_setup_for_watchdog(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            base = Path(tmpdir)
+            env_file = base / "bridge.env"
+            runner = base / "bridge-run"
+            state_dir = base / "state"
+            setup.write_env_config(
+                env_file,
+                mode="exec",
+                token="token",
+                chat_id="12345",
+                agent="codex",
+                agent_cmd="python3",
+                workdir=base,
+                prefix="BOT",
+                prefix_line=False,
+                state_dir=state_dir,
+                local_input=state_dir / "input.fifo",
+                dangerous_bypass=False,
+                tmux_socket="codex",
+                tmux_session="codex",
+                submit_key="Tab",
+                audio_transcribe_cmd="",
+            )
+            setup.install_runner(runner, env_file)
+
+            buffer = io.StringIO()
+            with mock.patch.object(setup.sys, "platform", "win32"), \
+                    mock.patch.object(setup.shutil, "which", return_value="/usr/bin/python3"), \
+                    mock.patch.object(setup, "service_status", return_value="startup-installed"), \
+                    mock.patch.object(setup, "watchdog_status", return_value="not-installed"), \
+                    contextlib.redirect_stdout(buffer):
+                rc = setup.doctor(env_file, runner, api_call=FakeApi())
+
+            output = buffer.getvalue()
+            self.assertEqual(rc, 0)
+            self.assertIn("Windows Startup autostart does not use watchdog", output)
+            self.assertNotIn("Run setup again to install service/watchdog", output)
 
     def test_noninteractive_setup_writes_config_and_runner(self):
         with tempfile.TemporaryDirectory() as tmpdir:
