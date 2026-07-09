@@ -148,7 +148,8 @@ def setup_command(command: str) -> None:
 def doctor_command_hint() -> str:
     invoked = Path(sys.argv[0]).name
     if invoked == "bridge_setup.py":
-        return "python3 bridge_setup.py doctor"
+        python_cmd = "python" if platform.system() == "Windows" else "python3"
+        return f"{python_cmd} bridge_setup.py doctor"
     if invoked in {"codex-telegram-bridge", "telegram-agent-bridge"}:
         return f"{invoked} doctor"
     return "codex-telegram-bridge doctor"
@@ -1034,6 +1035,10 @@ def install_watchdog(
         return plist_file
 
     if os_name == "Windows":
+        warn(
+            "Windows watchdog install is not automated; "
+            "setup installs the Startup launcher autostart only"
+        )
         return None
 
     warn(f"watchdog install is not automated for {os_name}")
@@ -1383,6 +1388,7 @@ def doctor(config_file: Path, runner_file: Path, api_call: ApiCall = telegram_ca
     failures = 0
     warnings = 0
     next_steps: list[str] = []
+    current_os = platform.system()
 
     def add_next_step(command: str) -> None:
         if command not in next_steps:
@@ -1490,7 +1496,10 @@ def doctor(config_file: Path, runner_file: Path, api_call: ApiCall = telegram_ca
     else:
         warn(f"service status: {status}")
         if status == "not-installed":
-            add_next_step(f"Run setup again to install service/watchdog: {setup_command_hint()}")
+            if current_os == "Windows":
+                add_next_step(f"Install Windows Startup autostart: {setup_command_hint()}")
+            else:
+                add_next_step(f"Run setup again to install service/watchdog: {setup_command_hint()}")
         warnings += 1
 
     wd_status = watchdog_status()
@@ -1499,7 +1508,13 @@ def doctor(config_file: Path, runner_file: Path, api_call: ApiCall = telegram_ca
     else:
         warn(f"watchdog status: {wd_status}")
         if wd_status == "not-installed":
-            add_next_step(f"Run setup again to install service/watchdog: {setup_command_hint()}")
+            if current_os == "Windows":
+                setup_note(
+                    "Windows watchdog install is not automated; "
+                    "the Startup launcher covers logon autostart but not periodic recovery."
+                )
+            else:
+                add_next_step(f"Run setup again to install service/watchdog: {setup_command_hint()}")
         warnings += 1
 
     out("")

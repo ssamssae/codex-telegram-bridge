@@ -105,7 +105,7 @@ Answer media attachments
   -> send the actual media with sendPhoto/sendVideo/sendVoice/sendAudio
 
 Service restart
-  -> run a local watchdog every 60 seconds when installed as a service
+  -> run a local watchdog every 60 seconds on Linux/WSL and macOS
   -> restart or kickstart the bridge if the user service is inactive
   -> load a persistent JSONL cursor and final-answer dedup ring
   -> resume from the cursor when it still matches the current session file
@@ -191,8 +191,9 @@ The wizard will:
 - write a private `~/.config/telegram-agent-bridge.env` with mode `0600`
 - install `~/.local/bin/telegram-agent-bridge-run`
 - install and start a user service with systemd on Linux/WSL, launchd on macOS,
-  or a per-user Windows Scheduled Task
-- install a watchdog timer/LaunchAgent that recovers an inactive bridge service
+  or a per-user Windows Startup launcher
+- install a watchdog timer/LaunchAgent on Linux/WSL and macOS that recovers an
+  inactive bridge service
 - send a setup-complete test message
 
 Default setup mode is `repl`, which supports the visible Codex CLI transcript,
@@ -476,8 +477,8 @@ service was restarting.
 
 ## Service Watchdog
 
-When the setup wizard installs a background service, it also installs a small
-watchdog.
+When the setup wizard installs a background service on Linux/WSL or macOS, it
+also installs a small watchdog.
 
 On Windows, the wizard writes a per-user Startup launcher at
 `%APPDATA%\Microsoft\Windows\Start Menu\Programs\Startup\telegram-agent-bridge.bat`.
@@ -485,7 +486,9 @@ This does not require administrator rights. Setup also starts that launcher once
 immediately so you can send `/ping` without logging out and back in. If an older
 per-user `telegram-agent-bridge` Scheduled Task exists, `doctor` still reports
 its `schtasks /query` status; otherwise it reports whether the Startup launcher
-is installed.
+is installed. Windows watchdog install is not automated; `doctor` reports that
+Startup autostart is the supported Windows path instead of recommending another
+setup run for watchdog.
 
 On Linux and WSL, the wizard writes:
 
