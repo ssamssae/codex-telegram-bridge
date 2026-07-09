@@ -17,10 +17,10 @@ Default `repl` mode is REPL sync, not a separate hidden chat. Your terminal
 stays the source of truth, the transcript remains readable, and Telegram becomes
 the remote control when you are away from the keyboard.
 
-Install with `pipx`, then run the setup wizard:
+Install from PyPI with `pipx`, then run the setup wizard:
 
 ```bash
-pipx install "git+https://github.com/ssamssae/codex-telegram-bridge.git@v0.5.1"
+pipx install codex-telegram-bridge
 codex-telegram-bridge setup
 codex-telegram-bridge doctor
 ```

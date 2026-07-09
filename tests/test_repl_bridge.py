@@ -184,7 +184,7 @@ class FakeTelegram:
         self.downloads.append((file_id, path, allowed_extensions))
         return path
 
-    def send(self, text):
+    def send(self, text, reply_to_message_id=None):
         self.sent.append(text)
         return True
 
@@ -278,6 +278,12 @@ class RecordingCodexRepl(repl.CodexRepl):
 
     def sent_keys(self):
         return [args[-1] for args, _input_text in self.calls if args and args[0] == "send-keys"]
+
+
+def without_sent_directive_cards(messages):
+    # Terminal-origin prompts mirror one "sent directive" card; filter it out
+    # when a test only cares about the messages that follow.
+    return [message for message in messages if not message.startswith("📤 보낸 지시\n")]
 
 
 class ReplBridgeTests(unittest.TestCase):
@@ -618,7 +624,7 @@ class ReplBridgeTests(unittest.TestCase):
                 )
             )
 
-            self.assertEqual(telegram.sent, ["goal updated"])
+            self.assertEqual(without_sent_directive_cards(telegram.sent), ["goal updated"])
 
     def test_goal_copy_payload_commentary_sends_plain_before_final(self):
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -1060,7 +1066,10 @@ class ReplBridgeTests(unittest.TestCase):
                 self.assertTrue(bridge.process_line(line, cursor, cursor + len(line)))
                 cursor += len(line)
 
-            self.assertEqual(telegram.sent, [f"{repl.FLOW_MIRROR_HEADER}\n서비스 확인 중", "완료"])
+            self.assertEqual(
+                without_sent_directive_cards(telegram.sent),
+                [f"{repl.FLOW_MIRROR_HEADER}\n서비스 확인 중", "완료"],
+            )
 
     def test_duplicate_progress_text_sends_flow_mirror_once_per_turn(self):
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -1101,7 +1110,7 @@ class ReplBridgeTests(unittest.TestCase):
                 cursor += len(line)
 
             self.assertEqual(
-                telegram.sent,
+                without_sent_directive_cards(telegram.sent),
                 [f"{repl.FLOW_MIRROR_HEADER}\n{progress}", "머지 라우팅 GO"],
             )
 
@@ -1137,7 +1146,7 @@ class ReplBridgeTests(unittest.TestCase):
                 self.assertTrue(bridge.process_line(line, cursor, cursor + len(line)))
                 cursor += len(line)
 
-            self.assertEqual(telegram.sent, ["완료"])
+            self.assertEqual(without_sent_directive_cards(telegram.sent), ["완료"])
 
     def test_reasoning_summary_mirrors_after_final_answer(self):
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -1176,7 +1185,7 @@ class ReplBridgeTests(unittest.TestCase):
 
             # Answer first, then the 🧠 reasoning mirror.
             self.assertEqual(
-                telegram.sent,
+                without_sent_directive_cards(telegram.sent),
                 ["완료", f"{repl.REASONING_HEADER}\n옵션을 비교해 가장 빠른 경로를 택함"],
             )
 
@@ -1215,7 +1224,7 @@ class ReplBridgeTests(unittest.TestCase):
                 self.assertTrue(bridge.process_line(line, cursor, cursor + len(line)))
                 cursor += len(line)
 
-            self.assertEqual(telegram.sent, ["완료"])
+            self.assertEqual(without_sent_directive_cards(telegram.sent), ["완료"])
 
     def test_telegram_prompt_tracking_sends_periodic_progress_update(self):
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -1284,7 +1293,12 @@ class ReplBridgeTests(unittest.TestCase):
             bridge.handle_user_event("typed directly in terminal")
             bridge.send_telegram_fallback("typed directly in terminal", 95)
 
-            self.assertEqual(telegram.sent, [])
+            # Terminal-origin prompts mirror a single "sent directive" card;
+            # the fallback itself must not add anything on top of it.
+            self.assertEqual(
+                telegram.sent,
+                ["📤 보낸 지시\n🤖 testnode → 🤖 testnode\ntyped directly in terminal"],
+            )
 
     def test_liveness_recovers_typing_when_repl_is_busy(self):
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -1839,9 +1853,14 @@ Overwrite existing file? [y/N]
             telegram = FailingAttachmentTelegram()
             bridge = repl.Bridge(config(tmpdir), telegram, None)
 
-            self.assertFalse(bridge.send_answer(f"Here: [screenshot.png]({image})"))
+            # Attachment failure no longer fails the whole turn — the body is
+            # delivered and the failure is surfaced as a one-line notice, so the
+            # cursor advances and the same answer is not resent forever.
+            self.assertTrue(bridge.send_answer(f"Here: [screenshot.png]({image})"))
 
-            self.assertEqual(telegram.sent, ["Here:"])
+            self.assertEqual(telegram.sent[0], "Here:")
+            self.assertIn("첨부 전송 실패", telegram.sent[-1])
+            self.assertIn(str(image.resolve()), telegram.sent[-1])
             self.assertEqual(len(telegram.attachments), 1)
 
     def test_hides_and_sends_local_video_path(self):

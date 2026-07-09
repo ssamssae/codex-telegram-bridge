@@ -30,6 +30,7 @@ import sys
 import tempfile
 import threading
 import time
+import urllib.error
 import urllib.parse
 import urllib.request
 from contextlib import contextmanager
@@ -61,6 +62,7 @@ FLOW_MIRROR_EDIT_MIN_SECONDS = 1.0
 # directive-received-ack.sh 가 주입 시 남긴 신호파일을 브릿지가 tail 해 카드화한다. flow_mirror
 # 토글 게이트. claude-telegram-bridge.py 의 '📥 받은 지시'(PR#248, node-origin 직접감지)와 한 쌍.
 AMBIENT_DIRECTIVE_HEADER = "📥 받은 지시"
+SENT_DIRECTIVE_HEADER = "📤 보낸 지시"
 AMBIENT_DIRECTIVE_LIMIT = 400
 DIRECTIVE_SIGNAL_ENV = "CRB_DIRECTIVE_SIGNAL_PATH"
 # Codex REPL "dead/interrupted mid-turn" markers. When these appear at the
@@ -151,7 +153,7 @@ LONG_RUNNING_SLASH_COMMANDS = {"/goal"}
 STATUS_WIDE_CAPTURE_COLUMNS = 132
 ANSI_RE = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]")
 REPL_BUSY_RE = re.compile(
-    r"esc to interrupt|interrupt to stop|\bWorking\b|tokens used",
+    r"esc to interrupt|interrupt to stop|\bWorking\b|Churning|Saut[eé]ed|✻|✽",
     re.IGNORECASE,
 )
 REPL_IDLE_DONE_RE = re.compile(r"\bGoal achieved\b", re.IGNORECASE)
@@ -420,22 +422,45 @@ def read_json(path: Path) -> dict[str, Any] | None:
     return payload if isinstance(payload, dict) else None
 
 
+def _atomic_tmp(path: Path) -> tuple[int, Path]:
+    # T-260704-39 F7: tmp 는 호출마다 유니크(mkstemp) — 고정 '<name>.tmp' 는 동시
+    # 쓰기가 같은 경로를 공유하다 첫 replace 후 두번째 replace 가 FileNotFoundError
+    # 로 죽는 race. claude 브릿지 F5(T-260704-37, 라이덴 크래시 실측)와 동일 클래스 선제수리.
+    fd, name = tempfile.mkstemp(prefix=path.name + ".", suffix=".tmp", dir=str(path.parent))
+    return fd, Path(name)
+
+
 def write_text_atomic(path: Path, value: str | int) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_name(path.name + ".tmp")
-    tmp.write_text(str(value), encoding="utf-8")
-    tmp.replace(path)
+    fd, tmp = _atomic_tmp(path)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            handle.write(str(value))
+        tmp.replace(path)
+    except BaseException:
+        try:
+            tmp.unlink()
+        except OSError:
+            pass
+        raise
 
 
 def write_json_atomic(path: Path, payload: dict[str, Any]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_name(path.name + ".tmp")
-    with tmp.open("w", encoding="utf-8") as handle:
-        json.dump(payload, handle, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
-        handle.write("\n")
-        handle.flush()
-        os.fsync(handle.fileno())
-    tmp.replace(path)
+    fd, tmp = _atomic_tmp(path)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            json.dump(payload, handle, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+            handle.write("\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        tmp.replace(path)
+    except BaseException:
+        try:
+            tmp.unlink()
+        except OSError:
+            pass
+        raise
     try:
         dir_fd = os.open(str(path.parent), os.O_RDONLY)
     except OSError:
@@ -891,6 +916,20 @@ def format_ambient_directive(
     return f"{AMBIENT_DIRECTIVE_HEADER}\n{out}" if out else ""
 
 
+def format_sent_directive(text: str, from_alias: str, to_alias: str) -> str:
+    body = strip_inline_node_emoji_header(strip_node_emoji_header(text or "")).strip()
+    if not body:
+        return ""
+    sender_label, sender_emoji = node_label_emoji(from_alias)
+    receiver_label, receiver_emoji = node_label_emoji(to_alias)
+    sender = f"{sender_emoji} {sender_label}".strip()
+    receiver = f"{receiver_emoji} {receiver_label}".strip()
+    route_line = f"{sender} → {receiver}" if sender or receiver else ""
+    parts = [part for part in (route_line, body) if part]
+    gist = "\n".join(parts)[:AMBIENT_DIRECTIVE_LIMIT].strip()
+    return f"{SENT_DIRECTIVE_HEADER}\n{gist}" if gist else ""
+
+
 def flow_step_summary(text: str, limit: int = FLOW_MIRROR_LINE_LIMIT) -> str:
     """One clean line for a single flow step (claude parity).
 
@@ -953,6 +992,183 @@ PATCH_TARGET_RE = re.compile(
 )
 
 FLOW_TOOL_DETAIL_LIMIT = 140
+
+# T-260706-01 (아니키 GO 2026-07-06 00:21 '코덱스 흐름카드 규칙요약 ㄱ'): 셸 명령 원문을
+# 말줄임으로 자르는 대신 코드 규칙으로 '동작+대상'만 추출 — claude 카드(모델이 붙인 짧은
+# 설명)와 정보밀도 패리티. LLM 호출 0 (토큰 비용 0).
+FLOW_SUMMARY_MAX_SEGMENTS = 3
+FLOW_SUMMARY_TOKEN_CAP = 40
+FLOW_SUMMARY_QUOTED_CAP = 20
+_SHELL_WRAPPER_NAMES = {"bash", "sh", "zsh", "dash"}
+_SHELL_NOISE_COMMANDS = {"cd", "set", "export", "trap", "true", ":", "sleep"}
+_PYTHON_NAMES_RE = re.compile(r"^python[0-9.]*$")
+_REDIRECT_DROP_RE = re.compile(r"^\d*>>?(&\d+|/dev/null)$|^</dev/null$")
+_ENV_ASSIGN_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=")
+
+
+def _flow_cap_text(text: str, cap: int) -> str:
+    """cap 초과 시 단어 경계에서 자르고 '…' — 흐름카드 요약용 미니 컷."""
+    if len(text) <= cap:
+        return text
+    cut = text[:cap]
+    sp = cut.rfind(" ")
+    if sp > 0:
+        cut = cut[:sp]
+    return cut.rstrip() + "…"
+
+
+def _flow_shorten_token(token: str) -> str:
+    """경로는 basename 으로, 인용 문자열/장토큰은 컷 — 폰 카드 가독성용."""
+    if " " in token:  # shlex 언쿼트된 인용 문자열
+        return _flow_cap_text(token, FLOW_SUMMARY_QUOTED_CAP)
+    if "/" in token and not token.startswith("-") and not token.startswith("http"):
+        stripped = token.rstrip("/")
+        base = stripped.rsplit("/", 1)[-1]
+        if base:
+            token = base + ("/" if token.endswith("/") else "")
+    if len(token) > FLOW_SUMMARY_TOKEN_CAP:
+        token = token[: FLOW_SUMMARY_TOKEN_CAP - 1].rstrip() + "…"
+    return token
+
+
+def _flow_split_segments(cmd: str) -> list[str]:
+    """&&·||·|·;·& 를 인용부호 밖에서만 분할 (2>&1 의 & 는 리다이렉트라 제외)."""
+    segments: list[str] = []
+    buf: list[str] = []
+    quote = ""
+    i = 0
+    while i < len(cmd):
+        ch = cmd[i]
+        if quote:
+            buf.append(ch)
+            if ch == quote:
+                quote = ""
+            i += 1
+            continue
+        if ch in "'\"":
+            quote = ch
+            buf.append(ch)
+            i += 1
+            continue
+        two = cmd[i : i + 2]
+        if two in ("&&", "||"):
+            segments.append("".join(buf))
+            buf = []
+            i += 2
+            continue
+        if ch in "|;" or (ch == "&" and (i == 0 or cmd[i - 1] != ">")):
+            segments.append("".join(buf))
+            buf = []
+            i += 1
+            continue
+        buf.append(ch)
+        i += 1
+    segments.append("".join(buf))
+    return [seg.strip() for seg in segments if seg.strip()]
+
+
+def _flow_summarize_segment(segment: str) -> str | None:
+    """세그먼트 1개 → '명령 [대상 최대 2]' 요약. 노이즈면 None, 파싱 불능이면 ValueError."""
+    heredoc = segment.find("<<")
+    if heredoc >= 0:
+        segment = segment[:heredoc].strip()
+    if not segment:
+        return None
+    tokens = shlex.split(segment)  # 인용 불균형 시 ValueError → 호출측 폴백
+    while tokens and _ENV_ASSIGN_RE.match(tokens[0]):
+        tokens.pop(0)
+    if not tokens:
+        return None
+
+    head = tokens[0].rstrip("/").rsplit("/", 1)[-1] or tokens[0]
+    rest = tokens[1:]
+
+    # 셸 래퍼(bash -lc "...") 언랩 → 내부 명령을 재귀 요약
+    if head in _SHELL_WRAPPER_NAMES:
+        flags = [t for t in rest if t.startswith("-")]
+        inner = next((t for t in rest if not t.startswith("-")), "")
+        if any("c" in f for f in flags) and inner:
+            return summarize_shell_command(inner) or None
+
+    if head in _SHELL_NOISE_COMMANDS:
+        return None
+
+    # python -m mod → mod 가 명령 / python script.py → 스크립트 basename 노출
+    if _PYTHON_NAMES_RE.match(head) and rest:
+        if rest[0] == "-m" and len(rest) >= 2:
+            head = rest[1]
+            rest = rest[2:]
+        elif rest[0].endswith(".py"):
+            head = f"{head} {_flow_shorten_token(rest[0])}"
+            rest = rest[1:]
+    elif head in {"git", "gh", "npm", "cargo", "docker", "flutter", "dart", "systemctl", "tmux"} and rest and not rest[0].startswith("-"):
+        head = f"{head} {rest[0]}"
+        rest = rest[1:]
+
+    salient: list[str] = []
+    idx = 0
+    while idx < len(rest):
+        token = rest[idx]
+        idx += 1
+        if _REDIRECT_DROP_RE.match(token):
+            continue
+        if token in {">", ">>"}:
+            if idx < len(rest):
+                salient.append(">" + _flow_shorten_token(rest[idx]))
+                idx += 1
+            continue
+        if token.startswith("-") and len(token) > 1:
+            continue
+        if not any(ch.isalnum() for ch in token):
+            continue
+        if len(salient) < 2:
+            salient.append(_flow_shorten_token(token))
+
+    if head == "echo" and not salient:
+        return None  # 구분선 echo(===) 노이즈
+    return " ".join([head, *salient]).strip()
+
+
+def summarize_shell_command(cmd: str) -> str:
+    """셸 명령 원문 → 규칙 요약 (T-260706-01). 파싱 불능/전부 노이즈면 원문 반환."""
+    original = (cmd or "").strip()
+    if not original:
+        return original
+    try:
+        summaries: list[str] = []
+        for segment in _flow_split_segments(original):
+            summary = _flow_summarize_segment(segment)
+            if summary:
+                summaries.append(summary)
+    except ValueError:
+        return original
+    if not summaries:
+        return original
+    shown = summaries[:FLOW_SUMMARY_MAX_SEGMENTS]
+    out = " → ".join(shown)
+    remaining = len(summaries) - len(shown)
+    if remaining > 0:
+        out += f" +{remaining}"
+    return out
+
+
+def compact_flow_detail(detail: str, limit: int = FLOW_TOOL_DETAIL_LIMIT) -> str:
+    """flow 카드 detail 컷 — T-260705-12 (아니키 제보 '쓰다가 끊긴 느낌').
+
+    limit 초과 시 토큰(공백) 경계에서 자르고 '…' 를 붙인다. 경계가 컷 지점에서
+    너무 멀면(마지막 30자 밖) 하드컷+…. limit 이하는 원문 그대로. 기존
+    'no ellipsis (claude parity)' 규칙은 결과 비대칭이라 폐기 — claude 카드는
+    짧은 설명문(description)이라 컷에 거의 안 걸리지만 codex 카드는 셸 명령
+    원문이라 항상 걸려 mid-token 끊김('port=922' 류)으로 보였다."""
+    if len(detail) <= limit:
+        return detail
+    cut = detail[:limit]
+    sp = cut.rfind(" ")
+    if sp >= limit - 30:
+        cut = cut[:sp]
+    return cut.rstrip(" ·|&;,(") + "…"
+
+
 GENERIC_DETAIL_KEYS = (
     "path",
     "file_path",
@@ -1026,7 +1242,8 @@ def tool_detail(name: str, args: dict[str, Any], raw: str) -> str:
         if isinstance(cmd, list):
             cmd = " ".join(str(part) for part in cmd)
         if cmd:
-            return str(cmd)
+            # T-260706-01: 원문 대신 규칙 요약 — 말줄임 컷은 compact_flow_detail 최종 가드로만
+            return summarize_shell_command(str(cmd))
     for detail_key in GENERIC_DETAIL_KEYS:
         value = args.get(detail_key)
         if value:
@@ -1043,9 +1260,7 @@ def function_call_flow_summary(payload: dict[str, Any]) -> str:
     args, raw = parse_tool_arguments(payload)
     label = tool_label_ko(name)
     detail = " ".join(tool_detail(name, args, raw).split())
-    if len(detail) > FLOW_TOOL_DETAIL_LIMIT:
-        # Truncate but add NO ellipsis (claude parity). (T-260628-43)
-        detail = detail[:FLOW_TOOL_DETAIL_LIMIT].rstrip()
+    detail = compact_flow_detail(detail)
     return f"• {label} · {detail}".rstrip(" ·").rstrip() if not detail else f"• {label} · {detail}"
 
 
@@ -1684,6 +1899,80 @@ class Config:
         return self.state_dir / f"codex-repl-bridge-{self.node}.pid"
 
 
+# F3≡C3 (T-260705-72): 429 flood control 대응 상수 — claude-telegram-bridge.py 동형.
+# 고정 2s×N 재시도 예산이 통상 30s+ flood 대기를 못 넘겨 발신이 영구 유실되던 갭.
+TELEGRAM_FLOOD_MAX_WAITS = 3
+TELEGRAM_FLOOD_WAIT_CAP_SECONDS = 61.0
+
+
+def telegram_retry_after_seconds(body: str, headers: Any = None, default: float = 3.0) -> float:
+    """429 응답에서 대기 초를 해석: body JSON parameters.retry_after → Retry-After 헤더 → default."""
+    try:
+        payload = json.loads(body)
+        value = (payload.get("parameters") or {}).get("retry_after")
+        if isinstance(value, (int, float)) and not isinstance(value, bool) and value >= 0:
+            return float(value)
+    except Exception:  # noqa: BLE001
+        pass
+    try:
+        raw = headers.get("Retry-After") if headers is not None else None
+        if raw is not None:
+            return max(0.0, float(raw))
+    except Exception:  # noqa: BLE001
+        pass
+    return default
+
+
+class CodexEgressRouteError(RuntimeError):
+    """Raised before a Codex bot token can send to a non-Codex chat route."""
+
+
+def codex_secret_token_files() -> list[Path]:
+    return []
+
+
+def read_codex_secret_token(path: Path) -> str:
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return ""
+    return str(payload.get("api_key") or "").strip()
+
+
+def codex_registry_aliases_for_token(token: str) -> list[str]:
+    if not token:
+        return []
+    aliases: list[str] = []
+    for path in codex_secret_token_files():
+        if read_codex_secret_token(path) == token:
+            alias = path.stem.removeprefix("codex_bridge_")
+            aliases.append(alias or path.name)
+    return aliases
+
+
+def expected_codex_chat_id() -> str:
+    return (env("CRB_CHAT_ID") or env("TAB_CHAT_ID") or "").strip()
+
+
+def assert_codex_egress_chat(token: str, chat_id: str | None) -> tuple[bool, str]:
+    aliases = codex_registry_aliases_for_token(token)
+    if not aliases:
+        return False, ""
+    expected = expected_codex_chat_id()
+    if not expected:
+        raise CodexEgressRouteError(
+            "Codex Telegram egress blocked: CRB_CHAT_ID/TAB_CHAT_ID is required for "
+            "codex_bridge_<node>.json tokens; refusing legacy TELEGRAM_CHAT_ID fallback."
+        )
+    if str(chat_id or "") != expected:
+        alias_hint = ",".join(sorted(aliases))
+        raise CodexEgressRouteError(
+            "Codex Telegram egress blocked: chat_id mismatch for "
+            f"codex_bridge registry alias={alias_hint}; target must equal CRB_CHAT_ID/TAB_CHAT_ID."
+        )
+    return True, expected
+
+
 class TelegramClient:
     def __init__(self, token: str, chat_id: str, emoji: str, chunk_size: int) -> None:
         self.token = token
@@ -1691,6 +1980,13 @@ class TelegramClient:
         self.chat_id = chat_id
         self.emoji = emoji
         self.chunk_size = chunk_size
+        self.codex_route_guard_active, self.codex_expected_chat_id = assert_codex_egress_chat(token, chat_id)
+
+    def assert_outbound_chat(self, chat_id: Any) -> None:
+        if self.codex_route_guard_active and chat_id is not None and str(chat_id) != self.codex_expected_chat_id:
+            raise CodexEgressRouteError(
+                "Codex Telegram egress blocked: chat_id mismatch for codex_bridge registry token."
+            )
 
     def call(
         self,
@@ -1701,27 +1997,53 @@ class TelegramClient:
         _retry_delay: float = 2.0,
         **params: Any,
     ) -> dict[str, Any] | None:
+        self.assert_outbound_chat(params.get("chat_id"))
         cutover_payload = mesh_cutover_call(method, params)
         if cutover_payload is not None:
             return cutover_payload
         data = urllib.parse.urlencode(params).encode()
         url = f"{self.api}/{method}"
         attempts = max(1, _attempts)
-        for attempt in range(attempts):
+        # C3 (T-260705-72): 429 는 retry_after 를 지켜 기다렸다 재시도 — flood 대기는
+        # 일반 재시도 예산과 별도로 센다. 단발(_attempts=1) 호출(typing 등)은 fast-fail 유지.
+        flood_budget = TELEGRAM_FLOOD_MAX_WAITS if attempts > 1 else 0
+        attempt = 0
+        flood_waits = 0
+        while True:
             try:
                 request = urllib.request.Request(url, data=data)
                 with urllib.request.urlopen(request, timeout=_request_timeout) as response:
                     payload = json.load(response)
                 mesh_ledger_record(method, params.get("chat_id"), params.get("text"), payload, message_id=params.get("message_id"))
                 return payload if isinstance(payload, dict) else None
+            except urllib.error.HTTPError as exc:
+                body = exc.read().decode("utf-8", errors="replace")
+                if exc.code == 429 and flood_waits < flood_budget:
+                    flood_waits += 1
+                    wait = min(telegram_retry_after_seconds(body, exc.headers) + 1.0, TELEGRAM_FLOOD_WAIT_CAP_SECONDS)
+                    log("TGERR", f"{method} 429 flood; waiting {wait:.0f}s ({flood_waits}/{flood_budget})")
+                    time.sleep(wait)
+                    continue
+                if 400 <= exc.code < 500:
+                    # 4xx(flood 예산 소진 포함)는 재시도 무의미 — 즉시 단락.
+                    log("TGERR", f"{method} failed: HTTP {exc.code} {body[:200]}")
+                    mesh_ledger_record(method, params.get("chat_id"), params.get("text"), None, message_id=params.get("message_id"))
+                    return None
+                attempt += 1
+                if attempt >= attempts:
+                    log("TGERR", f"{method} failed: HTTP {exc.code} {body[:200]}")
+                    mesh_ledger_record(method, params.get("chat_id"), params.get("text"), None, message_id=params.get("message_id"))
+                    return None
+                if _retry_delay > 0:
+                    time.sleep(_retry_delay)
             except Exception as exc:  # noqa: BLE001
-                if attempt == attempts - 1:
+                attempt += 1
+                if attempt >= attempts:
                     log("TGERR", f"{method} failed: {exc}")
                     mesh_ledger_record(method, params.get("chat_id"), params.get("text"), None, message_id=params.get("message_id"))
                     return None
                 if _retry_delay > 0:
                     time.sleep(_retry_delay)
-        return None
 
     def call_multipart(
         self,
@@ -1730,6 +2052,7 @@ class TelegramClient:
         file_field: str,
         file_path: Path,
     ) -> dict[str, Any] | None:
+        self.assert_outbound_chat(fields.get("chat_id"))
         boundary = "----crb" + secrets.token_hex(16)
         parts: list[bytes] = []
         for name, value in fields.items():
@@ -1757,17 +2080,37 @@ class TelegramClient:
             data=b"".join(parts),
             headers={"Content-Type": f"multipart/form-data; boundary={boundary}"},
         )
-        for attempt in range(3):
+        # C2·C3 (T-260705-72): call() 과 동형 — 429 는 retry_after 대기 후 재시도(별도 예산),
+        # 그 외 4xx(치수거부 PNG 등 영구 오류)는 즉시 단락해 폴백/공지 경로로 넘긴다.
+        attempt = 0
+        flood_waits = 0
+        while True:
             try:
                 with urllib.request.urlopen(request, timeout=60) as response:
                     payload = json.load(response)
                 return payload if isinstance(payload, dict) else None
+            except urllib.error.HTTPError as exc:
+                body = exc.read().decode("utf-8", errors="replace")
+                if exc.code == 429 and flood_waits < TELEGRAM_FLOOD_MAX_WAITS:
+                    flood_waits += 1
+                    wait = min(telegram_retry_after_seconds(body, exc.headers) + 1.0, TELEGRAM_FLOOD_WAIT_CAP_SECONDS)
+                    log("TGERR", f"{method} upload 429 flood; waiting {wait:.0f}s ({flood_waits}/{TELEGRAM_FLOOD_MAX_WAITS})")
+                    time.sleep(wait)
+                    continue
+                if 400 <= exc.code < 500:
+                    log("TGERR", f"{method} upload failed: HTTP {exc.code} {body[:200]}")
+                    return None
+                attempt += 1
+                if attempt >= 3:
+                    log("TGERR", f"{method} upload failed: HTTP {exc.code} {body[:200]}")
+                    return None
+                time.sleep(2)
             except Exception as exc:  # noqa: BLE001
-                if attempt == 2:
+                attempt += 1
+                if attempt >= 3:
                     log("TGERR", f"{method} upload failed: {exc}")
                     return None
                 time.sleep(2)
-        return None
 
     def send_typing(self) -> bool:
         payload = self.call(
@@ -1809,10 +2152,26 @@ class TelegramClient:
         quoted_path = urllib.parse.quote(file_path, safe="/")
         url = f"https://api.telegram.org/file/bot{self.token}/{quoted_path}"
         request = urllib.request.Request(url)
-        with urllib.request.urlopen(request, timeout=60) as response:
-            data = response.read()
-        output_path.write_bytes(data)
-        return output_path
+        # T-260705-43: 단발 통짜 read()는 텔레그램 파일서버 지연 국면에
+        # 'read operation timed out' 으로 그대로 실패(2026-07-05 본진+라이덴 크로스노드 재현).
+        # chunk read 는 소켓 타임아웃이 청크마다 갱신되고, transient 실패는 백오프 재시도.
+        last_err: Exception | None = None
+        for attempt in range(3):
+            try:
+                buf = bytearray()
+                with urllib.request.urlopen(request, timeout=60) as response:
+                    while True:
+                        chunk = response.read(1 << 16)
+                        if not chunk:
+                            break
+                        buf.extend(chunk)
+                output_path.write_bytes(bytes(buf))
+                return output_path
+            except OSError as err:
+                last_err = err
+                if attempt < 2:
+                    time.sleep(2 * (attempt + 1))
+        raise RuntimeError(f"file download failed after 3 attempts: {last_err}")
 
     def with_emoji_prefix(self, text: str) -> str:
         first_line = text.splitlines()[0].strip() if text.splitlines() else ""
@@ -1917,6 +2276,15 @@ class TelegramClient:
         suffix = path.suffix.lower()
         if suffix in {".jpg", ".jpeg", ".png", ".webp"} and size <= 10 * 1024 * 1024:
             payload = self.call_multipart("sendPhoto", {"chat_id": self.chat_id}, "photo", path)
+            if not payload or not payload.get("ok"):
+                # C2 (T-260705-72): 치수/포맷 거부 등 sendPhoto 영구 거부는 문서로 폴백
+                # (video/voice/audio 와 동형). 폴백 부재가 첨부 무한 재전송 폭풍의 트리거였다.
+                payload = self.call_multipart(
+                    "sendDocument",
+                    {"chat_id": self.chat_id},
+                    "document",
+                    path,
+                )
         elif suffix in VIDEO_EXTENSIONS:
             payload = self.call_multipart("sendVideo", {"chat_id": self.chat_id}, "video", path)
             if not payload or not payload.get("ok"):
@@ -3094,6 +3462,31 @@ class TelegramPrompt:
     text: str
     image_path: Path | None = None
     kind: str = "text"
+    message_id: int = 0
+
+
+# C3 (T-260705-72): 발송 실패한 승인/선택 카드 재발송 간격. approval_loop 은 1s tick 이라
+# 매 tick 재발송하면 flood 를 악화시킨다 — 실패 카드만 이 간격으로 재시도.
+PROMPT_CARD_RESEND_SECONDS = 15.0
+
+
+def should_resend_prompt_card(
+    message_id: int | None,
+    signature: str,
+    resolved_ids: set[str],
+    last_attempt_at: float,
+    now: float,
+    interval: float = PROMPT_CARD_RESEND_SECONDS,
+) -> bool:
+    """C3 (T-260705-72): 화면에 남아 있는 같은 signature 프롬프트인데 카드 발송이 실패해
+    message_id 가 없으면(미해결 한정) 재발송한다 — signature 동일성만으로 재발송을 영구
+    억제하면 flood/네트워크 단발 실패 시 codex 가 사람 게이트에 무기한 블록되는데
+    폰에는 카드가 없다."""
+    return (
+        message_id is None
+        and signature not in resolved_ids
+        and now - last_attempt_at >= interval
+    )
 
 
 class Bridge:
@@ -3114,9 +3507,11 @@ class Bridge:
         self.pending_telegram: list[str] = []
         self.pending_approval: ApprovalPrompt | None = None
         self.pending_approval_message_id: int | None = None
+        self.pending_approval_send_attempt_at = 0.0
         self.resolved_approval_ids: set[str] = set()
         self.pending_choice: ChoicePrompt | None = None
         self.pending_choice_message_id: int | None = None
+        self.pending_choice_send_attempt_at = 0.0
         self.resolved_choice_ids: set[str] = set()
         self.stop_event = threading.Event()
         self.current_origin: str | None = None
@@ -3127,6 +3522,7 @@ class Bridge:
         self.pending_reasoning_mirror: tuple[str, str] | None = None
         self.active_telegram_prompt = ""
         self.active_telegram_prompt_started_at = 0.0
+        self.active_telegram_message_id = 0
         self.flow_message_id = 0
         self.flow_body = ""
         self.flow_scope = ""
@@ -3226,8 +3622,22 @@ class Bridge:
         else:
             self.current_origin = "terminal"
             self.stop_telegram_fallback()
+            self.emit_sent_directive_card(text)
             log("JSONL", "terminal-origin prompt")
             self.begin_repl_typing()
+
+    def emit_sent_directive_card(self, text: str) -> None:
+        if self.config.bridge_kill:
+            log("SEND", "sent-directive echo blocked by CRB_KILL=1")
+            return
+        node = str(getattr(self.config, "node", "") or node_defaults()[0])
+        message = format_sent_directive(text, from_alias=node, to_alias=node)
+        if not message:
+            return
+        if not self.telegram.send(message):
+            log("SEND", "sent-directive echo failed")
+            return
+        log("SEND", "sent terminal-origin directive card")
 
     def handle_reasoning_event(self, text: str, key: str) -> None:
         if is_copy_payload_message(text):
@@ -3466,6 +3876,11 @@ class Bridge:
         # 앵커를 edit 해 받은지시→코덱스답을 1장 통합. 첨부 있으면(편집 불가)/길이 4000 초과/edit 실패
         # 시 폴백 send → 답 1장 보장(0장도 2장폭발도 아님). 텔레그램-origin 답은 영향 없음.
         anchor = self.ambient_directive_message_id
+        telegram_reply_anchor = (
+            self.active_telegram_message_id
+            if self.current_origin == "telegram" and self.active_telegram_message_id > 0
+            else None
+        )
         sent_via_reply = False
         if self.current_origin != "telegram" and anchor and alt3_narrative_enabled():
             # alt3 (spec v0.2 §6, T-260703-14 — claude PR#358 동형): 받은지시 카드 edit-통합
@@ -3486,13 +3901,19 @@ class Bridge:
                 log("SEND", f"edited codex answer into directive anchor mid={anchor}")
                 return True
             # 폴백: 길이초과/edit실패 → 아래에서 새 카드 send
-        ok = sent_via_reply or self.telegram.send(outgoing)
+        ok = sent_via_reply or self.telegram.send(outgoing, reply_to_message_id=telegram_reply_anchor)
+        if not ok:
+            # 본문 자체가 실패 — 이벤트 재시도 대상 (커서 미전진, 중복 발신 없음).
+            return False
         for path in attachments:
             log("ATTACH", f"send {path}")
             if not self.telegram.send_local_attachment(path, self.config.max_attachment_bytes):
+                # C2 (T-260705-72): 본문이 이미 발송된 뒤의 첨부 실패로 턴을 실패시키면
+                # jsonl 커서가 안 전진해 같은 본문을 폴링마다 영구 재발신(+후속 답 전면 웨지).
+                # 첨부 실패는 1줄 공지로 가시화하고 턴은 완료 처리 — 파일은 노드에 보존.
                 log("ATTACH", f"send failed: {path}")
-                ok = False
-        return ok
+                self.telegram.send(f"⚠️ 첨부 전송 실패 — 파일은 노드에 보존됨: {path}")
+        return True
 
     def persist_state(self, offset: int | None = None, event_key: str | None = None) -> None:
         identity = self.session_identity
@@ -3507,6 +3928,8 @@ class Bridge:
         state["flow_message_id"] = self.flow_message_id
         state["flow_body"] = self.flow_body
         state["flow_scope"] = self.flow_scope
+        if self.active_telegram_message_id > 0:
+            state["active_telegram_message_id"] = self.active_telegram_message_id
         if offset is not None:
             state["offset"] = offset
         if event_key:
@@ -3728,6 +4151,7 @@ class Bridge:
                 self.active_telegram_prompt = str(
                     self.bridge_state.get("active_telegram_prompt") or ""
                 )
+                self.active_telegram_message_id = int(self.bridge_state.get("active_telegram_message_id") or 0)
             # persisted across restart (anti-fragmentation): resume the ⚙️ flow card so the
             # next tool step edits the existing card instead of sending a fresh one.
             self.flow_message_id = int(self.bridge_state.get("flow_message_id") or 0)
@@ -3973,24 +4397,36 @@ class Bridge:
                 self.repl_typing_stop = None
                 log("TYPE", "stop")
 
-    def set_active_telegram_prompt(self, prompt: str, started_at: float | None = None) -> None:
+    def set_active_telegram_prompt(
+        self,
+        prompt: str,
+        started_at: float | None = None,
+        message_id: int | None = None,
+    ) -> None:
         prompt = normalize_prompt(prompt)
         with self.lock:
             self.active_telegram_prompt = prompt
             if started_at is not None:
                 self.active_telegram_prompt_started_at = started_at if prompt else 0.0
+            if message_id is not None:
+                self.active_telegram_message_id = int(message_id or 0) if prompt else 0
             if self.bridge_state is not None:
                 if prompt:
                     self.bridge_state["active_telegram_prompt"] = prompt
                     if started_at is not None:
                         self.bridge_state["active_telegram_prompt_started_at"] = started_at
+                    if self.active_telegram_message_id > 0:
+                        self.bridge_state["active_telegram_message_id"] = self.active_telegram_message_id
+                    else:
+                        self.bridge_state.pop("active_telegram_message_id", None)
                 else:
                     self.bridge_state.pop("active_telegram_prompt", None)
                     self.bridge_state.pop("active_telegram_prompt_started_at", None)
+                    self.bridge_state.pop("active_telegram_message_id", None)
         self.persist_state()
 
     def clear_active_telegram_prompt(self) -> None:
-        self.set_active_telegram_prompt("", 0.0)
+        self.set_active_telegram_prompt("", 0.0, 0)
 
     def active_prompt_for_recovery(self) -> str:
         with self.lock:
@@ -4021,7 +4457,7 @@ class Bridge:
     def copy_payload_dedup_key_for_turn(self, text: str) -> str:
         return copy_payload_dedup_key(text, self.active_prompt_for_recovery())
 
-    def begin_telegram_prompt_tracking(self, prompt: str) -> None:
+    def begin_telegram_prompt_tracking(self, prompt: str, message_id: int | None = None) -> None:
         self.add_pending_telegram(prompt)
         started_at = time.time()
         with self.lock:
@@ -4030,13 +4466,13 @@ class Bridge:
             self.last_public_progress = ""
             self.telegram_fallback_sent = False
             self.reset_flow_card()
-        self.set_active_telegram_prompt(prompt, started_at)
+        self.set_active_telegram_prompt(prompt, started_at, message_id or 0)
         self.set_copy_payload_pair_contract(prompt)
         self.start_telegram_fallback(prompt)
         self.start_long_running_progress(prompt)
 
-    def begin_long_running_telegram_prompt(self, prompt: str) -> None:
-        self.begin_telegram_prompt_tracking(prompt)
+    def begin_long_running_telegram_prompt(self, prompt: str, message_id: int | None = None) -> None:
+        self.begin_telegram_prompt_tracking(prompt, message_id=message_id)
 
     def start_long_running_progress(self, prompt: str) -> None:
         self.stop_long_running_progress()
@@ -4286,6 +4722,9 @@ class Bridge:
         return True
 
     def clear_and_paste_prompt(self, prompt: str, label: str = "telegram input") -> None:
+        if not is_codex_slash_command(prompt) and self.repl_is_working():
+            self.paste_prompt_without_clearing_composer(prompt, label)
+            return
         composer_lock = getattr(self.repl, "composer_lock", None)
         clear_unlocked = getattr(self.repl, "_clear_composer_unlocked", None)
         paste_unlocked = getattr(self.repl, "_paste_prompt_unlocked", None)
@@ -4312,6 +4751,17 @@ class Bridge:
         if not self.needs_composer_clear:
             return
         self.clear_composer_before_telegram_input("stale slash command")
+
+    def paste_prompt_without_clearing_composer(self, prompt: str, label: str = "telegram input") -> None:
+        composer_lock = getattr(self.repl, "composer_lock", None)
+        paste_unlocked = getattr(self.repl, "_paste_prompt_unlocked", None)
+        if callable(composer_lock) and callable(paste_unlocked):
+            with composer_lock():
+                paste_unlocked(prompt)
+        else:
+            self.repl.paste_prompt(prompt)
+        self.needs_composer_clear = False
+        log("REPL", f"queued {label} while busy without clearing composer")
 
     def handle_slash_command_result(self, text: str) -> bool:
         command = slash_command_token(text)
@@ -4360,7 +4810,19 @@ class Bridge:
                         if previous is None or previous.signature != prompt.signature:
                             self.pending_approval = prompt
                             self.pending_approval_message_id = None
+                            self.pending_approval_send_attempt_at = 0.0
                             should_send = True
+                        elif should_resend_prompt_card(
+                            self.pending_approval_message_id,
+                            prompt.signature,
+                            self.resolved_approval_ids,
+                            self.pending_approval_send_attempt_at,
+                            time.monotonic(),
+                        ):
+                            # C3 (T-260705-72): 발송 실패 승인카드 재발송
+                            should_send = True
+                        if should_send:
+                            self.pending_approval_send_attempt_at = time.monotonic()
                     if should_send:
                         log("APPROV", f"approval prompt detected {prompt.short_signature}")
                         message_id = self.telegram.send_approval_prompt(prompt)
@@ -4386,7 +4848,19 @@ class Bridge:
                         if previous_choice is None or previous_choice.signature != choice_prompt.signature:
                             self.pending_choice = choice_prompt
                             self.pending_choice_message_id = None
+                            self.pending_choice_send_attempt_at = 0.0
                             should_send = True
+                        elif should_resend_prompt_card(
+                            self.pending_choice_message_id,
+                            choice_prompt.signature,
+                            self.resolved_choice_ids,
+                            self.pending_choice_send_attempt_at,
+                            time.monotonic(),
+                        ):
+                            # C3 (T-260705-72): 발송 실패 선택카드 재발송 — 승인카드와 동형
+                            should_send = True
+                        if should_send:
+                            self.pending_choice_send_attempt_at = time.monotonic()
                     if should_send:
                         log("CHOICE", f"choice prompt detected {choice_prompt.short_signature}")
                         message_id = self.telegram.send_choice_prompt(choice_prompt)
@@ -5150,9 +5624,13 @@ class Bridge:
         return "\n".join(lines)
 
     def prompt_from_telegram_message(self, message: dict[str, Any], update_id: int) -> TelegramPrompt:
+        try:
+            message_id = int(message.get("message_id") or 0)
+        except (TypeError, ValueError):
+            message_id = 0
         text = message.get("text")
         if isinstance(text, str) and text.strip():
-            return TelegramPrompt(text=text)
+            return TelegramPrompt(text=text, message_id=message_id)
 
         caption = message.get("caption")
         caption_text = caption.strip() if isinstance(caption, str) else ""
@@ -5181,6 +5659,7 @@ class Bridge:
                     text=self.image_prompt_text(caption_text, image_path),
                     image_path=image_path,
                     kind="photo",
+                    message_id=message_id,
                 )
 
         document = message.get("document")
@@ -5204,6 +5683,7 @@ class Bridge:
                     text=self.image_prompt_text(caption_text, image_path),
                     image_path=image_path,
                     kind="image_document",
+                    message_id=message_id,
                 )
 
         audio: dict[str, Any] | None = None
@@ -5257,6 +5737,7 @@ class Bridge:
                     probe_summary,
                 ),
                 kind=audio_kind,
+                message_id=message_id,
             )
 
         video: dict[str, Any] | None = None
@@ -5319,6 +5800,7 @@ class Bridge:
                     probe_summary,
                 ),
                 kind=video_kind,
+                message_id=message_id,
             )
 
         if isinstance(document, dict) and document.get("file_id"):
@@ -5343,9 +5825,10 @@ class Bridge:
             return TelegramPrompt(
                 text=self.document_prompt_text(caption_text, media_path, metadata),
                 kind="document",
+                message_id=message_id,
             )
 
-        return TelegramPrompt(text="")
+        return TelegramPrompt(text="", message_id=message_id)
 
     def offer_update_if_available(self) -> None:
         latest = self_update_available()
@@ -5399,7 +5882,7 @@ class Bridge:
                     prompt = self.prompt_from_telegram_message(message, int(update["update_id"]))
                 except Exception as exc:  # noqa: BLE001
                     log("TG", f"media download failed: {exc}")
-                    self.telegram.send(f"codex REPL media delivery failed: {exc}")
+                    self.telegram.send(f"codex REPL media delivery failed: {exc}. 다시 보내주시면 재시도합니다.")
                     continue
                 if not prompt.text.strip():
                     continue
@@ -5418,7 +5901,7 @@ class Bridge:
                 log("TG", "prompt -> Codex REPL")
                 self.begin_repl_typing()
                 slash_command = is_codex_slash_command(prompt.text)
-                self.begin_telegram_prompt_tracking(prompt.text)
+                self.begin_telegram_prompt_tracking(prompt.text, message_id=prompt.message_id)
                 try:
                     self.clear_and_paste_prompt(prompt.text, "telegram prompt")
                     if slash_command:
