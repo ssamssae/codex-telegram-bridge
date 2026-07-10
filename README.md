@@ -17,26 +17,163 @@ Default `repl` mode is REPL sync, not a separate hidden chat. Your terminal
 stays the source of truth, the transcript remains readable, and Telegram becomes
 the remote control when you are away from the keyboard.
 
-Install from PyPI with `pipx`, then run the setup wizard:
+## Beginner Quick Start
+
+### 1. What this does
+
+Codex Telegram Bridge lets you use a private Telegram bot as a phone remote for
+the Codex session running on your computer. A message sent to the bot appears in
+your visible Codex terminal, and Codex's answer comes back to Telegram.
+
+The default `repl` mode keeps the terminal as the source of truth. The bridge
+does not create a second hidden AI conversation.
+
+### 2. What you need
+
+- a personal Telegram account
+- Python 3.10 or newer
+- [Codex CLI](https://developers.openai.com/codex/cli/) installed and logged in
+- `tmux` on Linux, WSL, or macOS for the full visible-session `repl` mode
+- two terminal windows during first-time setup
+
+Native Windows users can start with text-only `exec` mode without `tmux`. See
+[Windows quickstart](#windows-quickstart-5-min) after this section.
+
+### 3. Create your Telegram bot with BotFather
+
+1. Open Telegram and search for the official
+   [@BotFather](https://t.me/BotFather) account.
+2. Send this command to BotFather:
+
+   ```text
+   /newbot
+   ```
+
+3. BotFather asks for a display name. Any name is fine, for example
+   `My Codex Remote`.
+4. BotFather asks for a username. It must be unique and end in `bot`, for
+   example `my_codex_remote_bot`.
+5. BotFather sends you a bot token. Copy it, but treat it like a password.
+   Never post it in an issue, commit it to Git, or send it to your new bot.
+6. Open the new bot's chat and send one message. `/start` is recommended:
+
+   ```text
+   /start
+   ```
+
+Telegram bots cannot start a private conversation with you. Your `/start`
+message creates the first update that setup can discover.
+
+#### Find your numeric `chat_id` with `getUpdates`
+
+The setup wizard in step 5 detects this automatically. The manual check below
+is useful when learning the setup or diagnosing an empty result.
+
+On Linux, WSL, or macOS, read the token without placing it in shell history:
 
 ```bash
-pipx install codex-telegram-bridge
+read -rsp 'Bot token: ' BOT_TOKEN; echo
+curl -sS "https://api.telegram.org/bot${BOT_TOKEN}/getUpdates"
+unset BOT_TOKEN
+```
+
+In the JSON response, find the most recent private message and read:
+
+```text
+result -> message -> chat -> id
+```
+
+That integer is your `chat_id`. Keep it private even though the bot token is the
+more sensitive value.
+
+PowerShell users can run:
+
+```powershell
+$token = Read-Host 'Bot token'
+$updates = Invoke-RestMethod "https://api.telegram.org/bot$token/getUpdates"
+$updates.result[-1].message.chat.id
+Remove-Variable token
+```
+
+If `result` is empty, return to the bot chat, send `/start` again, and rerun
+`getUpdates`. If Telegram returns `401 Unauthorized`, copy a fresh token from
+BotFather and check that no spaces were added.
+
+### 4. Install from PyPI
+
+Using a virtual environment keeps the bridge isolated from system Python.
+
+```bash
+python3 -m venv ~/.venvs/codex-telegram-bridge
+source ~/.venvs/codex-telegram-bridge/bin/activate
+python -m pip install --upgrade pip
+pip install codex-telegram-bridge
+```
+
+Windows PowerShell equivalent:
+
+```powershell
+py -m venv "$HOME\.venvs\codex-telegram-bridge"
+& "$HOME\.venvs\codex-telegram-bridge\Scripts\Activate.ps1"
+python -m pip install --upgrade pip
+pip install codex-telegram-bridge
+```
+
+You can use `pipx install codex-telegram-bridge` instead if you already use
+`pipx` for Python command-line applications.
+
+### 5. Start Codex and run the minimal setup
+
+In terminal 1, create the visible tmux session and start Codex:
+
+```bash
+tmux -L codex new -s codex
+codex
+```
+
+Leave Codex running. In terminal 2, activate the virtual environment if needed,
+then start the setup wizard:
+
+```bash
+source ~/.venvs/codex-telegram-bridge/bin/activate
 codex-telegram-bridge setup
+```
+
+The wizard asks for the BotFather token, waits for the `/start` message, detects
+your `chat_id`, writes the private configuration, and installs a background
+user service. Paste the token only into this local terminal prompt.
+
+Native Windows without tmux should use:
+
+```powershell
+codex-telegram-bridge setup --mode exec
+```
+
+`exec` mode handles one text-only Codex turn per Telegram message. Run Codex in
+WSL with tmux if you want the full visible-session `repl` experience on Windows.
+
+### 6. Verify your first run
+
+Run the built-in health check:
+
+```bash
 codex-telegram-bridge doctor
 ```
 
-Or install from a clone:
+Then open your bot chat in Telegram:
 
-```bash
-git clone https://github.com/ssamssae/codex-telegram-bridge.git
-cd codex-telegram-bridge
-python3 bridge_setup.py setup
-python3 bridge_setup.py doctor
-```
+1. Send `/ping`. You should receive a bridge response.
+2. Send `Reply with exactly: bridge works`.
+3. In `repl` mode, confirm that the prompt appears in the visible Codex tmux
+   session and that the final answer returns to Telegram.
 
-Token safety rule: BotFather shows the bot token in Telegram, but paste it only
-into the local terminal setup wizard. In Telegram, send only `/start`, `/ping`,
-or normal prompts to your bot.
+If `doctor` reports that the tmux session is missing, start terminal 1 again or
+switch to `exec` mode. If `codex-telegram-bridge` is not found, reactivate the
+virtual environment and retry.
+
+You now have the minimum working bridge. The sections below explain the public
+export model, setup wizard internals, services, media, approvals, security, and
+advanced configuration.
 
 ## Public Export Model
 
@@ -137,7 +274,7 @@ Service restart
 - The daemon uses polling and a single `chat_id` allowlist, so no public webhook
   or inbound port is required.
 
-## Quickstart
+## Setup Wizard Details
 
 The setup wizard is designed for first-time users. It shows six steps:
 

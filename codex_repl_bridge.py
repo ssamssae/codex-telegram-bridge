@@ -159,6 +159,11 @@ REPL_BUSY_RE = re.compile(
     r"esc to interrupt|interrupt to stop|\bWorking\b|Churning|Saut[eé]ed|✻|✽",
     re.IGNORECASE,
 )
+REPL_ACTIVE_BUSY_RE = re.compile(
+    r"esc to interru|interrupt to stop|^[•*]\s*Working\b|Churning|Saut[eé]ed|✻|✽",
+    re.IGNORECASE,
+)
+REPL_QUEUED_RE = re.compile(r"\bQueued follow-up inputs\b", re.IGNORECASE)
 REPL_IDLE_DONE_RE = re.compile(r"\bGoal achieved\b", re.IGNORECASE)
 REPL_PROMPT_READY_RE = re.compile(r"^[›>]\s*(?:$|.+)")
 FOOTER_CONTEXT_RE = re.compile(r"\bContext\s+(?P<used>\d{1,3})%\s+used\b", re.IGNORECASE)
@@ -999,7 +1004,7 @@ PATCH_TARGET_RE = re.compile(
 
 FLOW_TOOL_DETAIL_LIMIT = 140
 
-# T-260706-01 (아니키 GO 2026-07-06 00:21 '코덱스 흐름카드 규칙요약 ㄱ'): 셸 명령 원문을
+# T-260706-01 (2026-07-06 '코덱스 흐름카드 규칙요약' 요청): 셸 명령 원문을
 # 말줄임으로 자르는 대신 코드 규칙으로 '동작+대상'만 추출 — claude 카드(모델이 붙인 짧은
 # 설명)와 정보밀도 패리티. LLM 호출 0 (토큰 비용 0).
 FLOW_SUMMARY_MAX_SEGMENTS = 3
@@ -1159,7 +1164,7 @@ def summarize_shell_command(cmd: str) -> str:
 
 
 def compact_flow_detail(detail: str, limit: int = FLOW_TOOL_DETAIL_LIMIT) -> str:
-    """flow 카드 detail 컷 — T-260705-12 (아니키 제보 '쓰다가 끊긴 느낌').
+    """flow 카드 detail 컷 — T-260705-12 (사용자 제보 '쓰다가 끊긴 느낌').
 
     limit 초과 시 토큰(공백) 경계에서 자르고 '…' 를 붙인다. 경계가 컷 지점에서
     너무 멀면(마지막 30자 밖) 하드컷+…. limit 이하는 원문 그대로. 기존
@@ -3056,28 +3061,41 @@ def clean_pane_lines(screen: str) -> list[str]:
     return [ANSI_RE.sub("", line).rstrip() for line in screen.splitlines()]
 
 
+def repl_pane_activity_from_screen(screen: str, max_lines: int) -> str:
+    state = ""
+    active_turn = False
+    lines = [
+        line.strip()
+        for line in clean_pane_lines(screen or "")[-max_lines:]
+        if line.strip()
+    ]
+    for cleaned in lines:
+        if any(marker in cleaned for marker in CODEX_INTERRUPT_MARKERS):
+            state = "interrupt"
+            active_turn = False
+        elif REPL_QUEUED_RE.search(cleaned):
+            state = "alive"
+            active_turn = True
+        elif REPL_IDLE_DONE_RE.search(cleaned):
+            state = "idle"
+            active_turn = False
+        elif REPL_ACTIVE_BUSY_RE.search(cleaned):
+            state = "alive"
+            active_turn = True
+        elif REPL_PROMPT_READY_RE.search(cleaned):
+            if not active_turn:
+                state = "idle"
+        elif "clear to save" not in cleaned.lower() and REPL_BUSY_RE.search(cleaned):
+            state = "alive"
+    return state
+
+
 def screen_has_repl_busy_marker(screen: str) -> bool:
-    lines = clean_pane_lines(screen)[-20:]
-    tail = [line.strip() for line in lines if line.strip()]
-    for cleaned in tail[-8:]:
-        if REPL_IDLE_DONE_RE.search(cleaned) or REPL_PROMPT_READY_RE.search(cleaned):
-            return False
-    for cleaned in tail:
-        if "clear to save" in cleaned.lower():
-            continue
-        if REPL_BUSY_RE.search(cleaned):
-            return True
-    return False
+    return repl_pane_activity_from_screen(screen, 20) == "alive"
 
 
 def repl_typing_stop_signal_from_screen(screen: str) -> str:
-    lines = [ln.strip() for ln in clean_pane_lines(screen or "") if ln.strip()]
-    tail = lines[-6:]
-    if any(REPL_IDLE_DONE_RE.search(ln) or REPL_PROMPT_READY_RE.search(ln) for ln in tail):
-        return "idle"
-    if any(any(marker in ln for marker in CODEX_INTERRUPT_MARKERS) for ln in tail):
-        return "interrupt"
-    return ""
+    return repl_pane_activity_from_screen(screen, 6)
 
 
 def update_typing_watch_hits(
