@@ -19,7 +19,7 @@ import urllib.parse
 import urllib.request
 import xml.etree.ElementTree as ET
 from dataclasses import dataclass
-from pathlib import Path
+from pathlib import Path, PureWindowsPath
 from typing import Any, Callable
 
 
@@ -38,6 +38,10 @@ AUDIO_TRANSCRIBE_SCRIPT = REPO_DIR / "codex_audio_transcribe.py"
 WATCHDOG_SCRIPT = REPO_DIR / "bridge_watchdog.py"
 SETUP_TOTAL_STEPS = 6
 WINDOWS_BATCH_EXTENSIONS = {".bat", ".cmd"}
+WINDOWS_BRIDGE_PROCESS_PATTERN = (
+    r"telegram_agent_bridge\.py|codex_repl_bridge\.py|telegram-agent-bridge-run|"
+    r"(?:^|\s)-m\s+(?:codex_repl_bridge|telegram_agent_bridge)\b"
+)
 
 
 class SetupError(RuntimeError):
@@ -936,8 +940,23 @@ def install_windows_scheduled_task(
     return f"Scheduled Task: {task_name}"
 
 
+def windows_watchdog_python_executable(
+    python_executable: str | None = None,
+    *,
+    file_exists: Callable[[str], bool] | None = None,
+    which: Callable[[str], str | None] | None = None,
+) -> str:
+    file_exists = file_exists or os.path.isfile
+    which = which or shutil.which
+    python_bin = python_executable or sys.executable or which("python.exe") or which("python") or "python.exe"
+    pythonw = str(PureWindowsPath(str(python_bin)).with_name("pythonw.exe"))
+    if file_exists(pythonw):
+        return pythonw
+    return which("pythonw.exe") or which("pythonw") or str(python_bin)
+
+
 def windows_watchdog_task_action() -> str:
-    python_bin = sys.executable or shutil.which("python") or shutil.which("python3") or "python"
+    python_bin = windows_watchdog_python_executable()
     return " ".join(windows_command_quote(part) for part in [str(python_bin), str(WATCHDOG_SCRIPT)])
 
 
@@ -1045,7 +1064,7 @@ def windows_bridge_process_running(run: Callable[..., subprocess.CompletedProces
         "$ErrorActionPreference='SilentlyContinue'; "
         "$p = Get-CimInstance Win32_Process | Where-Object { "
         "$_.ProcessId -ne $PID -and $_.CommandLine -and "
-        "$_.CommandLine -match 'telegram_agent_bridge\\.py|codex_repl_bridge\\.py|telegram-agent-bridge-run' "
+        f"$_.CommandLine -match '{WINDOWS_BRIDGE_PROCESS_PATTERN}' "
         "} | Select-Object -First 1; "
         "if ($p) { 'running'; exit 0 } else { 'missing'; exit 1 }"
     )

@@ -7,6 +7,7 @@ import argparse
 import os
 import platform
 import subprocess
+import sys
 import time
 from pathlib import Path
 from typing import Callable
@@ -16,6 +17,10 @@ APP_NAME = "telegram-agent-bridge"
 SERVICE_NAME = "telegram-agent-bridge.service"
 LAUNCHD_LABEL = "com.user.telegram-agent-bridge"
 WINDOWS_TASK_NAME = APP_NAME
+WINDOWS_BRIDGE_PROCESS_PATTERN = (
+    r"telegram_agent_bridge\.py|codex_repl_bridge\.py|telegram-agent-bridge-run|"
+    r"(?:^|\s)-m\s+(?:codex_repl_bridge|telegram_agent_bridge)\b"
+)
 
 RunCommand = Callable[[list[str]], subprocess.CompletedProcess[str]]
 
@@ -35,7 +40,10 @@ def default_status_file() -> Path:
 
 
 def run_command(cmd: list[str]) -> subprocess.CompletedProcess[str]:
-    return subprocess.run(cmd, capture_output=True, text=True)
+    kwargs: dict[str, object] = {"capture_output": True, "text": True}
+    if sys.platform == "win32":
+        kwargs["creationflags"] = subprocess.CREATE_NO_WINDOW
+    return subprocess.run(cmd, **kwargs)
 
 
 def status_text(proc: subprocess.CompletedProcess[str]) -> str:
@@ -111,7 +119,7 @@ def windows_bridge_process_running(run: RunCommand) -> bool:
         "$ErrorActionPreference='SilentlyContinue'; "
         "$p = Get-CimInstance Win32_Process | Where-Object { "
         "$_.ProcessId -ne $PID -and $_.CommandLine -and "
-        "$_.CommandLine -match 'telegram_agent_bridge\\.py|codex_repl_bridge\\.py|telegram-agent-bridge-run' "
+        f"$_.CommandLine -match '{WINDOWS_BRIDGE_PROCESS_PATTERN}' "
         "}; "
         "if ($p) { 'running'; exit 0 } else { 'missing'; exit 1 }"
     )
