@@ -410,7 +410,8 @@ class Bridge:
         text = text or "(empty response)"
         private_chat = is_private_chat_id(self.config.chat_id)
         if private_chat:
-            text = strip_leading_emoji_decoration(text)
+            undecorated = strip_leading_emoji_decoration(text)
+            text = undecorated if undecorated.strip() else text
         if self.config.prefix and not private_chat:
             separator = "\n" if self.config.prefix_line else " "
             prefix = f"{self.config.prefix}{separator}"

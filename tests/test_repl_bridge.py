@@ -95,6 +95,7 @@ class ConfigDefaultsTest(unittest.TestCase):
         telegram.call = lambda method, **params: calls.append((method, params)) or {"ok": True}
 
         self.assertEqual(telegram.with_emoji_prefix("🙂😄👋 안녕하세요"), "안녕하세요")
+        self.assertEqual(telegram.with_emoji_prefix("🍎"), "🍎")
         self.assertTrue(telegram.send("답변", reply_to_message_id=42))
 
         self.assertEqual(calls[-1][1]["reply_to_message_id"], 42)
