@@ -86,8 +86,28 @@ class ConfigDefaultsTest(unittest.TestCase):
 
         self.assertEqual(
             telegram.with_emoji_prefix("🏭 ㅎㅇ 잘 지내, 대기 중입니다."),
-            "🏭\nㅎㅇ 잘 지내, 대기 중입니다.",
+            "ㅎㅇ 잘 지내, 대기 중입니다.",
         )
+
+    def test_private_chat_removes_leading_decorative_emoji_and_keeps_reply_quote(self):
+        telegram = repl.TelegramClient("token", "1234", "BOT", 4096)
+        calls = []
+        telegram.call = lambda method, **params: calls.append((method, params)) or {"ok": True}
+
+        self.assertEqual(telegram.with_emoji_prefix("🙂😄👋 안녕하세요"), "안녕하세요")
+        self.assertTrue(telegram.send("답변", reply_to_message_id=42))
+
+        self.assertEqual(calls[-1][1]["reply_to_message_id"], 42)
+
+    def test_group_chat_keeps_node_emoji_and_reply_quote(self):
+        telegram = repl.TelegramClient("token", "-1234", "BOT", 4096)
+        calls = []
+        telegram.call = lambda method, **params: calls.append((method, params)) or {"ok": True}
+
+        self.assertEqual(telegram.with_emoji_prefix("답변"), "BOT\n답변")
+        self.assertTrue(telegram.send("답변", reply_to_message_id=42))
+
+        self.assertEqual(calls[-1][1]["reply_to_message_id"], 42)
 
     def test_code_fence_sends_native_pre_entity(self):
         telegram = repl.TelegramClient("token", "1234", "BOT", 4096)
@@ -103,7 +123,7 @@ class ConfigDefaultsTest(unittest.TestCase):
         ]
         self.assertEqual(
             [params["text"] for params in messages],
-            ["BOT\nbefore", "a😀b", "BOT\nafter"],
+            ["before", "a😀b", "after"],
         )
         self.assertNotIn("entities", messages[0])
         self.assertEqual(

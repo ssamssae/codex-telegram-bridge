@@ -43,6 +43,36 @@ from typing import Any
 HOME = Path.home()
 KST = timezone(timedelta(hours=9), "KST")
 NODE_EMOJI_LINES = {"\U0001f34e", "\U0001f3ed", "\U0001fa9f", "\U0001f5a5", "\U0001f4bb", "\U0001f916"}
+
+
+def is_private_chat_id(chat_id: object) -> bool:
+    try:
+        return int(str(chat_id).strip()) > 0
+    except (TypeError, ValueError):
+        return False
+
+
+def strip_leading_emoji_decoration(text: str) -> str:
+    value = (text or "").lstrip()
+    index = 0
+    seen_decoration = False
+    while index < len(value):
+        codepoint = ord(value[index])
+        if (
+            0x1F1E6 <= codepoint <= 0x1F1FF
+            or 0x1F300 <= codepoint <= 0x1FAFF
+            or 0x2190 <= codepoint <= 0x2BFF
+            or 0x1F3FB <= codepoint <= 0x1F3FF
+            or codepoint in {0x200D, 0xFE0E, 0xFE0F}
+        ):
+            seen_decoration = True
+            index += 1
+            continue
+        if seen_decoration and value[index].isspace():
+            index += 1
+            continue
+        break
+    return value[index:].lstrip() if seen_decoration else value
 REASONING_HEADER = "\U0001f9e0 코덱스 사고"
 REASONING_MIRROR_LIMIT = 3500
 FLOW_MIRROR_HEADER = "⚙️ 작업 흐름"
@@ -2186,9 +2216,12 @@ class TelegramClient:
 
     def with_emoji_prefix(self, text: str) -> str:
         first_line = text.splitlines()[0].strip() if text.splitlines() else ""
-        if first_line == self.emoji:
+        private_chat = is_private_chat_id(self.chat_id)
+        if first_line == self.emoji and not private_chat:
             return text
         text = strip_inline_node_emoji_header(strip_node_emoji_header(text))
+        if private_chat:
+            return strip_leading_emoji_decoration(text)
         return f"{self.emoji}\n{text}"
 
     def chunks(self, text: str) -> list[str]:

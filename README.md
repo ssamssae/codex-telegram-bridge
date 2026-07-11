@@ -25,6 +25,10 @@ Codex Telegram Bridge lets you use a private Telegram bot as a phone remote for
 the Codex session running on your computer. A message sent to the bot appears in
 your visible Codex terminal, and Codex's answer comes back to Telegram.
 
+Private-chat replies omit configured `BOT`/node prefixes and leading decorative
+emoji. Group chats keep their prefix and node emoji so senders remain clear;
+reply quoting works the same on both surfaces.
+
 The default `repl` mode keeps the terminal as the source of truth. The bridge
 does not create a second hidden AI conversation.
 
