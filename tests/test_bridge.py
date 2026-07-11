@@ -98,7 +98,7 @@ class BridgeTests(unittest.TestCase):
 
             self.assertEqual(
                 bridge.telegram_chunks("abcdefghijklmnopqrstuvwxy"),
-                ["BOT abcdefgh", "ijklmnopqrst", "uvwxy"],
+                ["abcdefghijkl", "mnopqrstuvwx", "y"],
             )
 
             bridge.handle_update(
@@ -106,9 +106,17 @@ class BridgeTests(unittest.TestCase):
             )
             self.assertEqual(bridge.telegram.calls, [])
 
-    def test_bridge_prefix_can_use_own_line(self):
+    def test_private_chat_removes_prefix_and_leading_decorative_emoji(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             cfg = config(tmpdir, prefix="BOT", prefix_line=True, telegram_chunk=12)
+            bridge = tab.Bridge(cfg, tab.CodexBackend(cfg), FakeTelegram())
+
+            self.assertEqual(bridge.telegram_chunks("🙂😄👋 answer"), ["answer"])
+            self.assertEqual(bridge.telegram_chunks("🍎"), ["🍎"])
+
+    def test_group_chat_keeps_prefix(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            cfg = config(tmpdir, chat_id="-1234", prefix="BOT", prefix_line=True, telegram_chunk=12)
             bridge = tab.Bridge(cfg, tab.CodexBackend(cfg), FakeTelegram())
 
             self.assertEqual(bridge.telegram_chunks("answer"), ["BOT\nanswer"])
@@ -128,7 +136,7 @@ class BridgeTests(unittest.TestCase):
             ]
             self.assertEqual(
                 [params["text"] for params in messages],
-                ["BOT before", "a😀b", "BOT after"],
+                ["before", "a😀b", "after"],
             )
             self.assertNotIn("entities", messages[0])
             self.assertEqual(
@@ -164,7 +172,7 @@ class BridgeTests(unittest.TestCase):
                 for method, params in bridge.telegram.calls
                 if method == "sendMessage"
             ]
-            self.assertEqual(sent, ["BOT local input:\nhello", "BOT answer to hello"])
+            self.assertEqual(sent, ["local input:\nhello", "answer to hello"])
             self.assertIn("codex answer (local):\nanswer to hello", bridge.local_output)
 
     def test_telegram_job_mirrors_prompt_to_terminal_and_answer_to_telegram(self):
@@ -180,7 +188,7 @@ class BridgeTests(unittest.TestCase):
                 for method, params in bridge.telegram.calls
                 if method == "sendMessage"
             ]
-            self.assertEqual(sent, ["BOT done"])
+            self.assertEqual(sent, ["done"])
             self.assertIn("telegram input:\nfrom phone", bridge.local_output)
             self.assertIn("codex answer (telegram):\ndone", bridge.local_output)
 

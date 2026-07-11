@@ -111,6 +111,36 @@ def write_text_atomic(path: Path, value: str | int) -> None:
 CODE_FENCE_RE = re.compile(r"```([^\n`]*)\n(.*?)```", re.DOTALL)
 
 
+def is_private_chat_id(chat_id: object) -> bool:
+    try:
+        return int(str(chat_id).strip()) > 0
+    except (TypeError, ValueError):
+        return False
+
+
+def strip_leading_emoji_decoration(text: str) -> str:
+    value = (text or "").lstrip()
+    index = 0
+    seen_decoration = False
+    while index < len(value):
+        codepoint = ord(value[index])
+        if (
+            0x1F1E6 <= codepoint <= 0x1F1FF
+            or 0x1F300 <= codepoint <= 0x1FAFF
+            or 0x2190 <= codepoint <= 0x2BFF
+            or 0x1F3FB <= codepoint <= 0x1F3FF
+            or codepoint in {0x200D, 0xFE0E, 0xFE0F}
+        ):
+            seen_decoration = True
+            index += 1
+            continue
+        if seen_decoration and value[index].isspace():
+            index += 1
+            continue
+        break
+    return value[index:].lstrip() if seen_decoration else value
+
+
 def utf16_code_units(text: str) -> int:
     return len(text.encode("utf-16-le")) // 2
 
@@ -378,7 +408,11 @@ class Bridge:
 
     def telegram_chunks(self, text: str) -> list[str]:
         text = text or "(empty response)"
-        if self.config.prefix:
+        private_chat = is_private_chat_id(self.config.chat_id)
+        if private_chat:
+            undecorated = strip_leading_emoji_decoration(text)
+            text = undecorated if undecorated.strip() else text
+        if self.config.prefix and not private_chat:
             separator = "\n" if self.config.prefix_line else " "
             prefix = f"{self.config.prefix}{separator}"
         else:
