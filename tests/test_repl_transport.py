@@ -161,6 +161,80 @@ class ReplTransportTest(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "generation changed"):
             transport.verify()
 
+    def test_conpty_session_function_call_sends_enabled_flow_card(self) -> None:
+        session = self.root / "rollout.jsonl"
+        session.touch()
+        requests: list[dict] = []
+
+        def requester(request):
+            requests.append(request)
+            response = {
+                "request_id": request["request_id"],
+                "generation": request["generation"],
+                "ok": True,
+            }
+            if request["op"] == "session":
+                response["session_file"] = str(session)
+            return response
+
+        with mock.patch.dict(
+            os.environ,
+            {
+                "TAB_CHAT_ID": "1234",
+                "TAB_STATE_DIR": str(self.root / "state"),
+                "CRB_STATE_PATH": str(self.root / "bridge-state.json"),
+                "CRB_WORKDIR": str(self.root),
+                "CRB_REPL_TRANSPORT": "conpty",
+                "CRB_CONPTY_STATE_PATH": str(self.descriptor()),
+                "CRB_FLOW_MIRROR": "1",
+            },
+            clear=False,
+        ):
+            config = self.bridge.Config.from_env()
+
+        transport = self.bridge.ConPtyTransport(config, requester=requester)
+        self.assertEqual(transport.session_file(), session)
+        self.assertTrue(config.flow_mirror)
+
+        class RecordingTelegram:
+            def __init__(self):
+                self.sent: list[str] = []
+
+            def send_message_id(self, text):
+                self.sent.append(text)
+                return 77
+
+            def edit(self, _message_id, _text):
+                return True
+
+        telegram = RecordingTelegram()
+        bridge = self.bridge.Bridge(config, telegram, transport)
+        identity = self.bridge.session_identity(session)
+        bridge.session_identity = identity
+        bridge.bridge_state = self.bridge.bridge_state_default(identity)
+        bridge.current_flow_scope = "PowerShell synchronized turn"
+        bridge.repl_typing_stop = threading.Event()
+        event = self.bridge.extract_event(
+            {
+                "type": "response_item",
+                "payload": {
+                    "type": "function_call",
+                    "name": "exec_command",
+                    "arguments": '{"cmd":"git status"}',
+                },
+            }
+        )
+        self.assertIsNotNone(event)
+        kind, text = event
+        self.assertEqual(kind, "flow")
+        bridge.handle_flow_event(text, "conpty-flow-key")
+
+        self.assertEqual(requests[0]["op"], "session")
+        self.assertEqual(
+            telegram.sent,
+            [f"{self.bridge.FLOW_MIRROR_HEADER}\n• 실행 · git status"],
+        )
+
     def test_host_bracketed_paste_preserves_unicode_and_multiline(self) -> None:
         paste_frame, submit_frame = self.host.encode_paste(
             "한글 😀\r\n둘째 줄\n",

@@ -556,11 +556,13 @@ In Windows Terminal 2, start the bridge against the host descriptor:
 ```powershell
 $env:CRB_REPL_TRANSPORT = "conpty"
 $env:CRB_CONPTY_STATE_PATH = "$env:LOCALAPPDATA\codex-telegram-bridge\repl-host.json"
+$env:CRB_FLOW_MIRROR = "1"
 python -m codex_repl_bridge
 ```
 
 P0 supports text prompts, Korean/Unicode, multiline bracketed paste, and
-final/public-flow mirroring from the JSONL session created by that host.
+final/public-flow mirroring from the JSONL session created by that host. Set
+`CRB_FLOW_MIRROR=0` to disable the live-updating flow card.
 Screen-model features are intentionally deferred: Telegram approval/selection
 buttons and `/status` or `/context` TUI extraction still require tmux REPL mode.
 If more than one new Codex JSONL session appears during startup, the host stops
