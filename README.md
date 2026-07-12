@@ -38,6 +38,8 @@ does not create a second hidden AI conversation.
 - Python 3.10 or newer
 - [Codex CLI](https://developers.openai.com/codex/cli/) installed and logged in
 - `tmux` on Linux, WSL, or macOS for the full visible-session `repl` mode
+  (if missing, install once with `sudo apt install tmux` on Debian/Ubuntu or
+  `brew install tmux` on macOS)
 - two terminal windows during first-time setup
 
 Native Windows users can start with text-only `exec` mode without `tmux`. See
@@ -175,9 +177,12 @@ If `doctor` reports that the tmux session is missing, start terminal 1 again or
 switch to `exec` mode. If `codex-telegram-bridge` is not found, reactivate the
 virtual environment and retry.
 
-You now have the minimum working bridge. The sections below explain the public
-export model, setup wizard internals, services, media, approvals, security, and
-advanced configuration.
+You now have the minimum working bridge. When you want to stop or remove it
+later, run `codex-telegram-bridge uninstall` (add `--purge` to also delete the
+private config) — details in [Setup Commands](#setup-commands).
+
+The sections below explain the public export model, setup wizard internals,
+services, media, approvals, security, and advanced configuration.
 
 ## Public Export Model
 
@@ -385,6 +390,51 @@ py bridge_setup.py doctor
 
 `doctor` should finish with zero failures. If it prints a warning, follow the
 `Next steps` command printed above the summary, then run `doctor` again.
+
+### Native visible REPL P0 (manual foreground mode)
+
+The default Windows path above remains `exec` mode. An opt-in P0 can instead
+create one native visible Codex TUI that is owned by a foreground ConPTY host.
+It does not attach to a Codex session that was started earlier, install a
+service, edit Windows Terminal settings, or synthesize global keystrokes.
+
+First make sure the bot token and chat id are already present in the local
+environment. In Windows Terminal 1, start the host from the working directory
+where Codex should run:
+
+```powershell
+python -m codex_repl_host_windows --workdir $PWD
+```
+
+The host launches native Codex itself. Keep that terminal open; local keyboard
+input and Telegram input are serialized into the same TUI. Press `Ctrl+]` to
+close the foreground host without reserving `Ctrl+C`, which remains available
+to Codex. The first local or Telegram prompt creates the JSONL session; the
+host then binds that exact new file to its current generation. It waits for the
+first prompt instead of guessing an existing session.
+
+An optional local check creates a short-lived `cmd.exe` ConPTY and a protected
+IPC endpoint without contacting Codex or Telegram:
+
+```powershell
+python -m codex_repl_host_windows --self-test
+```
+
+In Windows Terminal 2, start the bridge against the host descriptor:
+
+```powershell
+$env:CRB_REPL_TRANSPORT = "conpty"
+$env:CRB_CONPTY_STATE_PATH = "$env:LOCALAPPDATA\codex-telegram-bridge\repl-host.json"
+python -m codex_repl_bridge
+```
+
+P0 supports text prompts, Korean/Unicode, multiline bracketed paste, and
+final/public-flow mirroring from the JSONL session created by that host.
+Screen-model features are intentionally deferred: Telegram approval/selection
+buttons and `/status` or `/context` TUI extraction still require tmux REPL mode.
+If more than one new Codex JSONL session appears during startup, the host stops
+instead of guessing. A restarted host uses a new generation and capability, so
+an old bridge cannot redirect queued input into the new session.
 
 Token safety rule: BotFather shows the token in Telegram, but you should copy it
 from BotFather and paste it into the local setup wizard in your terminal. In
@@ -757,6 +807,10 @@ These are product directions, not promises in the current release:
 - Keep `TAB_CHAT_ID` set to the intended chat id. This single-user allowlist is the main safety boundary.
 - Run this only on a trusted personal machine or trusted server. Telegram messages become Codex prompts.
 - Protect `CRB_SIGNAL_PATH`/`TAB_LOCAL_INPUT`. Anyone who can write to the FIFO can send prompts to Codex.
+- Native ConPTY P0 uses a current-user-only Windows named pipe plus a random
+  capability stored in a current-user-only descriptor file. Do not copy,
+  print, or share that descriptor. Prompt bodies and capabilities are excluded
+  from host logs.
 - Be careful with `TAB_CODEX_DANGEROUS_BYPASS=1`. It adds `--dangerously-bypass-approvals-and-sandbox`, allowing Codex to act without normal approval and sandbox protections.
 - Prefer a limited working directory in `TAB_WORKDIR` when possible.
 - This daemon uses Telegram polling, not a public inbound webhook. You do not need to expose a local port.

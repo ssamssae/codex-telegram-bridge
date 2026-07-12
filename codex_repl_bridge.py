@@ -1,20 +1,21 @@
 #!/usr/bin/env python3
-"""Telegram bridge for the existing Codex REPL.
+"""Telegram bridge for a visible Codex REPL.
 
-This bridge intentionally targets the visible `cx` / `tmux -L codex` REPL:
+The default transport targets the existing `cx` / `tmux -L codex` REPL. An
+opt-in native Windows transport talks to a foreground bridge-owned ConPTY host.
 
-- Telegram text is pasted into the existing Codex TUI.
+- Telegram text is pasted into the visible Codex TUI.
 - Final answers are read from Codex's JSONL session file, not from screen
   scraping.
 - Answers typed directly in the REPL are mirrored to Telegram too.
 
-There is no public non-TTY input API for an already-running Codex TUI, so only
-input delivery uses tmux. Reply extraction uses the structured session log.
+There is no supported late-attach input API for an arbitrary Codex TUI. The
+tmux transport attaches only to its configured pane; the native host launches
+and owns its child. Reply extraction always uses the structured session log.
 """
 
 from __future__ import annotations
 
-import fcntl
 import glob
 import hashlib
 import json
@@ -37,7 +38,46 @@ from contextlib import contextmanager
 from dataclasses import dataclass, replace
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable, Protocol, runtime_checkable
+
+try:
+    import fcntl
+except ImportError:  # Native Windows uses the ConPTY transport and host queue.
+    fcntl = None  # type: ignore[assignment]
+
+try:
+    import msvcrt
+except ImportError:  # POSIX — fcntl path above is authoritative.
+    msvcrt = None  # type: ignore[assignment]
+
+
+def lock_handle_nb(handle) -> None:
+    """Exclusive non-blocking OS file lock; BlockingIOError if already held.
+
+    Both backends keep the singleton invariant the pid-lock flock guard relies
+    on: the kernel drops the lock when the owning process dies, so a stale pid
+    can never wedge restarts (issues/2026-06-26-codex-bridge-stale-pid-loop.md).
+    """
+    if fcntl is not None:
+        fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        return
+    if msvcrt is not None:
+        handle.seek(0)
+        try:
+            msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
+        except OSError as exc:
+            raise BlockingIOError(str(exc)) from exc
+        return
+    raise RuntimeError("no OS file-lock backend available (fcntl/msvcrt)")
+
+
+def unlock_handle(handle) -> None:
+    if fcntl is not None:
+        fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+        return
+    if msvcrt is not None:
+        handle.seek(0)
+        msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
 
 
 HOME = Path.home()
@@ -73,8 +113,6 @@ def strip_leading_emoji_decoration(text: str) -> str:
             continue
         break
     return value[index:].lstrip() if seen_decoration else value
-
-
 REASONING_HEADER = "\U0001f9e0 코덱스 사고"
 REASONING_MIRROR_LIMIT = 3500
 FLOW_MIRROR_HEADER = "⚙️ 작업 흐름"
@@ -238,6 +276,23 @@ def int_env(name: str, default: int, minimum: int = 0) -> int:
 def bool_env(name: str, default: bool = False) -> bool:
     fallback = "1" if default else "0"
     return (env(name, fallback) or fallback).lower() in {"1", "true", "yes", "on"}
+
+
+def suggested_reply_messages(text: str, enabled: bool, surface: str) -> list[str]:
+    original = text or ""
+    trimmed = original.rstrip("\r\n")
+    lines = trimmed.splitlines()
+    if not lines:
+        return [original]
+    match = re.fullmatch(r"<추천답변>([^\r\n]+)</추천답변>", lines[-1])
+    if not match:
+        return [original]
+    body = "\n".join(lines[:-1]).rstrip()
+    if not body:
+        return [match.group(1)]
+    if enabled and surface == "aniki_dm":
+        return [body, match.group(1)]
+    return [body]
 
 
 def clamp(value: int, minimum: int, maximum: int) -> int:
@@ -1824,6 +1879,11 @@ class Config:
     flow_mirror: bool
     signal_path: Path | None = None
     directive_signal_path: Path | None = None
+    transport_mode: str = "tmux"
+    conpty_state_path: Path | None = None
+    conpty_timeout_ms: int = 5000
+    suggested_reply_bubble: bool = False
+    native_turn_stale_seconds: int = 300
 
     @classmethod
     def from_env(cls) -> "Config":
@@ -1842,6 +1902,9 @@ class Config:
             else Path("~/.config/codex-telegram-bridge/token.json").expanduser()
         )
         default_state_path = state_dir / f"codex-repl-bridge-{node}.state.json"
+        local_app_data = env("LOCALAPPDATA")
+        native_state_root = Path(local_app_data) if local_app_data else state_dir
+        default_conpty_state = native_state_root / "codex-telegram-bridge" / "repl-host.json"
         return cls(
             node=node,
             emoji=env("CRB_EMOJI", env("TAB_PREFIX", default_emoji) or default_emoji)
@@ -1917,6 +1980,18 @@ class Config:
             flow_mirror=bool_env("CRB_FLOW_MIRROR", True),
             signal_path=optional_path_env("CRB_SIGNAL_PATH", env("TAB_LOCAL_INPUT")),
             directive_signal_path=optional_path_env(DIRECTIVE_SIGNAL_ENV, str(state_dir / "received-directive.jsonl")),
+            transport_mode=(env("CRB_REPL_TRANSPORT", "tmux") or "tmux").strip().lower(),
+            conpty_state_path=Path(
+                env("CRB_CONPTY_STATE_PATH", str(default_conpty_state))
+                or str(default_conpty_state)
+            ).expanduser(),
+            conpty_timeout_ms=int_env("CRB_CONPTY_TIMEOUT_MS", 5000, minimum=100),
+            suggested_reply_bubble=bool_env("SUGGESTED_REPLY_BUBBLE", False),
+            native_turn_stale_seconds=int_env(
+                "CRB_NATIVE_TURN_STALE_SECONDS",
+                300,
+                minimum=0,
+            ),
         )
 
     @property
@@ -2247,6 +2322,13 @@ class TelegramClient:
             rest = rest[self.chunk_size :]
         return out
 
+    def send_copy_content(self, text: str) -> bool:
+        ok = True
+        for chunk in self.raw_chunks(text):
+            payload = self.call("sendMessage", chat_id=self.chat_id, text=chunk)
+            ok = ok and bool(payload and payload.get("ok"))
+        return ok
+
     def send(self, text: str, reply_to_message_id: int | None = None) -> bool:
         ok = True
         sent_count = 0
@@ -2469,21 +2551,58 @@ class TelegramClient:
         )
 
 
-class CodexRepl:
+@dataclass(frozen=True)
+class TransportChoice:
+    value: str
+    key: str = ""
+    index: int = 0
+    selected_index: int | None = None
+
+
+@runtime_checkable
+class ReplTransport(Protocol):
+    """Minimum input/session contract shared by tmux and native ConPTY."""
+
+    supports_pane_features: bool
+
+    def verify(self) -> None: ...
+
+    def paste_prompt(self, text: str) -> None: ...
+
+    def clear_composer(self) -> None: ...
+
+    def capture_screen(self, lines: int = 80) -> str: ...
+
+    def send_key(self, key: str) -> None: ...
+
+    def send_choice(self, option: TransportChoice) -> None: ...
+
+    def session_file(self) -> Path: ...
+
+
+class TmuxTransport:
+    """Behavior-compatible transport for the existing visible tmux REPL."""
+
+    supports_pane_features = True
+
     def __init__(self, config: Config) -> None:
         self.config = config
+        self._thread_lock = threading.RLock()
 
     @contextmanager
     def composer_lock(self):
-        path = composer_lock_path()
-        path.parent.mkdir(parents=True, exist_ok=True)
-        with path.open("a", encoding="utf-8") as lock_file:
-            # ⚠️ 제거 금지 (DO NOT REMOVE) — codex composer single-writer guard (T-260628-35)
-            fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
-            try:
-                yield
-            finally:
-                fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+        with self._thread_lock:
+            path = composer_lock_path()
+            path.parent.mkdir(parents=True, exist_ok=True)
+            with path.open("a", encoding="utf-8") as lock_file:
+                # ⚠️ 제거 금지 (DO NOT REMOVE) — codex composer single-writer guard (T-260628-35)
+                if fcntl is not None:
+                    fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
+                try:
+                    yield
+                finally:
+                    if fcntl is not None:
+                        fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
 
     def tmux(self, *args: str, input_text: str | None = None) -> subprocess.CompletedProcess[str]:
         cmd = [self.config.tmux_bin, "-L", self.config.tmux_socket, *args]
@@ -2532,6 +2651,11 @@ class CodexRepl:
         with self.composer_lock():
             self._paste_prompt_unlocked(prompt)
 
+    def replace_prompt(self, prompt: str) -> None:
+        with self.composer_lock():
+            self._clear_composer_unlocked()
+            self._paste_prompt_unlocked(prompt)
+
     def _clear_composer_unlocked(self) -> None:
         self.verify()
         # C-u only clears text before the cursor. After a rejected slash command,
@@ -2545,7 +2669,7 @@ class CodexRepl:
         with self.composer_lock():
             self._clear_composer_unlocked()
 
-    def capture_pane(self, lines: int = 80) -> str:
+    def capture_screen(self, lines: int = 80) -> str:
         out = self.tmux(
             "capture-pane",
             "-p",
@@ -2556,6 +2680,9 @@ class CodexRepl:
             self.config.pane_target,
         )
         return out.stdout
+
+    # Compatibility aliases for external callers during the transport rename.
+    capture_pane = capture_screen
 
     @contextmanager
     def temporary_window_width(self, columns: int = STATUS_WIDE_CAPTURE_COLUMNS):
@@ -2613,7 +2740,7 @@ class CodexRepl:
                 except Exception as exc:  # noqa: BLE001
                     log("REPL", f"wide status capture restore failed: {exc}")
 
-    def send_approval_key(self, key: str) -> None:
+    def send_key(self, key: str) -> None:
         normalized = key.strip().lower()
         if normalized in {"esc", "escape"}:
             self.tmux("send-keys", "-t", self.config.pane_target, "Escape")
@@ -2627,14 +2754,13 @@ class CodexRepl:
         time.sleep(0.1)
         self.tmux("send-keys", "-t", self.config.pane_target, "Enter")
 
-    def send_choice_option(self, prompt: ChoicePrompt, option: ChoiceOption) -> None:
+    def send_choice(self, option: TransportChoice) -> None:
         if option.key:
-            self.send_approval_key(option.key)
+            self.send_key(option.key)
             return
 
-        selected = prompt.selected_option()
-        if selected is not None:
-            delta = option.index - selected.index
+        if option.selected_index is not None:
+            delta = option.index - option.selected_index
             key = "Down" if delta > 0 else "Up"
             for _ in range(abs(delta)):
                 self.tmux("send-keys", "-t", self.config.pane_target, key)
@@ -2642,7 +2768,20 @@ class CodexRepl:
             self.tmux("send-keys", "-t", self.config.pane_target, "Enter")
             return
 
-        self.send_approval_key(option.value)
+        self.send_key(option.value)
+
+    send_approval_key = send_key
+
+    def send_choice_option(self, prompt: ChoicePrompt, option: ChoiceOption) -> None:
+        selected = prompt.selected_option()
+        self.send_choice(
+            TransportChoice(
+                value=option.value,
+                key=option.key,
+                index=option.index,
+                selected_index=selected.index if selected is not None else None,
+            )
+        )
 
     def session_file(self) -> Path:
         pid = self.pane_pid()
@@ -2653,6 +2792,174 @@ class CodexRepl:
         if path:
             return path
         raise RuntimeError("could not find active Codex TUI session JSONL")
+
+
+CONPTY_DESCRIPTOR_SCHEMA = 1
+CONPTY_MAX_FRAME_BYTES = 256 * 1024
+
+
+class ConPtyTransport:
+    """Authenticated client for a foreground bridge-owned Windows ConPTY host."""
+
+    supports_pane_features = False
+
+    def __init__(
+        self,
+        config: Config,
+        requester: Callable[[dict[str, Any]], dict[str, Any]] | None = None,
+    ) -> None:
+        self.config = config
+        self.state_path = config.conpty_state_path or (
+            config.state_dir / "codex-telegram-bridge" / "repl-host.json"
+        )
+        descriptor = read_json(self.state_path)
+        if not descriptor:
+            raise RuntimeError("ConPTY host descriptor is missing")
+        self.generation = self._descriptor_value(descriptor, "generation", minimum=16)
+        self.capability = self._descriptor_value(descriptor, "capability", minimum=32)
+        self.pipe_name = self._descriptor_value(descriptor, "pipe_name", minimum=12)
+        if descriptor.get("schema") != CONPTY_DESCRIPTOR_SCHEMA:
+            raise RuntimeError("ConPTY host descriptor schema mismatch")
+        if not self.pipe_name.startswith("\\\\.\\pipe\\codex-repl-host-"):
+            raise RuntimeError("ConPTY host descriptor pipe is invalid")
+        self._requester = requester
+
+    @staticmethod
+    def _descriptor_value(descriptor: dict[str, Any], key: str, minimum: int) -> str:
+        value = descriptor.get(key)
+        if not isinstance(value, str) or len(value) < minimum:
+            raise RuntimeError(f"ConPTY host descriptor {key} is invalid")
+        return value
+
+    def _pipe_request(self, request: dict[str, Any]) -> dict[str, Any]:
+        if os.name != "nt":
+            raise RuntimeError("ConPtyTransport requires native Windows")
+        import ctypes
+
+        timeout_ms = max(100, int(self.config.conpty_timeout_ms))
+        wait_named_pipe = ctypes.windll.kernel32.WaitNamedPipeW
+        wait_named_pipe.argtypes = [ctypes.c_wchar_p, ctypes.c_uint32]
+        wait_named_pipe.restype = ctypes.c_int
+        if not wait_named_pipe(self.pipe_name, timeout_ms):
+            raise RuntimeError("ConPTY host IPC is unavailable")
+        encoded = (json.dumps(request, ensure_ascii=False, separators=(",", ":")) + "\n").encode(
+            "utf-8"
+        )
+        if len(encoded) > CONPTY_MAX_FRAME_BYTES:
+            raise RuntimeError("ConPTY IPC frame is too large")
+        try:
+            with open(self.pipe_name, "r+b", buffering=0) as pipe:
+                pipe.write(encoded)
+                response = bytearray()
+                while len(response) <= CONPTY_MAX_FRAME_BYTES:
+                    chunk = pipe.read(1)
+                    if not chunk or chunk == b"\n":
+                        break
+                    response.extend(chunk)
+        except OSError as exc:
+            raise RuntimeError("ConPTY host IPC failed") from exc
+        if not response or len(response) > CONPTY_MAX_FRAME_BYTES:
+            raise RuntimeError("ConPTY host IPC response is invalid")
+        try:
+            payload = json.loads(response.decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise RuntimeError("ConPTY host IPC response is invalid") from exc
+        if not isinstance(payload, dict):
+            raise RuntimeError("ConPTY host IPC response is invalid")
+        return payload
+
+    def _request(self, op: str, **params: Any) -> dict[str, Any]:
+        request_id = secrets.token_hex(12)
+        request = {
+            "schema": CONPTY_DESCRIPTOR_SCHEMA,
+            "request_id": request_id,
+            "generation": self.generation,
+            "capability": self.capability,
+            "op": op,
+            **params,
+        }
+        response = self._requester(request) if self._requester else self._pipe_request(request)
+        if not isinstance(response, dict):
+            raise RuntimeError("ConPTY host IPC response is invalid")
+        if response.get("request_id") != request_id:
+            raise RuntimeError("ConPTY host IPC response id mismatch")
+        response_generation = str(response.get("generation", ""))
+        if not secrets.compare_digest(response_generation, self.generation):
+            raise RuntimeError("ConPTY host generation changed")
+        if response.get("ok") is not True:
+            code = str(response.get("error", "request_failed"))
+            raise RuntimeError(f"ConPTY host rejected request: {code}")
+        return response
+
+    def verify(self) -> None:
+        self._request("verify")
+
+    def paste_prompt(self, text: str) -> None:
+        payload = text.rstrip("\n")
+        if not payload:
+            return
+        self._request(
+            "paste",
+            text=payload,
+            clear_before=False,
+            submit_key="Enter" if is_codex_slash_command(payload) else self.config.submit_key,
+            enter_count=(
+                1
+                if is_codex_slash_command(payload) or self.config.submit_key != "Enter"
+                else self.config.enter_count
+            ),
+        )
+
+    def replace_prompt(self, text: str) -> None:
+        payload = text.rstrip("\n")
+        if not payload:
+            return
+        self._request(
+            "paste",
+            text=payload,
+            clear_before=True,
+            submit_key="Enter" if is_codex_slash_command(payload) else self.config.submit_key,
+            enter_count=(
+                1
+                if is_codex_slash_command(payload) or self.config.submit_key != "Enter"
+                else self.config.enter_count
+            ),
+        )
+
+    def clear_composer(self) -> None:
+        self._request("clear")
+
+    def capture_screen(self, lines: int = 80) -> str:
+        response = self._request("capture", lines=clamp(int(lines), 1, 500))
+        screen = response.get("screen", "")
+        return screen if isinstance(screen, str) else ""
+
+    def send_key(self, key: str) -> None:
+        normalized = key.strip()
+        if not normalized:
+            raise RuntimeError("empty ConPTY key")
+        self._request("key", key=normalized)
+
+    def send_choice(self, option: TransportChoice) -> None:
+        self._request(
+            "choice",
+            value=option.value,
+            key=option.key,
+            index=option.index,
+            selected_index=option.selected_index,
+        )
+
+    def session_file(self) -> Path:
+        response = self._request("session")
+        raw = response.get("session_file")
+        if not isinstance(raw, str) or not raw:
+            raise RuntimeError("ConPTY host session is not bound")
+        return Path(raw)
+
+
+# Temporary import compatibility for private callers while the product moves to
+# the explicit transport contract.
+CodexRepl = TmuxTransport
 
 
 def proc_ppid(pid: int) -> int | None:
@@ -3551,7 +3858,7 @@ def should_resend_prompt_card(
 
 
 class Bridge:
-    def __init__(self, config: Config, telegram: TelegramClient, repl: CodexRepl) -> None:
+    def __init__(self, config: Config, telegram: TelegramClient, repl: ReplTransport) -> None:
         self.config = config
         self.telegram = telegram
         self.repl = repl
@@ -3611,10 +3918,12 @@ class Bridge:
         # restart 루프 중 죽은 pid 가 재사용되면 "already running" 오판으로 자기영속
         # 크래시 루프(NRestarts 1320회)에 빠졌음. claude-telegram-bridge.py 와 동일한
         # flock 으로 통일. 근거: issues/2026-06-26-codex-bridge-stale-pid-loop.md
+        # Windows(fcntl=None)는 msvcrt.locking 동등 분기 — 커널 자동해제 불변식 동일
+        # (lock_handle_nb docstring, T-260711-13).
         self.config.state_dir.mkdir(parents=True, exist_ok=True)
         self.pid_handle = self.config.pid_file.open("a+")
         try:
-            fcntl.flock(self.pid_handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            lock_handle_nb(self.pid_handle)
         except BlockingIOError as exc:
             try:
                 self.pid_handle.close()
@@ -3635,7 +3944,7 @@ class Bridge:
         if handle is not None:
             if owns_lock:
                 try:
-                    fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+                    unlock_handle(handle)
                 except OSError:
                     pass
             try:
@@ -3922,6 +4231,15 @@ class Bridge:
             log("SEND", "blocked by CRB_KILL=1")
             mesh_ledger_record("sendMessage", self.config.chat_id, answer, result="suppressed")
             return False
+        chat_id = getattr(self.config, "chat_id", getattr(self.telegram, "chat_id", ""))
+        surface = "aniki_dm" if is_private_chat_id(chat_id) else "mesh_group"
+        answer_messages = suggested_reply_messages(
+            answer,
+            getattr(self.config, "suggested_reply_bubble", False),
+            surface,
+        )
+        answer = answer_messages[0]
+        suggested_reply = answer_messages[1] if len(answer_messages) == 2 else ""
         attachments = extract_local_attachment_paths(
             answer,
             self.config.attachment_roots,
@@ -3985,6 +4303,8 @@ class Bridge:
             self.ambient_directive_body = ""
             if len(unified) <= 4000 and self.telegram.edit(anchor, unified):
                 log("SEND", f"edited codex answer into directive anchor mid={anchor}")
+                if suggested_reply and not self.telegram.send_copy_content(suggested_reply):
+                    log("SEND", "suggested reply bubble failed after final answer (non-fatal)")
                 return True
             # 폴백: 길이초과/edit실패 → 아래에서 새 카드 send
         ok = sent_via_reply or self.telegram.send(outgoing, reply_to_message_id=telegram_reply_anchor)
@@ -3999,6 +4319,8 @@ class Bridge:
                 # 첨부 실패는 1줄 공지로 가시화하고 턴은 완료 처리 — 파일은 노드에 보존.
                 log("ATTACH", f"send failed: {path}")
                 self.telegram.send(f"⚠️ 첨부 전송 실패 — 파일은 노드에 보존됨: {path}")
+        if suggested_reply and not self.telegram.send_copy_content(suggested_reply):
+            log("SEND", "suggested reply bubble failed after final answer (non-fatal)")
         return True
 
     def persist_state(self, offset: int | None = None, event_key: str | None = None) -> None:
@@ -4309,7 +4631,11 @@ class Bridge:
                             break
                         self.session_pos = line_end
             except Exception as exc:  # noqa: BLE001
-                log("JSONL", f"watch error: {exc}")
+                if not (
+                    not getattr(self.repl, "supports_pane_features", True)
+                    and "session_unbound" in str(exc)
+                ):
+                    log("JSONL", f"watch error: {exc}")
             self.poll_directive_signals()
             time.sleep(0.5)
 
@@ -4383,15 +4709,19 @@ class Bridge:
         Only the last few non-empty lines are inspected so a stale marker still
         sitting in scrollback from an OLD error does not falsely trip detection.
         """
+        if not getattr(self.repl, "supports_pane_features", True):
+            return False
         try:
-            screen = self.repl.capture_pane(15)
+            screen = self.repl.capture_screen(15)
         except Exception:  # noqa: BLE001
             return False
         return repl_typing_stop_signal_from_screen(screen) == "interrupt"
 
     def repl_typing_stop_signal(self) -> str:
+        if not getattr(self.repl, "supports_pane_features", True):
+            return ""
         try:
-            screen = self.repl.capture_pane(15)
+            screen = self.repl.capture_screen(15)
         except Exception:  # noqa: BLE001
             return "capture_error"
         return repl_typing_stop_signal_from_screen(screen)
@@ -4571,6 +4901,8 @@ class Bridge:
         def loop() -> None:
             while not stop_event.wait(interval):
                 elapsed = time.monotonic() - started
+                if self.abort_lost_native_turn(prompt, elapsed):
+                    return
                 log("PROG", f"send long-running update after {int(elapsed)}s")
                 message = self.long_running_progress_message(prompt, elapsed)
                 if self.telegram.send(message):
@@ -4581,6 +4913,52 @@ class Bridge:
         with self.long_running_progress_lock:
             self.long_running_progress_stop = stop_event
         threading.Thread(target=loop, daemon=True, name="crb-long-progress").start()
+
+    def native_turn_loss_reason(self, elapsed_seconds: float) -> str:
+        """Native ConPTY has no pane busy marker, so a lost turn (host
+        restart, unbound or hijacked session) would heartbeat forever unless
+        the bridge gives up. Return a reason when the turn is provably lost."""
+
+        if getattr(self.repl, "supports_pane_features", True):
+            return ""
+        cutoff = int(getattr(self.config, "native_turn_stale_seconds", 0) or 0)
+        if cutoff <= 0:
+            return ""
+        try:
+            self.repl.verify()
+        except Exception as exc:  # noqa: BLE001
+            return f"host generation changed or unreachable ({exc})"
+        if elapsed_seconds < cutoff:
+            return ""
+        try:
+            session = self.repl.session_file()
+        except Exception as exc:  # noqa: BLE001
+            return f"session unbound for {int(elapsed_seconds)}s ({exc})"
+        try:
+            idle = time.time() - session.stat().st_mtime
+        except OSError as exc:
+            return f"session file unreadable ({exc})"
+        if idle >= cutoff:
+            return f"session idle for {int(idle)}s during an active turn"
+        return ""
+
+    def abort_lost_native_turn(self, prompt: str, elapsed_seconds: float) -> bool:
+        reason = self.native_turn_loss_reason(elapsed_seconds)
+        if not reason:
+            return False
+        log("PROG", f"abort lost native turn: {reason}")
+        summary = format_progress_summary(prompt, 80)
+        self.telegram.send(
+            f"⚠️ Turn lost — {reason}. I can no longer deliver the answer for '{summary}' "
+            "and am releasing the wait. Send it again to start a fresh turn."
+        )
+        self.stop_repl_typing()
+        self.stop_telegram_fallback()
+        self.resolve_midreport_obligation("failed", f"native turn lost: {reason}")
+        self.finish_duplicate_final_turn()
+        with self.long_running_progress_lock:
+            self.long_running_progress_stop = None
+        return True
 
     def start_telegram_fallback(self, prompt: str) -> None:
         self.stop_telegram_fallback()
@@ -4712,8 +5090,10 @@ class Bridge:
             stop_event.set()
 
     def repl_is_working(self) -> bool:
+        if not getattr(self.repl, "supports_pane_features", True):
+            return False
         try:
-            screen = self.repl.capture_pane(60)
+            screen = self.repl.capture_screen(60)
         except Exception as exc:  # noqa: BLE001
             log("LIVE", f"pane capture failed: {exc}")
             return False
@@ -4763,36 +5143,40 @@ class Bridge:
         context_only = is_context_command(text)
         if not (context_only or is_status_command(text)):
             return False
+        if not getattr(self.repl, "supports_pane_features", True):
+            self.telegram.send(
+                "native ConPTY P0에서는 화면 기반 /status·/context를 아직 지원하지 않습니다. "
+                "프롬프트 주입과 JSONL 답변 미러만 사용해 주세요."
+            )
+            return True
         label = "context" if context_only else "status"
-        log("TG", f"{label} -> Codex footer")
+        log("TG", f"{label} -> {'Codex footer' if context_only else 'Codex REPL live capture'}")
         self.begin_repl_typing()
         try:
-            screen = self.repl.capture_pane(30)
-            answer = (
-                extract_codex_footer_context_text(screen)
-                if context_only
-                else extract_codex_footer_status_text(screen)
-            )
-            footer_answer = bool(answer)
+            # /status must render the live TUI limit bars on every node. A visible
+            # footer is only a safe shortcut for /context, which needs one value.
+            answer = ""
+            if context_only:
+                screen = self.repl.capture_screen(30)
+                answer = extract_codex_footer_context_text(screen)
             if not answer:
-                log("TG", f"{label} footer unavailable -> Codex REPL fallback")
+                if context_only:
+                    log("TG", "context footer unavailable -> Codex REPL fallback")
                 wide_context = getattr(self.repl, "temporary_window_width", None)
                 if callable(wide_context):
                     with wide_context(STATUS_WIDE_CAPTURE_COLUMNS):
                         self.clear_and_paste_prompt("/status", label)
                         time.sleep(1.0)
-                        screen = self.repl.capture_pane(120)
+                        screen = self.repl.capture_screen(120)
                 else:
                     self.clear_and_paste_prompt("/status", label)
                     time.sleep(1.0)
-                    screen = self.repl.capture_pane(120)
+                    screen = self.repl.capture_screen(120)
                 answer = (
                     extract_codex_context_text(screen)
                     if context_only
                     else extract_codex_status_text(screen)
-            )
-            if not context_only and footer_answer:
-                answer = append_rate_limit_resets(answer, self.repl.session_file())
+                )
             if context_only:
                 self.telegram.send(answer)
             else:
@@ -4810,6 +5194,12 @@ class Bridge:
     def clear_and_paste_prompt(self, prompt: str, label: str = "telegram input") -> None:
         if not is_codex_slash_command(prompt) and self.repl_is_working():
             self.paste_prompt_without_clearing_composer(prompt, label)
+            return
+        replace_prompt = getattr(self.repl, "replace_prompt", None)
+        if callable(replace_prompt):
+            replace_prompt(prompt)
+            log("REPL", f"cleared composer before {label}")
+            self.needs_composer_clear = False
             return
         composer_lock = getattr(self.repl, "composer_lock", None)
         clear_unlocked = getattr(self.repl, "_clear_composer_unlocked", None)
@@ -4853,7 +5243,9 @@ class Bridge:
         command = slash_command_token(text)
         if not command:
             return False
-        screen = self.repl.capture_pane(120)
+        if not getattr(self.repl, "supports_pane_features", True):
+            return False
+        screen = self.repl.capture_screen(120)
         error = extract_unrecognized_slash_error(screen, command)
         if error:
             self.needs_composer_clear = True
@@ -4873,7 +5265,7 @@ class Bridge:
     def approval_loop(self) -> None:
         while not self.stop_event.is_set():
             try:
-                screen = self.repl.capture_pane()
+                screen = self.repl.capture_screen()
                 prompt = parse_approval_prompt(screen)
                 choice_prompt = None if prompt else parse_choice_prompt(screen)
                 should_send = False
@@ -5081,7 +5473,7 @@ class Bridge:
         if option is None:
             return False
         try:
-            self.repl.send_approval_key(option.key)
+            self.repl.send_key(option.key)
         except Exception as exc:  # noqa: BLE001
             log("APPROV", f"choice failed: {exc}")
             self.telegram.send(f"Codex approval choice failed: {exc}")
@@ -5269,7 +5661,15 @@ class Bridge:
         if option is None:
             return False
         try:
-            self.repl.send_choice_option(prompt, option)
+            selected = prompt.selected_option()
+            self.repl.send_choice(
+                TransportChoice(
+                    value=option.value,
+                    key=option.key,
+                    index=option.index,
+                    selected_index=selected.index if selected is not None else None,
+                )
+            )
         except Exception as exc:  # noqa: BLE001
             log("CHOICE", f"choice failed: {exc}")
             self.telegram.send(f"Codex selection failed: {exc}")
@@ -6071,15 +6471,19 @@ class Bridge:
 
     def run(self) -> None:
         self.repl.verify()
-        self.ensure_session_file()
+        if getattr(self.repl, "supports_pane_features", True):
+            self.ensure_session_file()
         self.acquire_lock()
         jsonl_thread = threading.Thread(target=self.jsonl_loop, daemon=True)
         jsonl_thread.start()
-        approval_thread = threading.Thread(target=self.approval_loop, daemon=True)
-        approval_thread.start()
-        self.recover_repl_liveness("startup")
-        liveness_thread = threading.Thread(target=self.liveness_loop, daemon=True)
-        liveness_thread.start()
+        if getattr(self.repl, "supports_pane_features", True):
+            approval_thread = threading.Thread(target=self.approval_loop, daemon=True)
+            approval_thread.start()
+            self.recover_repl_liveness("startup")
+            liveness_thread = threading.Thread(target=self.liveness_loop, daemon=True)
+            liveness_thread.start()
+        else:
+            log("REPL", "native ConPTY P0: pane approval/status/liveness parity deferred")
         if self.config.signal_path is not None:
             self.ensure_signal_fifo()
             log("SIGNAL", f"fifo ready: {self.config.signal_path}")
@@ -6092,6 +6496,15 @@ class Bridge:
             self.release_lock()
 
 
+def build_repl_transport(config: Config) -> ReplTransport:
+    mode = (config.transport_mode or "tmux").strip().lower()
+    if mode == "tmux":
+        return TmuxTransport(config)
+    if mode in {"conpty", "native-windows", "windows"}:
+        return ConPtyTransport(config)
+    raise RuntimeError(f"unsupported CRB_REPL_TRANSPORT: {mode}")
+
+
 def main() -> int:
     try:
         config = Config.from_env()
@@ -6099,7 +6512,7 @@ def main() -> int:
         bridge = Bridge(
             config,
             TelegramClient(token, config.chat_id, config.emoji, config.telegram_chunk),
-            CodexRepl(config),
+            build_repl_transport(config),
         )
     except Exception as exc:  # noqa: BLE001
         print(f"configuration error: {exc}", file=sys.stderr)
@@ -6110,12 +6523,15 @@ def main() -> int:
         bridge.release_lock()
         raise SystemExit(128 + signum)
 
-    for signum in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP):
+    stop_signals = [signal.SIGINT, signal.SIGTERM]
+    if hasattr(signal, "SIGHUP"):
+        stop_signals.append(signal.SIGHUP)
+    for signum in stop_signals:
         signal.signal(signum, stop)
 
     log(
         "START",
-        f"node={config.node} chat={config.chat_id} tmux={config.tmux_socket}/{config.tmux_session}",
+        f"node={config.node} chat={config.chat_id} transport={config.transport_mode}",
     )
     try:
         bridge.run()

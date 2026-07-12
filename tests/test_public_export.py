@@ -3,6 +3,7 @@ import os
 import sys
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 from unittest import mock
 
 
@@ -45,6 +46,48 @@ class PublicExportTest(unittest.TestCase):
         # T-260701-68: stripped mesh layer must leave working no-op stubs
         self.assertIsNone(mod.mesh_cutover_call("sendMessage", {}))
         self.assertIsNone(mod.mesh_ledger_record())
+
+    def test_private_dm_removes_leading_decoration_and_group_keeps_context(self):
+        path = Path(__file__).resolve().parents[1] / "codex_repl_bridge.py"
+        spec = importlib.util.spec_from_file_location("codex_repl_bridge_behavior", path)
+        mod = importlib.util.module_from_spec(spec)
+        sys.modules[spec.name] = mod
+        spec.loader.exec_module(mod)
+
+        private = mod.TelegramClient("token", "1234", "BOT", 4096)
+        private_calls = []
+        private.call = lambda method, **params: private_calls.append((method, params)) or {"ok": True}
+        self.assertEqual(private.with_emoji_prefix("🙂😄👋 hello"), "hello")
+        self.assertEqual(private.with_emoji_prefix("🍎"), "🍎")
+        private.send("answer", reply_to_message_id=42)
+        self.assertEqual(private_calls[-1][1]["reply_to_message_id"], 42)
+
+        group = mod.TelegramClient("token", "-1234", "BOT", 4096)
+        group_calls = []
+        group.call = lambda method, **params: group_calls.append((method, params)) or {"ok": True}
+        group.send("answer", reply_to_message_id=42)
+        self.assertEqual(group_calls[-1][1]["text"], "BOT\nanswer")
+        self.assertEqual(group_calls[-1][1]["reply_to_message_id"], 42)
+
+    def test_exec_bridge_private_emoji_only_is_not_emptied(self):
+        path = Path(__file__).resolve().parents[1] / "telegram_agent_bridge.py"
+        spec = importlib.util.spec_from_file_location("telegram_agent_bridge_behavior", path)
+        mod = importlib.util.module_from_spec(spec)
+        sys.modules[spec.name] = mod
+        sys.path.insert(0, str(path.parent))
+        try:
+            spec.loader.exec_module(mod)
+        finally:
+            sys.path.pop(0)
+        bridge = mod.Bridge.__new__(mod.Bridge)
+        bridge.config = SimpleNamespace(
+            chat_id="1234",
+            prefix="BOT",
+            prefix_line=False,
+            telegram_chunk=4096,
+        )
+
+        self.assertEqual(bridge.telegram_chunks("🍎"), ["🍎"])
 
 
 if __name__ == "__main__":
