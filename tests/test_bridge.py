@@ -192,6 +192,7 @@ class BridgeTests(unittest.TestCase):
             self.assertIn("telegram input:\nfrom phone", bridge.local_output)
             self.assertIn("codex answer (telegram):\ndone", bridge.local_output)
 
+    @unittest.skipUnless(hasattr(os, "mkfifo"), "requires POSIX FIFO")
     def test_local_fifo_is_created(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             fifo_path = Path(tmpdir) / "input.fifo"

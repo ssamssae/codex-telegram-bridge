@@ -179,8 +179,14 @@ def watch_linux(
     return 1
 
 
+def mac_gui_domain() -> str:
+    getuid = getattr(os, "getuid", None)
+    uid = getuid() if callable(getuid) else 0
+    return f"gui/{uid}"
+
+
 def mac_service_state(label: str, run: RunCommand) -> tuple[bool, str]:
-    proc = run(["launchctl", "print", f"gui/{os.getuid()}/{label}"])
+    proc = run(["launchctl", "print", f"{mac_gui_domain()}/{label}"])
     if proc.returncode != 0:
         return False, "not-loaded"
     state = launchd_state(status_text(proc))
@@ -200,7 +206,7 @@ def watch_macos(
         write_status(status_file, "active", f"launchd:{label}")
         return 0
 
-    domain = f"gui/{os.getuid()}"
+    domain = mac_gui_domain()
     if state == "not-loaded" and plist_file.exists():
         run(["launchctl", "bootstrap", domain, str(plist_file)])
 

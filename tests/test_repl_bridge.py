@@ -500,6 +500,7 @@ class ReplBridgeTests(unittest.TestCase):
             self.assertEqual(bridge.current_origin, "telegram")
             self.assertEqual(bridge.active_prompt_for_recovery(), "T-260630-99 do work")
 
+    @unittest.skipUnless(hasattr(os, "mkfifo"), "requires POSIX FIFO")
     def test_signal_fifo_is_created_private(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             path = Path(tmpdir) / "signal.fifo"
@@ -1918,6 +1919,14 @@ Overwrite existing file? [y/N]
             self.assertEqual(telegram.attachments[0][0].resolve(), image.resolve())
             self.assertEqual(telegram.sent, ["스크린샷입니다:"])
             self.assertNotIn(str(image), telegram.sent[0])
+
+    def test_raw_windows_attachment_path_pattern_is_recognized(self):
+        match = repl.RAW_LOCAL_ATTACHMENT_PATH_RE.search(
+            r"영상입니다: C:\Users\test_user\Downloads\demo.mp4"
+        )
+
+        self.assertIsNotNone(match)
+        self.assertEqual(match.group("path"), r"C:\Users\test_user\Downloads\demo.mp4")
 
     def test_attachment_only_answer_uses_human_fallback_text(self):
         with tempfile.TemporaryDirectory() as tmpdir:

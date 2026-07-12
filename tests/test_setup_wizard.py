@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 import contextlib
 import io
+import os
 import subprocess
 import tempfile
 import unittest
@@ -91,14 +92,17 @@ class SetupWizardTests(unittest.TestCase):
                 audio_transcribe_cmd="/tmp/transcribe {path}",
             )
 
-            self.assertEqual(setup.file_mode(env_file), 0o600)
+            self.assertTrue(env_file.is_file())
+            if os.name != "nt":
+                self.assertEqual(setup.file_mode(env_file), 0o600)
             values = setup.load_env_file(env_file)
             self.assertEqual(values["TAB_BOT_TOKEN"], "123:secret")
             self.assertEqual(values["TAB_CHAT_ID"], "12345")
             self.assertEqual(values["TAB_BRIDGE_MODE"], "repl")
             self.assertEqual(values["TAB_PREFIX_LINE"], "1")
             self.assertEqual(values["SUGGESTED_REPLY_BUBBLE"], "1")
-            self.assertEqual(values["CRB_SIGNAL_PATH"], str(state_dir / "input.fifo"))
+            expected_signal_path = "off" if os.name == "nt" else str(state_dir / "input.fifo")
+            self.assertEqual(values["CRB_SIGNAL_PATH"], expected_signal_path)
             self.assertEqual(values["CRB_TMUX_SOCKET"], "codex")
 
     def test_install_runner_sources_private_env(self):
@@ -108,11 +112,20 @@ class SetupWizardTests(unittest.TestCase):
             setup.install_runner(runner, env_file)
 
             text = runner.read_text(encoding="utf-8")
-            self.assertIn(str(env_file), text)
-            self.assertIn(str(setup.REPL_BRIDGE_SCRIPT), text)
-            self.assertIn(str(setup.EXEC_BRIDGE_SCRIPT), text)
+            env_reference = repr(str(env_file)) if os.name == "nt" else str(env_file)
+            repl_reference = (
+                repr(str(setup.REPL_BRIDGE_SCRIPT)) if os.name == "nt" else str(setup.REPL_BRIDGE_SCRIPT)
+            )
+            exec_reference = (
+                repr(str(setup.EXEC_BRIDGE_SCRIPT)) if os.name == "nt" else str(setup.EXEC_BRIDGE_SCRIPT)
+            )
+            self.assertIn(env_reference, text)
+            self.assertIn(repl_reference, text)
+            self.assertIn(exec_reference, text)
             self.assertIn("TAB_BRIDGE_MODE", text)
-            self.assertEqual(setup.file_mode(runner), 0o755)
+            self.assertTrue(runner.is_file())
+            if os.name != "nt":
+                self.assertEqual(setup.file_mode(runner), 0o755)
 
     def test_service_templates_do_not_embed_token(self):
         runner = Path("/tmp/telegram-agent-bridge-run")
