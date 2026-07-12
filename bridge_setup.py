@@ -437,6 +437,7 @@ def write_env_config(
         "TAB_TIMEOUT=600",
         "TAB_TG_CHUNK=4096",
         "TAB_TYPING_INTERVAL=4",
+        "SUGGESTED_REPLY_BUBBLE=1",
         f"TAB_LOCAL_INPUT={shell_quote(local_input_value)}",
         "TAB_STDIN_INPUT=0",
         f"TAB_CODEX_DANGEROUS_BYPASS={'1' if dangerous_bypass else '0'}",

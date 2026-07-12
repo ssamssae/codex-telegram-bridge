@@ -29,6 +29,11 @@ class PublicExportTest(unittest.TestCase):
         self.assertEqual(cfg.chat_id, "123456789")
         self.assertTrue(str(cfg.state_dir).endswith(".local/state/codex-telegram-bridge"))
         self.assertTrue(str(cfg.directive_signal_path).endswith("received-directive.jsonl"))
+        self.assertFalse(cfg.suggested_reply_bubble)
+        self.assertIn(
+            "SUGGESTED_REPLY_BUBBLE=1",
+            (path.parent / "config.example.env").read_text(encoding="utf-8"),
+        )
         self.assertEqual(mod.extract_codex_context_text("Model: gpt-5"), "Codex context not visible yet.")
         progress = mod.format_long_running_progress_message(
             "deploy bridge",
