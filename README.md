@@ -45,6 +45,19 @@ does not create a second hidden AI conversation.
 Native Windows users can start with text-only `exec` mode without `tmux`. See
 [Windows quickstart](#windows-quickstart-5-min) after this section.
 
+Before continuing in Windows PowerShell, check the two commands the setup uses:
+
+```powershell
+py --version
+codex --version
+```
+
+If `py` is not found, install Python 3.10 or newer from
+[python.org](https://www.python.org/downloads/windows/) with the Python launcher,
+then reopen PowerShell. If `codex` is not found, follow the
+[Codex CLI installation guide](https://developers.openai.com/codex/cli/), reopen
+PowerShell, run `codex` once, and complete sign-in before installing the bridge.
+
 ### 3. Create your Telegram bot with BotFather
 
 1. Open Telegram and search for the official
@@ -116,17 +129,12 @@ python -m pip install --upgrade pip
 pip install codex-telegram-bridge
 ```
 
-Windows PowerShell equivalent:
+Native Windows PowerShell users should use the single `pipx` path in the
+[Windows quickstart](#windows-quickstart-5-min). It avoids virtual-environment
+activation and the common `Activate.ps1` execution-policy error.
 
-```powershell
-py -m venv "$HOME\.venvs\codex-telegram-bridge"
-& "$HOME\.venvs\codex-telegram-bridge\Scripts\Activate.ps1"
-python -m pip install --upgrade pip
-pip install codex-telegram-bridge
-```
-
-You can use `pipx install codex-telegram-bridge` instead if you already use
-`pipx` for Python command-line applications.
+On Linux, WSL, or macOS, you can use `pipx install codex-telegram-bridge`
+instead if you already use `pipx` for Python command-line applications.
 
 ### 5. Start Codex and run the minimal setup
 
@@ -144,6 +152,9 @@ then start the setup wizard:
 source ~/.venvs/codex-telegram-bridge/bin/activate
 codex-telegram-bridge setup
 ```
+
+Native Windows users should skip these `tmux` and `source` commands and continue
+with the [Windows quickstart](#windows-quickstart-5-min).
 
 The wizard asks for the BotFather token, waits for the `/start` message, detects
 your `chat_id`, writes the private configuration, and installs a background
@@ -364,8 +375,20 @@ python3 bridge_setup.py doctor
 
 ## Windows quickstart (5 min)
 
+### Option A — Native Windows exec (easiest, text-only)
+
 On native Windows, use `exec` mode unless you are already running Codex inside
-WSL with tmux. Open PowerShell:
+WSL with tmux. This is the recommended native Windows install path.
+
+Open PowerShell and confirm the prerequisites:
+
+```powershell
+py --version
+codex --version
+```
+
+Both commands must print a version. Run `codex` once and complete sign-in if you
+have not already done so. Then install `pipx`:
 
 ```powershell
 py -m pip install --user pipx
@@ -376,7 +399,7 @@ Close and reopen PowerShell if `pipx` was just added to PATH, then install and
 run the setup wizard:
 
 ```powershell
-pipx install codex-telegram-bridge
+py -m pipx install codex-telegram-bridge
 codex-telegram-bridge setup --mode exec
 codex-telegram-bridge doctor
 ```
@@ -390,6 +413,114 @@ py bridge_setup.py doctor
 
 `doctor` should finish with zero failures. If it prints a warning, follow the
 `Next steps` command printed above the summary, then run `doctor` again.
+
+Common first-install fixes:
+
+- `py` is not recognized: install Python 3.10 or newer from
+  [python.org](https://www.python.org/downloads/windows/) with the Python
+  launcher, then reopen PowerShell.
+- `codex` is not recognized: install Codex CLI from the linked guide, reopen
+  PowerShell, and run `codex` once to sign in.
+- `codex-telegram-bridge` is not recognized: run `py -m pipx ensurepath`, close
+  every PowerShell window, open a new one, and retry.
+- PowerShell blocks `Activate.ps1`: do not weaken the execution policy for this
+  install. Use the `pipx` commands above; they do not activate a virtual
+  environment.
+
+### Option B — WSL + tmux (full visible REPL)
+
+Choose this path if you want Telegram messages to appear in one visible Codex
+terminal, with the full `repl` features. Everything except the short PowerShell
+commands runs inside Ubuntu on WSL. The official Codex
+[WSL guide](https://developers.openai.com/codex/windows/wsl) also recommends
+running Codex and your project files inside the Linux environment.
+
+1. Open PowerShell **as Administrator** and install Ubuntu on WSL:
+
+   ```powershell
+   wsl --install -d Ubuntu
+   ```
+
+   Restart Windows if prompted. If WSL is already installed, check the distro
+   name with `wsl -l -v` and skip this step.
+
+2. Open a normal PowerShell window and enter Ubuntu:
+
+   ```powershell
+   WSL.exe -d Ubuntu
+   ```
+
+   The prompt now changes to a Linux prompt. Run these commands there:
+
+   ```bash
+   sudo apt update
+   sudo apt install -y curl tmux python3 python3-venv pipx
+   pipx ensurepath
+   curl -fsSL https://chatgpt.com/codex/install.sh | sh
+   exit
+   ```
+
+   Back in PowerShell, reopen Ubuntu so the new commands are on `PATH`:
+
+   ```powershell
+   WSL.exe -d Ubuntu
+   ```
+
+   Then finish the install at the Linux prompt:
+
+   ```bash
+   pipx install codex-telegram-bridge
+   codex --version
+   codex-telegram-bridge --help
+   ```
+
+   This installs Codex and the bridge inside WSL. Do not mix them with the
+   native Windows copies from Option A.
+
+3. Still inside WSL, create the visible tmux session:
+
+   ```bash
+   mkdir -p ~/code
+   cd ~/code
+   tmux -L codex new -s codex
+   ```
+
+   The screen changes because you are now inside tmux. At the new prompt, run:
+
+   ```bash
+   codex
+   ```
+
+   Complete the ChatGPT sign-in the first time Codex asks. Leave this window
+   open while you finish setup.
+
+4. Open a **second** PowerShell window, enter Ubuntu again, and run the bridge
+   wizard in its default `repl` mode:
+
+   ```powershell
+   WSL.exe -d Ubuntu
+   ```
+
+   Then, at the Linux prompt:
+
+   ```bash
+   codex-telegram-bridge setup
+   codex-telegram-bridge doctor
+   ```
+
+5. You can watch or rejoin the same Codex screen from any PowerShell window:
+
+   ```powershell
+   WSL.exe -d Ubuntu -- tmux -L codex attach -t codex
+   ```
+
+   To leave the screen without stopping Codex, press `Ctrl+B`, release both
+   keys, then press `D`. The tmux session and bridge keep running. Use the same
+   attach command whenever you want to return.
+
+If your distro is not named `Ubuntu`, replace it in every `WSL.exe -d Ubuntu`
+command with the name printed by `wsl -l -v`. If tmux says the `codex` session
+already exists, use the attach command instead of creating it again.
 
 ### Native visible REPL P0 (manual foreground mode)
 
