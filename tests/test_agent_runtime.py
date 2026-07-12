@@ -1,8 +1,10 @@
 #!/usr/bin/env python3
+import json
+import os
 import tempfile
 import unittest
-import json
 from pathlib import Path
+from unittest import mock
 
 from agent_runtime import (
     ApprovalOption,
@@ -12,6 +14,8 @@ from agent_runtime import (
     WorkdirLock,
     WorkdirLockError,
 )
+from agent_runtime import locks as lock_module
+from agent_runtime import transport as transport_module
 from agent_runtime.adapters.codex_repl import CodexReplAdapter
 from agent_runtime.transport import QueueTransport
 from agent_runtime.types import AgentMessage
@@ -71,6 +75,7 @@ class AgentRuntimeTests(unittest.TestCase):
 
         self.assertEqual(transport.recv(timeout=0.1), "hello")
 
+    @unittest.skipIf(os.name == "nt", "FifoTransport requires POSIX named pipes")
     def test_fifo_transport_timeout_is_enforced(self):
         from agent_runtime.transport import FifoTransport
 
@@ -79,6 +84,15 @@ class AgentRuntimeTests(unittest.TestCase):
 
             with self.assertRaises(TimeoutError):
                 transport.recv(timeout=0.01)
+
+    def test_fifo_transport_fails_fast_on_windows(self):
+        from agent_runtime.transport import FifoTransport
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir) / "input.fifo"
+            with mock.patch.object(transport_module.os, "name", "nt"):
+                with self.assertRaisesRegex(NotImplementedError, "POSIX named pipes"):
+                    FifoTransport(path)
 
     def test_workdir_lock_blocks_second_owner(self):
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -120,6 +134,17 @@ class AgentRuntimeTests(unittest.TestCase):
             second = WorkdirLock(workdir, state_dir, "codex", stale_seconds=0)
             second.acquire()
             second.release()
+
+    def test_windows_process_check_never_uses_os_kill(self):
+        with (
+            mock.patch.object(lock_module.os, "name", "nt"),
+            mock.patch.object(lock_module, "_windows_process_alive", return_value=False) as check,
+            mock.patch.object(lock_module.os, "kill") as kill,
+        ):
+            self.assertFalse(lock_module._process_alive(99999999))
+
+        check.assert_called_once_with(99999999)
+        kill.assert_not_called()
 
     def test_codex_repl_adapter_wraps_existing_repl(self):
         repl = FakeRepl()

@@ -37,6 +37,10 @@ class QueueTransport:
 
 class FifoTransport:
     def __init__(self, path: Path) -> None:
+        if os.name == "nt" or not hasattr(os, "mkfifo"):
+            raise NotImplementedError(
+                "FifoTransport requires POSIX named pipes; use the native Windows transport"
+            )
         self.path = path
         self.path.parent.mkdir(parents=True, exist_ok=True)
         if not self.path.exists():
