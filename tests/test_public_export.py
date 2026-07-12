@@ -10,6 +10,7 @@ from unittest import mock
 class PublicExportTest(unittest.TestCase):
     def test_imports_public_bridge_and_defaults(self):
         path = Path(__file__).resolve().parents[1] / "codex_repl_bridge.py"
+        home = str(Path.home())
         spec = importlib.util.spec_from_file_location("codex_repl_bridge", path)
         self.assertIsNotNone(spec)
         self.assertIsNotNone(spec.loader)
@@ -21,13 +22,15 @@ class PublicExportTest(unittest.TestCase):
             os.environ,
             {
                 "CRB_CHAT_ID": "123456789",
-                "CRB_TOKEN_FILE": str(Path.home() / ".config/codex-telegram-bridge/token.json"),
+                "CRB_TOKEN_FILE": str(Path(home) / ".config/codex-telegram-bridge/token.json"),
+                "HOME": home,
+                "USERPROFILE": home,
             },
             clear=True,
         ):
             cfg = mod.Config.from_env()
         self.assertEqual(cfg.chat_id, "123456789")
-        self.assertTrue(str(cfg.state_dir).endswith(".local/state/codex-telegram-bridge"))
+        self.assertEqual(cfg.state_dir.parts[-3:], (".local", "state", "codex-telegram-bridge"))
         self.assertTrue(str(cfg.directive_signal_path).endswith("received-directive.jsonl"))
         self.assertFalse(cfg.suggested_reply_bubble)
         self.assertIn(

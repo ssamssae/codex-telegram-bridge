@@ -250,7 +250,7 @@ MEDIA_ATTACHMENT_SUFFIX_RE = "|".join(
     re.escape(ext) for ext in sorted(MEDIA_ATTACHMENT_EXTENSIONS, key=len, reverse=True)
 )
 RAW_LOCAL_ATTACHMENT_PATH_RE = re.compile(
-    rf"(?P<path>(?:file://)?/(?:[^\s\])<>\"']+?)(?:{MEDIA_ATTACHMENT_SUFFIX_RE}))",
+    rf"(?P<path>(?:(?:file://)?/|[A-Za-z]:[\\/])(?:[^\s\])<>\"']+?)(?:{MEDIA_ATTACHMENT_SUFFIX_RE}))",
     re.IGNORECASE,
 )
 

@@ -3,6 +3,7 @@ import subprocess
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 import bridge_watchdog as watchdog
 
@@ -49,6 +50,10 @@ class FakeLaunchd:
 
 
 class WatchdogTests(unittest.TestCase):
+    def test_macos_gui_domain_falls_back_when_getuid_is_unavailable(self):
+        with mock.patch.object(watchdog.os, "getuid", None, create=True):
+            self.assertEqual(watchdog.mac_gui_domain(), "gui/0")
+
     def test_linux_inactive_service_is_started_and_marked_recovered(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             status_file = Path(tmpdir) / "status"
