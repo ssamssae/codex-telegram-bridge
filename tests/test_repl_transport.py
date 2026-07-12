@@ -230,10 +230,13 @@ class ReplTransportTest(unittest.TestCase):
         bridge.handle_flow_event(text, "conpty-flow-key")
 
         self.assertEqual(requests[0]["op"], "session")
-        self.assertEqual(
-            telegram.sent,
-            [f"{self.bridge.FLOW_MIRROR_HEADER}\n• 실행 · git status"],
+        self.assertEqual(len(telegram.sent), 1)
+        self.assertRegex(
+            telegram.sent[0].splitlines()[0],
+            r"^🤖 codex · PowerShell synchronized turn · \d{2}:\d{2}$",
         )
+        self.assertIn("\n\n▶ 실행 · git status\n\n", telegram.sent[0])
+        self.assertTrue(telegram.sent[0].endswith("→ 진행중 · 현재: ▶ 실행"))
 
     def test_host_bracketed_paste_preserves_unicode_and_multiline(self) -> None:
         paste_frame, submit_frame = self.host.encode_paste(

@@ -953,9 +953,79 @@ def format_reasoning_mirror(text: str) -> str:
     return f"{REASONING_HEADER}\n{body}" if body else ""
 
 
-def format_flow_mirror(text: str) -> str:
-    body = flow_mirror_body(text)
-    return f"{FLOW_MIRROR_HEADER}\n{body}" if body else ""
+def flow_context_summary(text: str, limit: int = 40) -> str:
+    """Extract a stable, friendly one-line context for a live flow card."""
+    for raw in strip_node_emoji_header(text or "").splitlines():
+        line = " ".join(raw.strip().split())
+        if not line or line in {FLOW_MIRROR_HEADER, AMBIENT_DIRECTIVE_HEADER, SENT_DIRECTIVE_HEADER}:
+            continue
+        if re.match(r"^from=\S+\s*\|?\s*task=", line, re.IGNORECASE):
+            continue
+        if "→" in line and TASK_ID_RE.search(line):
+            continue
+        line = re.sub(r"^\[[^\]]+\]\s*", "", line)
+        if " — " in line and TASK_ID_RE.search(line.split(" — ", 1)[0]):
+            line = line.split(" — ", 1)[1]
+        line = re.sub(r"^T-\d{6}-\d+\s*(?:[—:|-]+\s*)?", "", line).strip()
+        line = re.sub(r"(?:진행해\s*줘|진행해\s*주세요|해\s*줘|해\s*주세요)[.!]?\s*$", "", line).strip()
+        if line:
+            return _flow_cap_text(line, limit)
+    return "작업 진행"
+
+
+def flow_card_steps(text: str) -> tuple[list[str], str]:
+    """Group consecutive identical tool labels and return lines/current step."""
+    groups: list[dict[str, Any]] = []
+    for raw in flow_mirror_body(text).splitlines():
+        line = raw.strip()
+        if line.startswith("• "):
+            line = line[2:].strip()
+        if not line:
+            continue
+        label, separator, detail = line.partition(" · ")
+        label = label.strip()
+        detail = detail.strip() if separator else ""
+        if groups and groups[-1]["label"] == label:
+            groups[-1]["count"] += 1
+            if detail:
+                groups[-1]["detail"] = detail
+        else:
+            groups.append({"label": label, "detail": detail, "count": 1})
+    rendered: list[str] = []
+    for group in groups:
+        count = f" ×{group['count']}" if group["count"] > 1 else ""
+        detail = f" · {group['detail']}" if group["detail"] else ""
+        rendered.append(f"{group['label']}{count}{detail}")
+    current = str(groups[-1]["label"]) if groups else ""
+    return rendered, current
+
+
+def format_flow_mirror(
+    text: str,
+    *,
+    node: str = "",
+    emoji: str = "",
+    context: str = "",
+    now: datetime | None = None,
+) -> str:
+    lines, current = flow_card_steps(text)
+    if not lines:
+        return ""
+    default_node, default_emoji = node_defaults()
+    node_token = node or default_node
+    label, mapped_emoji = node_label_emoji(node_token)
+    label = label or node_token or "작업 노드"
+    node_emoji = emoji or mapped_emoji or default_emoji
+    timestamp = (now or datetime.now(KST)).astimezone(KST).strftime("%H:%M")
+    header = f"{node_emoji} {label} · {flow_context_summary(context)} · {timestamp}"
+    footer = f"→ 진행중 · 현재: {current}"
+    available = max(1, FLOW_MIRROR_LIMIT - len(header) - len(footer) - 4)
+    while len(lines) > 1 and len("\n".join(lines)) > available:
+        lines.pop(0)
+    body = "\n".join(lines)
+    if len(body) > available:
+        body = body[: max(1, available - 1)].rstrip() + "…"
+    return f"{header}\n\n{body}\n\n{footer}"
 
 
 def flow_mirror_body(text: str) -> str:
@@ -1039,49 +1109,67 @@ def flow_step_summary(text: str, limit: int = FLOW_MIRROR_LINE_LIMIT) -> str:
     body = " ".join(strip_node_emoji_header(text).split())
     if body.startswith(REASONING_HEADER):
         body = body[len(REASONING_HEADER) :].strip()
-    # function_call one-liners ("• <label> · <detail>") are already collapsed and
-    # length-capped (no ellipsis) by function_call_flow_summary — keep them whole
-    # so the claude-parity flow card shows the full tool detail. (T-260628-43)
-    if body.startswith("• "):
+    # Tool one-liners are already collapsed and detail-capped by
+    # function_call_flow_summary. Keep them whole so the live card has parity
+    # with Claude's icon-labelled steps.
+    if body.startswith(
+        (
+            "▶ ",
+            "⌨️ ",
+            "🖊 ",
+            "🖼 ",
+            "🎨 ",
+            "🗂 ",
+            "⚡ ",
+            "🌐 ",
+            "🔗 ",
+            "🖱 ",
+            "📄 ",
+            "📈 ",
+            "🌤 ",
+            "🏟 ",
+            "🕒 ",
+            "🔧 ",
+        )
+    ):
         return body.strip()
     if len(body) > limit:
         body = body[:limit].rstrip() + "…"
     return body.strip()
 
 
-# Tool-call → Korean label map for the flow card (claude parity). Each codex
-# function_call becomes ONE short line "• <label> · <detail>" instead of long
+# Tool-call → Korean label map for the flow card (claude parity). Each Codex
+# function_call becomes one short icon-labelled line instead of long
 # commentary prose that overflowed and got ellipsis-truncated. (T-260628-43)
 TOOL_LABEL_KO = {
-    "exec_command": "실행",
-    "write_stdin": "입력",
-    "apply_patch": "편집",
-    "view_image": "이미지확인",
-    "imagegen": "이미지생성",
-    "update_plan": "계획",
-    "parallel": "병렬",
-    "web": "웹열기",
-    "web_open": "웹열기",
-    "open_page": "웹열기",
-    "search": "웹검색",
-    "web_search": "웹검색",
-    "finance": "금융조회",
-    "weather": "날씨조회",
-    "sports": "스포츠조회",
-    "time": "시간조회",
+    "exec_command": "▶ 실행",
+    "write_stdin": "⌨️ 입력",
+    "apply_patch": "🖊 편집",
+    "view_image": "🖼 이미지 확인",
+    "imagegen": "🎨 이미지 생성",
+    "update_plan": "🗂 계획",
+    "parallel": "⚡ 병렬 실행",
+    "web": "🌐 브라우저",
+    "web_open": "🌐 브라우저",
+    "open_page": "🌐 브라우저",
+    "search": "🌐 웹 검색",
+    "web_search": "🌐 웹 검색",
+    "finance": "📈 금융 조회",
+    "weather": "🌤 날씨 조회",
+    "sports": "🏟 스포츠 조회",
+    "time": "🕒 시간 조회",
 }
 
 # Substring families: when an exact name is not in TOOL_LABEL_KO, match these
 # family keywords so vendor-prefixed tool names (e.g. "browser.web_search")
 # still get the right Korean label.
 TOOL_LABEL_FAMILIES = (
-    ("web_search", "웹검색"),
-    ("search", "웹검색"),
-    ("web", "웹열기"),
-    ("finance", "금융조회"),
-    ("weather", "날씨조회"),
-    ("sports", "스포츠조회"),
-    ("time", "시간조회"),
+    ("web_search", "🌐 웹 검색"),
+    ("search", "🌐 웹 검색"),
+    ("finance", "📈 금융 조회"),
+    ("weather", "🌤 날씨 조회"),
+    ("sports", "🏟 스포츠 조회"),
+    ("time", "🕒 시간 조회"),
 )
 
 PATCH_TARGET_RE = re.compile(
@@ -1281,20 +1369,60 @@ GENERIC_DETAIL_KEYS = (
     "ref_id",
     "uri",
     "workdir",
+    "element",
+    "selector",
+    "text",
 )
+
+
+def flow_tool_short_name(name: str) -> str:
+    key = (name or "tool").strip()
+    if "__" in key:
+        key = key.rsplit("__", 1)[-1]
+    elif "." in key:
+        key = key.rsplit(".", 1)[-1]
+    return key or "tool"
 
 
 def tool_label_ko(name: str) -> str:
     key = (name or "").strip()
     if not key:
-        return "도구"
+        return "🔧 tool"
     if key in TOOL_LABEL_KO:
         return TOOL_LABEL_KO[key]
-    lowered = key.lower()
+    short = flow_tool_short_name(key)
+    lowered = short.lower()
+    if "click" in lowered or lowered in {"tap", "press"}:
+        return "🖱 클릭"
+    if "navigate" in lowered or lowered in {"goto", "open_url"}:
+        return "🔗 이동"
+    if lowered.startswith("browser_") or "browser" in lowered:
+        return "🌐 브라우저"
+    if "read" in lowered or lowered in {"cat", "open_file"}:
+        return "📄 읽기"
+    if any(token in lowered for token in ("edit", "patch", "write")):
+        return "🖊 편집"
+    if any(token in lowered for token in ("exec", "execute", "shell", "bash", "run_command")):
+        return "▶ 실행"
     for family, label in TOOL_LABEL_FAMILIES:
         if family in lowered:
             return label
-    return key
+    return f"🔧 {short}"
+
+
+def flow_tool_detail(name: str, detail: str) -> str:
+    short = flow_tool_short_name(name).lower()
+    value = " ".join((detail or "").split())
+    if not value:
+        return ""
+    if "navigate" in short or short in {"goto", "open_url"}:
+        parsed = urllib.parse.urlparse(value if "://" in value else f"https://{value}")
+        return parsed.hostname or value
+    if "read" in short:
+        path = value.replace("\\", "/").rstrip("/")
+        if "/" in path:
+            return path.rsplit("/", 1)[-1]
+    return value
 
 
 def parse_tool_arguments(payload: dict[str, Any]) -> tuple[dict[str, Any], str]:
@@ -1358,8 +1486,9 @@ def function_call_flow_summary(payload: dict[str, Any]) -> str:
     args, raw = parse_tool_arguments(payload)
     label = tool_label_ko(name)
     detail = " ".join(tool_detail(name, args, raw).split())
+    detail = flow_tool_detail(name, detail)
     detail = compact_flow_detail(detail)
-    return f"• {label} · {detail}".rstrip(" ·").rstrip() if not detail else f"• {label} · {detail}"
+    return f"{label} · {detail}".rstrip(" ·").rstrip() if not detail else f"{label} · {detail}"
 
 
 def flow_mirror_dedup_key(text: str, scope: str = "") -> str:
@@ -4091,7 +4220,14 @@ class Bridge:
         prior_lines = self.flow_body.split("\n") if self.flow_body else []
         candidate = "\n".join((prior_lines + [summary])[-FLOW_MIRROR_WINDOW:])
         if not self.flow_message_id:
-            message_id = self.telegram.send_message_id(format_flow_mirror(candidate))
+            message_id = self.telegram.send_message_id(
+                format_flow_mirror(
+                    candidate,
+                    node=str(getattr(self.config, "node", "")),
+                    emoji=str(getattr(self.config, "emoji", "")),
+                    context=scope,
+                )
+            )
             if not message_id:
                 log("SEND", "flow mirror failed")
                 return
@@ -4100,7 +4236,15 @@ class Bridge:
             log("SEND", f"sent flow mirror mid={message_id}")
         else:
             self.wait_for_flow_edit_budget()
-            if not self.telegram.edit(self.flow_message_id, format_flow_mirror(candidate)):
+            if not self.telegram.edit(
+                self.flow_message_id,
+                format_flow_mirror(
+                    candidate,
+                    node=str(getattr(self.config, "node", "")),
+                    emoji=str(getattr(self.config, "emoji", "")),
+                    context=scope,
+                ),
+            ):
                 log("SEND", "flow mirror edit failed")
                 return
             self.flow_body = candidate

@@ -323,6 +323,53 @@ def without_sent_directive_cards(messages):
 
 
 class ReplBridgeTests(unittest.TestCase):
+    def test_flow_live_card_matches_claude_reference(self):
+        payloads = [
+            {"name": "mcp__plugin_playwright_playwright__browser_snapshot", "arguments": "{}"},
+            {
+                "name": "mcp__plugin_playwright_playwright__browser_navigate",
+                "arguments": json.dumps({"url": "https://substack.com/publish/post"}),
+            },
+            {
+                "name": "mcp__plugin_playwright_playwright__browser_click",
+                "arguments": json.dumps({"element": "발행"}, ensure_ascii=False),
+            },
+            {
+                "name": "mcp__plugin_playwright_playwright__browser_click",
+                "arguments": json.dumps({"element": "확인"}, ensure_ascii=False),
+            },
+            {"name": "read_file", "arguments": json.dumps({"path": "/repo/newsletter/issue-66.md"})},
+            {"name": "exec_command", "arguments": json.dumps({"cmd": "python publish.py"})},
+        ]
+        steps = "\n".join(repl.function_call_flow_summary(payload) for payload in payloads)
+        card = repl.format_flow_mirror(
+            steps,
+            node="macmini",
+            emoji="🏭",
+            context="뉴스레터 발행해줘",
+            now=repl.datetime(2026, 7, 12, 22, 1, tzinfo=repl.KST),
+        )
+
+        self.assertEqual(
+            card,
+            "🏭 macmini · 뉴스레터 발행 · 22:01\n\n"
+            "🌐 브라우저\n"
+            "🔗 이동 · substack.com\n"
+            "🖱 클릭 ×2 · 확인\n"
+            "📄 읽기 · issue-66.md\n"
+            "▶ 실행 · python publish.py\n\n"
+            "→ 진행중 · 현재: ▶ 실행",
+        )
+        self.assertEqual(
+            repl.function_call_flow_summary(
+                {
+                    "name": "mcp__vendor__mystery_probe",
+                    "arguments": json.dumps({"query": "안전"}, ensure_ascii=False),
+                }
+            ),
+            "🔧 mystery_probe · 안전",
+        )
+
     def test_load_token_prefers_environment_token(self):
         old_env = os.environ.copy()
         try:
@@ -1102,10 +1149,12 @@ class ReplBridgeTests(unittest.TestCase):
                 self.assertTrue(bridge.process_line(line, cursor, cursor + len(line)))
                 cursor += len(line)
 
-            self.assertEqual(
-                without_sent_directive_cards(telegram.sent),
-                [f"{repl.FLOW_MIRROR_HEADER}\n서비스 확인 중", "완료"],
-            )
+            messages = without_sent_directive_cards(telegram.sent)
+            self.assertEqual(len(messages), 2)
+            self.assertRegex(messages[0].splitlines()[0], r"^BOT testnode · 진행해 · \d{2}:\d{2}$")
+            self.assertIn("\n\n서비스 확인 중\n\n", messages[0])
+            self.assertTrue(messages[0].endswith("→ 진행중 · 현재: 서비스 확인 중"))
+            self.assertEqual(messages[-1], "완료")
 
     def test_duplicate_progress_text_sends_flow_mirror_once_per_turn(self):
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -1145,10 +1194,12 @@ class ReplBridgeTests(unittest.TestCase):
                 self.assertTrue(bridge.process_line(line, cursor, cursor + len(line)))
                 cursor += len(line)
 
-            self.assertEqual(
-                without_sent_directive_cards(telegram.sent),
-                [f"{repl.FLOW_MIRROR_HEADER}\n{progress}", "머지 라우팅 GO"],
-            )
+            messages = without_sent_directive_cards(telegram.sent)
+            self.assertEqual(len(messages), 2)
+            self.assertRegex(messages[0].splitlines()[0], r"^BOT testnode · 231 머지해 · \d{2}:\d{2}$")
+            self.assertIn(f"\n\n{progress}\n\n", messages[0])
+            self.assertTrue(messages[0].endswith(f"→ 진행중 · 현재: {progress}"))
+            self.assertEqual(messages[-1], "머지 라우팅 GO")
 
     def test_progress_flow_mirror_can_be_disabled(self):
         with tempfile.TemporaryDirectory() as tmpdir:
