@@ -263,6 +263,8 @@ class CaptureTelegram(repl.TelegramClient):
 
 
 class FakeRepl:
+    supports_pane_features = True
+
     def __init__(self):
         self.approval_keys = []
         self.choice_options = []
@@ -273,14 +275,22 @@ class FakeRepl:
     def send_approval_key(self, key):
         self.approval_keys.append(key)
 
+    def send_key(self, key):
+        self.approval_keys.append(key)
+
     def send_choice_option(self, prompt, option):
         self.choice_options.append((prompt, option))
+
+    def send_choice(self, option):
+        self.choice_options.append((None, option))
 
     def paste_prompt(self, prompt):
         self.prompts.append(prompt)
 
     def capture_pane(self, lines=80):
         return self.screen
+
+    capture_screen = capture_pane
 
     def clear_composer(self):
         self.cleared += 1
