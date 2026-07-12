@@ -6,9 +6,10 @@ directly against their working tree.
 
 - Run `scripts/codex-bridge-oss-export.sh` (private repo).
 - Run the exported package test.
-- Sync the public repo's `tests/` with any behavior change in this release —
-  `tests/` is outside the export script's scope, so test ports are manual
-  (v0.6.4 gap: 3 cases had to be ported by hand).
+- `tests/test_agent_runtime.py` is exported with the runtime because it contains
+  platform guards for POSIX FIFO and Windows process checks. Sync the remaining
+  public `tests/` with any behavior change manually (v0.6.4 gap: 3 cases had to
+  be ported by hand).
 - Confirm the secret/internal scan has zero matches.
 - Confirm `CRB_DIRECTIVE_SIGNAL_PATH` points to a public local-state path or is disabled.
 - Build + validate the PyPI distribution before upload:
