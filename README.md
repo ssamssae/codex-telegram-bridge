@@ -739,7 +739,8 @@ Required settings are intentionally small and explicit.
 | `CRB_TYPING_MAX_SECONDS` | no | `7200` | Maximum lifetime for repeated Telegram `typing` actions during one visible Codex turn. |
 | `CRB_TELEGRAM_FALLBACK_SECONDS` | no | `90` | One-shot fallback progress reply delay for Telegram-origin REPL prompts when `final_answer` is delayed. Set `0` to disable. |
 | `CRB_FLOW_MIRROR` | no | `1` | Mirror public Codex progress/commentary steps to Telegram with the `⚙️ 작업 흐름` header. |
-| `SUGGESTED_REPLY_BUBBLE` | no | `1` for new installs | Split a final-line `<추천답변>...</추천답변>` into a separate copy-ready Telegram bubble. Set `0` to disable; an unset runtime still uses the code fallback `0`. |
+| `SUGGESTED_REPLY_BUBBLE` | no | `1` for new installs | Split a final-line `<추천답변>...</추천답변>` or `<추천답변 class="auto-ok\|hold">...</추천답변>` into a separate copy-ready Telegram bubble. Set `0` to disable; an unset runtime still uses the code fallback `0`. |
+| `CRB_SUGGESTED_REPLY_EYES` | no | `1` | Add a 👀 reaction to the successfully sent suggested-reply bubble in a private chat. Group-chat bubbles are never reacted to. |
 | `CRB_REASONING_MIRROR` | no | `1` | Mirror Codex's public reasoning summary to Telegram with the `🧠 코덱스 사고` header, sent right after the final answer. Only the runtime-public summary is sent (never raw chain-of-thought); copy-payload replies do not emit a reasoning mirror. Set `0` to disable. |
 | `CRB_LONG_RUNNING_PROGRESS_SECONDS` | no | `0` | Legacy periodic progress interval for long-running Telegram-origin REPL prompts. The flow mirror replaces it by default; set a positive second value to re-enable. |
 | `CRB_AUDIO_TRANSCRIBE_CMD` | no | empty | Optional command template for audio transcription. Use `{path}` for the media file. |

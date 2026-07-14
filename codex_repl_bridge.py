@@ -278,21 +278,108 @@ def bool_env(name: str, default: bool = False) -> bool:
     return (env(name, fallback) or fallback).lower() in {"1", "true", "yes", "on"}
 
 
+@dataclass(frozen=True)
+class SuggestedReply:
+    body: str
+    reply: str
+    declared_class: str
+
+
+SUGGESTED_REPLY_LINE_RE = re.compile(
+    r'^<추천답변(?:\s+class=(?:"(?P<quoted>[^"]+)"|(?P<bare>[^\s>]+)))?'
+    r'>(?P<reply>[^\r\n]+?)\s*</\s*추천답변\s*>\s*$'
+)
+
+
+def parse_suggested_reply(text: str) -> SuggestedReply:
+    original = text or ""
+    lines = original.rstrip("\r\n").splitlines()
+    if not lines:
+        return SuggestedReply(original, "", "")
+    match = SUGGESTED_REPLY_LINE_RE.fullmatch(lines[-1])
+    if not match:
+        return SuggestedReply(original, "", "")
+    return SuggestedReply(
+        "\n".join(lines[:-1]).rstrip(),
+        match.group("reply").strip(),
+        (match.group("quoted") or match.group("bare") or "").strip().lower(),
+    )
+
+
 def suggested_reply_messages(text: str, enabled: bool, surface: str) -> list[str]:
+    parsed = parse_suggested_reply(text)
+    if parsed.reply:
+        if not parsed.body:
+            return [parsed.reply]
+        if enabled and surface == "aniki_dm":
+            return [parsed.body, parsed.reply]
+        if not enabled and surface == "aniki_dm" and parsed.declared_class:
+            return [text or ""]
+        return [parsed.body]
     original = text or ""
     trimmed = original.rstrip("\r\n")
     lines = trimmed.splitlines()
     if not lines:
         return [original]
-    match = re.fullmatch(r"<추천답변>([^\r\n]+)</추천답변>", lines[-1])
-    if not match:
+    marker = lines[-1]
+    open_tag = "<추천답변>"
+    if not marker.startswith(open_tag):
         return [original]
     body = "\n".join(lines[:-1]).rstrip()
+    match = re.fullmatch(
+        r"(?P<content>[^\r\n]+?)\s*<\s*/\s*[^<>\r\n]*답변\s*>\s*",
+        marker[len(open_tag) :],
+    )
+    if not match:
+        if body:
+            return [body]
+        content = marker[len(open_tag) :].split("<", 1)[0].strip()
+        return [content] if content else [""]
+    content = match.group("content").strip()
     if not body:
-        return [match.group(1)]
+        return [content]
     if enabled and surface == "aniki_dm":
-        return [body, match.group(1)]
+        return [body, content]
     return [body]
+
+
+SUGGESTED_REPLY_CONFIRMATION_EMOJI = "👀"
+
+
+def suggested_reply_confirmation(
+    message_ids: list[int] | None,
+    surface: str,
+    enabled: bool = True,
+    origin: str = "telegram",
+) -> dict[str, Any] | None:
+    if not enabled or surface != "aniki_dm" or origin != "telegram" or not message_ids:
+        return None
+    for message_id in message_ids:
+        if isinstance(message_id, int) and message_id > 0:
+            return {"message_id": message_id, "emoji": SUGGESTED_REPLY_CONFIRMATION_EMOJI}
+    return None
+
+
+def apply_suggested_reply_confirmation(
+    telegram: Any,
+    message_ids: list[int] | None,
+    surface: str,
+    enabled: bool = True,
+    origin: str = "telegram",
+) -> None:
+    confirmation = suggested_reply_confirmation(message_ids, surface, enabled, origin)
+    if confirmation is None:
+        return
+    try:
+        reacted = telegram.set_message_reaction(
+            confirmation["message_id"],
+            confirmation["emoji"],
+        )
+    except Exception as exc:  # noqa: BLE001
+        log("SEND", f"suggested reply confirmation failed (non-fatal): {exc}")
+        return
+    if not reacted:
+        log("SEND", "suggested reply confirmation failed (non-fatal)")
 
 
 def clamp(value: int, minimum: int, maximum: int) -> int:
@@ -2012,6 +2099,7 @@ class Config:
     conpty_state_path: Path | None = None
     conpty_timeout_ms: int = 5000
     suggested_reply_bubble: bool = False
+    suggested_reply_confirmation_enabled: bool = True
     native_turn_stale_seconds: int = 300
 
     @classmethod
@@ -2116,6 +2204,7 @@ class Config:
             ).expanduser(),
             conpty_timeout_ms=int_env("CRB_CONPTY_TIMEOUT_MS", 5000, minimum=100),
             suggested_reply_bubble=bool_env("SUGGESTED_REPLY_BUBBLE", False),
+            suggested_reply_confirmation_enabled=bool_env("CRB_SUGGESTED_REPLY_EYES", True),
             native_turn_stale_seconds=int_env(
                 "CRB_NATIVE_TURN_STALE_SECONDS",
                 300,
@@ -2373,6 +2462,18 @@ class TelegramClient:
             log("TGERR", f"sendChatAction rejected: {detail}")
         return ok
 
+    def set_message_reaction(self, message_id: int, emoji: str) -> bool:
+        payload = self.call(
+            "setMessageReaction",
+            _request_timeout=10,
+            _attempts=1,
+            _retry_delay=0,
+            chat_id=self.chat_id,
+            message_id=message_id,
+            reaction=json.dumps([{"type": "emoji", "emoji": emoji}], ensure_ascii=False),
+        )
+        return bool(payload and payload.get("ok"))
+
     def download_file(
         self,
         file_id: str,
@@ -2451,12 +2552,17 @@ class TelegramClient:
             rest = rest[self.chunk_size :]
         return out
 
-    def send_copy_content(self, text: str) -> bool:
-        ok = True
+    def send_copy_content(self, text: str) -> list[int] | None:
+        message_ids: list[int] = []
         for chunk in self.raw_chunks(text):
             payload = self.call("sendMessage", chat_id=self.chat_id, text=chunk)
-            ok = ok and bool(payload and payload.get("ok"))
-        return ok
+            if not payload or not payload.get("ok"):
+                return None
+            result = payload.get("result")
+            if not isinstance(result, dict) or not isinstance(result.get("message_id"), int):
+                return None
+            message_ids.append(int(result["message_id"]))
+        return message_ids
 
     def send(self, text: str, reply_to_message_id: int | None = None) -> bool:
         ok = True
@@ -4447,8 +4553,18 @@ class Bridge:
             self.ambient_directive_body = ""
             if len(unified) <= 4000 and self.telegram.edit(anchor, unified):
                 log("SEND", f"edited codex answer into directive anchor mid={anchor}")
-                if suggested_reply and not self.telegram.send_copy_content(suggested_reply):
-                    log("SEND", "suggested reply bubble failed after final answer (non-fatal)")
+                if suggested_reply:
+                    bubble_ids = self.telegram.send_copy_content(suggested_reply)
+                    if bubble_ids is None:
+                        log("SEND", "suggested reply bubble failed after final answer (non-fatal)")
+                    else:
+                        apply_suggested_reply_confirmation(
+                            self.telegram,
+                            bubble_ids,
+                            surface,
+                            getattr(self.config, "suggested_reply_confirmation_enabled", True),
+                            "telegram" if surface == "aniki_dm" else (self.current_origin or "node"),
+                        )
                 return True
             # 폴백: 길이초과/edit실패 → 아래에서 새 카드 send
         ok = sent_via_reply or self.telegram.send(outgoing, reply_to_message_id=telegram_reply_anchor)
@@ -4463,8 +4579,18 @@ class Bridge:
                 # 첨부 실패는 1줄 공지로 가시화하고 턴은 완료 처리 — 파일은 노드에 보존.
                 log("ATTACH", f"send failed: {path}")
                 self.telegram.send(f"⚠️ 첨부 전송 실패 — 파일은 노드에 보존됨: {path}")
-        if suggested_reply and not self.telegram.send_copy_content(suggested_reply):
-            log("SEND", "suggested reply bubble failed after final answer (non-fatal)")
+        if suggested_reply:
+            bubble_ids = self.telegram.send_copy_content(suggested_reply)
+            if bubble_ids is None:
+                log("SEND", "suggested reply bubble failed after final answer (non-fatal)")
+            else:
+                apply_suggested_reply_confirmation(
+                    self.telegram,
+                    bubble_ids,
+                    surface,
+                    getattr(self.config, "suggested_reply_confirmation_enabled", True),
+                    "telegram" if surface == "aniki_dm" else (self.current_origin or "node"),
+                )
         return True
 
     def persist_state(self, offset: int | None = None, event_key: str | None = None) -> None:
