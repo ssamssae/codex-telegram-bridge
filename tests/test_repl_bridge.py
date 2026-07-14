@@ -55,6 +55,18 @@ def config(tmpdir, **overrides):
 
 
 class ConfigDefaultsTest(unittest.TestCase):
+    def test_suggested_reply_confirmation_defaults_on_and_can_disable(self):
+        old_env = os.environ.copy()
+        try:
+            os.environ["TAB_CHAT_ID"] = "1234"
+            os.environ.pop("CRB_SUGGESTED_REPLY_EYES", None)
+            self.assertTrue(repl.Config.from_env().suggested_reply_confirmation_enabled)
+            os.environ["CRB_SUGGESTED_REPLY_EYES"] = "0"
+            self.assertFalse(repl.Config.from_env().suggested_reply_confirmation_enabled)
+        finally:
+            os.environ.clear()
+            os.environ.update(old_env)
+
     def test_default_long_running_progress_interval_is_enabled(self):
         old_progress = os.environ.pop("CRB_LONG_RUNNING_PROGRESS_SECONDS", None)
         old_fallback = os.environ.pop("CRB_TELEGRAM_FALLBACK_SECONDS", None)
@@ -190,6 +202,9 @@ class FakeTelegram:
         self.choice_updates = []
         self.message_ids = []
         self.edits = []
+        self.reactions = []
+        self.fail_reactions = False
+        self.next_copy_message_id = 1001
 
     def download_file(
         self,
@@ -208,6 +223,16 @@ class FakeTelegram:
     def send(self, text, reply_to_message_id=None):
         self.sent.append(text)
         return True
+
+    def send_copy_content(self, text):
+        self.sent.append(text)
+        message_id = self.next_copy_message_id
+        self.next_copy_message_id += 1
+        return [message_id]
+
+    def set_message_reaction(self, message_id, emoji):
+        self.reactions.append((message_id, emoji))
+        return not self.fail_reactions
 
     def send_message_id(self, text):
         self.sent.append(text)
@@ -323,6 +348,153 @@ def without_sent_directive_cards(messages):
 
 
 class ReplBridgeTests(unittest.TestCase):
+    def test_suggested_reply_classes_match_claude_rendering(self):
+        for declared_class in ("auto-ok", "hold"):
+            with self.subTest(declared_class=declared_class):
+                answer = (
+                    "본문 답변\n"
+                    f'<추천답변 class="{declared_class}">바로 이어서 할게</추천답변>'
+                )
+                self.assertEqual(
+                    repl.parse_suggested_reply(answer).declared_class,
+                    declared_class,
+                )
+                self.assertEqual(
+                    repl.suggested_reply_messages(answer, True, "aniki_dm"),
+                    ["본문 답변", "바로 이어서 할게"],
+                )
+                self.assertEqual(
+                    repl.suggested_reply_messages(answer, False, "aniki_dm"),
+                    [answer],
+                )
+
+    def test_suggested_reply_confirmation_gate_matches_claude_reference(self):
+        self.assertEqual(
+            repl.suggested_reply_confirmation([701, 702], "aniki_dm", True, "telegram"),
+            {"message_id": 701, "emoji": "👀"},
+        )
+        self.assertIsNone(
+            repl.suggested_reply_confirmation([703], "aniki_dm", False, "telegram")
+        )
+        self.assertIsNone(
+            repl.suggested_reply_confirmation([704], "mesh_group", True, "telegram")
+        )
+        self.assertIsNone(
+            repl.suggested_reply_confirmation([705], "aniki_dm", True, "node")
+        )
+        self.assertIsNone(
+            repl.suggested_reply_confirmation([], "aniki_dm", True, "telegram")
+        )
+
+    def test_suggested_reply_bubble_gets_private_eyes_confirmation(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            telegram = FakeTelegram()
+            bridge = repl.Bridge(
+                config(
+                    tmpdir,
+                    suggested_reply_bubble=True,
+                    chat_id="1234",
+                ),
+                telegram,
+                None,
+            )
+            bridge.current_origin = "telegram"
+            bridge.active_telegram_message_id = 42
+
+            self.assertTrue(
+                bridge.send_answer(
+                    '본문 답변\n<추천답변 class="auto-ok">바로 이어서 할게</추천답변>'
+                )
+            )
+
+            self.assertEqual(telegram.sent, ["본문 답변", "바로 이어서 할게"])
+            self.assertEqual(telegram.reactions, [(1001, "👀")])
+
+    def test_private_node_origin_uses_output_chat_for_eyes_gate(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            telegram = FakeTelegram()
+            bridge = repl.Bridge(
+                config(
+                    tmpdir,
+                    suggested_reply_bubble=True,
+                    chat_id="1234",
+                ),
+                telegram,
+                None,
+            )
+            bridge.current_origin = "terminal"
+
+            self.assertTrue(
+                bridge.send_answer(
+                    '노드 답변\n<추천답변 class="hold">확인하고 이어서 할게</추천답변>'
+                )
+            )
+
+            self.assertEqual(telegram.sent, ["노드 답변", "확인하고 이어서 할게"])
+            self.assertEqual(telegram.reactions, [(1001, "👀")])
+
+    def test_suggested_reply_confirmation_is_gated_off_for_group(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            telegram = FakeTelegram()
+            bridge = repl.Bridge(
+                config(
+                    tmpdir,
+                    suggested_reply_bubble=True,
+                    chat_id="-1001234567890",
+                ),
+                telegram,
+                None,
+            )
+            bridge.current_origin = "terminal"
+
+            self.assertTrue(
+                bridge.send_answer("그룹 답변\n<추천답변>그룹 후속</추천답변>")
+            )
+
+            self.assertEqual(telegram.sent, ["그룹 답변"])
+            self.assertEqual(telegram.reactions, [])
+
+    def test_suggested_reply_reaction_failure_is_non_fatal(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            telegram = FakeTelegram()
+            telegram.fail_reactions = True
+            bridge = repl.Bridge(
+                config(
+                    tmpdir,
+                    suggested_reply_bubble=True,
+                    chat_id="1234",
+                ),
+                telegram,
+                None,
+            )
+            bridge.current_origin = "telegram"
+
+            self.assertTrue(
+                bridge.send_answer("본문 답변\n<추천답변>계속 진행해</추천답변>")
+            )
+            self.assertEqual(telegram.sent, ["본문 답변", "계속 진행해"])
+            self.assertEqual(telegram.reactions, [(1001, "👀")])
+
+    def test_suggested_reply_transport_returns_ids_and_sets_standard_eyes(self):
+        captured = []
+        client = repl.TelegramClient("token", "1234", "BOT", 4096)
+        client.call = lambda method, **params: (
+            captured.append((method, params))
+            or {"ok": True, "result": {"message_id": 702}}
+        )
+
+        self.assertEqual(client.send_copy_content("이대로 보내줘"), [702])
+        client.call = lambda method, **params: (
+            captured.append((method, params)) or {"ok": True, "result": True}
+        )
+        self.assertTrue(client.set_message_reaction(702, "👀"))
+        self.assertEqual(captured[-1][0], "setMessageReaction")
+        self.assertEqual(captured[-1][1]["message_id"], 702)
+        self.assertEqual(
+            json.loads(captured[-1][1]["reaction"]),
+            [{"type": "emoji", "emoji": "👀"}],
+        )
+
     def test_flow_live_card_matches_claude_reference(self):
         payloads = [
             {"name": "mcp__plugin_playwright_playwright__browser_snapshot", "arguments": "{}"},
