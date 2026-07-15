@@ -32,7 +32,8 @@ class PublicExportTest(unittest.TestCase):
         ):
             cfg = mod.Config.from_env()
         self.assertEqual(cfg.chat_id, "123456789")
-        self.assertTrue(str(cfg.state_dir).endswith(".local/state/codex-telegram-bridge"))
+        # str(Path) is backslashed on Windows; compare the POSIX form instead.
+        self.assertTrue(Path(cfg.state_dir).as_posix().endswith(".local/state/codex-telegram-bridge"))
         self.assertTrue(str(cfg.directive_signal_path).endswith("received-directive.jsonl"))
         self.assertTrue(cfg.suggested_reply_bubble)
         self.assertIn(
