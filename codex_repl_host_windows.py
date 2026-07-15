@@ -15,6 +15,7 @@ import hashlib
 import json
 import os
 import queue
+import re
 import secrets
 import shutil
 import subprocess
@@ -40,6 +41,13 @@ CLEAR_COMPOSER = b"\x05\x15\x01\x0b"  # C-e, C-u, C-a, C-k
 # T-260711-30: submit must trail the paste in its own frame — a same-frame \r
 # can be swallowed while the TUI is still processing the bracketed paste.
 PASTE_SUBMIT_DELAY_MS = 200
+CODEX_UPDATE_CHECK_OVERRIDE = "check_for_update_on_startup=false"
+ANSI_ESCAPE_RE = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]")
+UPDATE_PICKER_MARKERS = (
+    "Update available!",
+    "Update now",
+    "Skip until next version",
+)
 
 
 def safe_log(message: str) -> None:
@@ -540,6 +548,28 @@ def windows_command(binary: str, args: list[str]) -> str:
     return subprocess.list2cmdline([resolved, *args])
 
 
+def unattended_codex_args(args: Iterable[str]) -> list[str]:
+    """Disable Codex's interactive startup update check for this child only."""
+
+    return ["-c", CODEX_UPDATE_CHECK_OVERRIDE, *args]
+
+
+def update_picker_skip_keys(screen: str) -> bytes | None:
+    """Return one safe navigation step toward confirming Skip."""
+
+    selected = next(
+        (line for line in reversed(screen.splitlines()) if "›" in line),
+        "",
+    )
+    if "Skip until next version" in selected:
+        return encode_key("Up")
+    if "Skip" in selected:
+        return encode_key("Enter")
+    if "Update now" in selected:
+        return encode_key("Down")
+    return None
+
+
 class WindowsConPty:
     PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE = 0x00020016
     EXTENDED_STARTUPINFO_PRESENT = 0x00080000
@@ -1037,11 +1067,28 @@ def wait_for_tui_ready(
     output: RawOutputBuffer,
     child_alive: Callable[[], bool],
     timeout_seconds: float = 15.0,
+    on_update_picker: Callable[[bytes], None] | None = None,
 ) -> bool:
+    handled_selection = ""
     deadline = time.monotonic() + timeout_seconds
     while child_alive() and time.monotonic() < deadline:
-        screen = output.screen(300)
-        if "›" in screen:
+        screen = ANSI_ESCAPE_RE.sub("", output.screen(300))
+        picker_present = all(marker in screen for marker in UPDATE_PICKER_MARKERS)
+        picker_end = max((screen.rfind(marker) for marker in UPDATE_PICKER_MARKERS), default=-1)
+        composer = screen.rfind("›")
+        if picker_present and composer <= picker_end:
+            selected = next(
+                (line for line in reversed(screen.splitlines()) if "›" in line),
+                "",
+            )
+            if on_update_picker is not None and selected != handled_selection:
+                skip_keys = update_picker_skip_keys(screen)
+                if skip_keys is not None:
+                    on_update_picker(skip_keys)
+                    handled_selection = selected
+            time.sleep(0.05)
+            continue
+        if composer >= 0:
             return True
         time.sleep(0.05)
     return False
@@ -1071,7 +1118,7 @@ def run_host(args: argparse.Namespace) -> int:
     columns, rows = console_size(args.columns, args.rows)
     binder = SessionBinder(session_roots)
     pty = WindowsConPty(columns, rows)
-    command_line = windows_command(args.codex_bin, args.codex_arg)
+    command_line = windows_command(args.codex_bin, unattended_codex_args(args.codex_arg))
     child_pid = pty.launch(command_line, workdir)
     stop = threading.Event()
     inputs = OrderedInputQueue()
@@ -1096,7 +1143,11 @@ def run_host(args: argparse.Namespace) -> int:
     resize_thread.start()
 
     try:
-        if not wait_for_tui_ready(output, pty.alive):
+        def skip_update_picker(keys: bytes) -> None:
+            pty.write(keys)
+            safe_log("Codex startup update picker detected; forcing Skip selection")
+
+        if not wait_for_tui_ready(output, pty.alive, on_update_picker=skip_update_picker):
             safe_log("Codex TUI readiness timeout")
             return 3
         writer_thread = threading.Thread(
@@ -1278,6 +1329,36 @@ def prepare_smoke_codex_home(smoke_home: Path, real_home: Path | None = None) ->
     return smoke_home / "sessions"
 
 
+def remove_smoke_auth_copy(smoke_home: Path) -> None:
+    """Delete the copied login first, zeroizing it before a retry if needed."""
+
+    auth_copy = smoke_home / "auth.json"
+    try:
+        auth_copy.unlink()
+        return
+    except FileNotFoundError:
+        return
+    except OSError:
+        pass
+
+    try:
+        remaining = auth_copy.stat().st_size
+        zero_chunk = b"\0" * min(max(remaining, 1), 64 * 1024)
+        with auth_copy.open("r+b", buffering=0) as handle:
+            while remaining:
+                written = handle.write(zero_chunk[:remaining])
+                if not written:
+                    raise OSError("short write while zeroizing smoke authentication copy")
+                remaining -= written
+            handle.flush()
+            os.fsync(handle.fileno())
+        auth_copy.unlink()
+    except FileNotFoundError:
+        return
+    except OSError as exc:
+        raise RuntimeError("failed to remove smoke authentication copy") from exc
+
+
 def run_codex_smoke_test(args: argparse.Namespace) -> int:
     """Launch the native Codex TUI, bind its JSONL, then exit without a model turn."""
 
@@ -1285,16 +1366,9 @@ def run_codex_smoke_test(args: argparse.Namespace) -> int:
     import io
 
     workdir = Path(args.workdir).expanduser().resolve()
-    smoke_home_dir = tempfile.mkdtemp(prefix="codex-smoke-home-")
-    smoke_sessions = prepare_smoke_codex_home(Path(smoke_home_dir))
-    os.environ["CODEX_HOME"] = str(Path(smoke_home_dir))
-    session_roots = [smoke_sessions]
-    binder = SessionBinder(session_roots)
-    pty = WindowsConPty(args.columns, args.rows)
-    output = RawOutputBuffer(args.capture_bytes)
+    smoke_home = Path(tempfile.mkdtemp(prefix="codex-smoke-home-"))
+    pty: WindowsConPty | None = None
     stop = threading.Event()
-    inputs = OrderedInputQueue()
-    sink = io.BytesIO()
     output_thread: threading.Thread | None = None
 
     def final_seen(path: Path) -> bool:
@@ -1322,7 +1396,17 @@ def run_codex_smoke_test(args: argparse.Namespace) -> int:
         return False
 
     try:
-        pty.launch(windows_command(args.codex_bin, args.codex_arg), workdir)
+        smoke_sessions = prepare_smoke_codex_home(smoke_home)
+        os.environ["CODEX_HOME"] = str(smoke_home)
+        binder = SessionBinder([smoke_sessions])
+        pty = WindowsConPty(args.columns, args.rows)
+        output = RawOutputBuffer(args.capture_bytes)
+        inputs = OrderedInputQueue()
+        sink = io.BytesIO()
+        pty.launch(
+            windows_command(args.codex_bin, unattended_codex_args(args.codex_arg)),
+            workdir,
+        )
         output_thread = threading.Thread(
             target=output_loop,
             args=(pty, output, stop, sink),
@@ -1330,7 +1414,11 @@ def run_codex_smoke_test(args: argparse.Namespace) -> int:
             name="codex-smoke-output",
         )
         output_thread.start()
-        if not wait_for_tui_ready(output, pty.alive):
+        def skip_update_picker(keys: bytes) -> None:
+            pty.write(keys)
+            safe_log("Codex smoke startup update picker detected; forcing Skip selection")
+
+        if not wait_for_tui_ready(output, pty.alive, on_update_picker=skip_update_picker):
             safe_log("Codex smoke TUI readiness timeout")
             return 4
         threading.Thread(
@@ -1385,11 +1473,31 @@ def run_codex_smoke_test(args: argparse.Namespace) -> int:
         print("PASS native Codex TUI launch/session-bind/command/exit")
         return 0
     finally:
-        stop.set()
-        pty.close()
-        if output_thread is not None:
-            output_thread.join(timeout=2.0)
-        shutil.rmtree(smoke_home_dir, ignore_errors=True)
+        auth_cleanup_error: Exception | None = None
+        try:
+            remove_smoke_auth_copy(smoke_home)
+        except Exception as exc:  # keep closing the child before one bounded retry
+            auth_cleanup_error = exc
+        try:
+            stop.set()
+            if pty is not None:
+                pty.close()
+            if output_thread is not None:
+                output_thread.join(timeout=2.0)
+        finally:
+            auth_copy = smoke_home / "auth.json"
+            if auth_cleanup_error is not None and auth_copy.exists():
+                try:
+                    remove_smoke_auth_copy(smoke_home)
+                except Exception as exc:
+                    auth_cleanup_error = exc
+            try:
+                shutil.rmtree(smoke_home)
+            except FileNotFoundError:
+                pass
+            finally:
+                if auth_copy.exists():
+                    raise RuntimeError("smoke authentication copy remains after cleanup") from auth_cleanup_error
 
 
 def parser() -> argparse.ArgumentParser:

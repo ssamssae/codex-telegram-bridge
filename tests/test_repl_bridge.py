@@ -90,7 +90,7 @@ class ConfigDefaultsTest(unittest.TestCase):
         self.assertEqual(cfg.long_running_progress_seconds, 600)
         self.assertEqual(cfg.telegram_fallback_seconds, 90)
         self.assertEqual(cfg.typing_liveness_seconds, 10)
-        self.assertTrue(cfg.flow_mirror)
+        self.assertFalse(cfg.flow_mirror)
         self.assertTrue(cfg.reasoning_mirror)
 
     def test_emoji_prefix_strips_inline_node_emoji_from_answer_body(self):
@@ -365,7 +365,7 @@ class ReplBridgeTests(unittest.TestCase):
                 )
                 self.assertEqual(
                     repl.suggested_reply_messages(answer, False, "aniki_dm"),
-                    [answer],
+                    ["본문 답변", "바로 이어서 할게"],
                 )
 
     def test_suggested_reply_confirmation_gate_matches_claude_reference(self):
@@ -516,7 +516,7 @@ class ReplBridgeTests(unittest.TestCase):
         steps = "\n".join(repl.function_call_flow_summary(payload) for payload in payloads)
         card = repl.format_flow_mirror(
             steps,
-            node="macmini",
+            node="studio",
             emoji="🏭",
             context="뉴스레터 발행해줘",
             now=repl.datetime(2026, 7, 12, 22, 1, tzinfo=repl.KST),
@@ -524,7 +524,7 @@ class ReplBridgeTests(unittest.TestCase):
 
         self.assertEqual(
             card,
-            "🏭 macmini · 뉴스레터 발행 · 22:01\n\n"
+            "🏭 studio · 뉴스레터 발행 · 22:01\n\n"
             "🌐 브라우저\n"
             "🔗 이동 · substack.com\n"
             "🖱 클릭 ×2 · 확인\n"

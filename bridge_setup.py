@@ -456,7 +456,7 @@ def write_env_config(
                 f"CRB_TMUX_SUBMIT_KEY={shell_quote(submit_key)}",
                 "CRB_START_AT_END=1",
                 "CRB_IMAGE_MODE=repl",
-                "CRB_FLOW_MIRROR=1",
+                "CRB_FLOW_MIRROR=0",
                 "CRB_LONG_RUNNING_PROGRESS_SECONDS=0",
                 f"CRB_AUDIO_TRANSCRIBE_CMD={shell_quote(audio_transcribe_cmd)}",
             ]

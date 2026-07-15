@@ -117,6 +117,11 @@ REASONING_HEADER = "\U0001f9e0 코덱스 사고"
 REASONING_MIRROR_LIMIT = 3500
 FLOW_MIRROR_HEADER = "⚙️ 작업 흐름"
 FLOW_MIRROR_LIMIT = 1500
+# T-260714-43: default-OFF flow mirror gate. The env override matches the existing public
+# configuration surface; the flag file gives local REPL users Claude-bridge
+# parity without changing a service definition.
+FLOW_MIRROR_ENV = "CRB_FLOW_MIRROR"
+FLOW_MIRROR_FLAG = os.path.expanduser("~/.config/codex-telegram-bridge/flow-mirror.on")
 # Per-step line cap: each flow event is collapsed to ONE short line (claude
 # parity) instead of the full multi-line narration. Keeps many steps inside one
 # edit-in-place card instead of overflowing into many long messages.
@@ -126,6 +131,8 @@ FLOW_MIRROR_LINE_LIMIT = 100
 # scroll off instead of spawning multiple long cards. (T-260628-36)
 FLOW_MIRROR_WINDOW = 6
 FLOW_MIRROR_EDIT_MIN_SECONDS = 1.0
+FLOW_MIRROR_SCREEN_CAPTURE_LINES = 120
+FLOW_MIRROR_SCREEN_FALLBACK_SECONDS = 2.0
 # ⚙️ A2 받은-지시 카드 (T-260630-22): 노드/오케가 codex REPL 에 주입한 디렉티브를 결과(코덱스
 # 답)보다 먼저 1~2줄로 보여줘 맥락이 끊기던 문제 보완. codex 는 TUI 라 JSONL terminal-origin
 # 에 수동입력이 섞여 origin 만으론 노드주입을 못 가리므로(claude 헤드리스와 다름), 신뢰성 있는
@@ -133,7 +140,7 @@ FLOW_MIRROR_EDIT_MIN_SECONDS = 1.0
 # 토글 게이트. claude-telegram-bridge.py 의 '📥 받은 지시'(PR#248, node-origin 직접감지)와 한 쌍.
 AMBIENT_DIRECTIVE_HEADER = "📥 받은 지시"
 SENT_DIRECTIVE_HEADER = "📤 보낸 지시"
-# T-260709-56: 터미널 에코(자기→자기)는 라우팅 줄이 "라이덴 → 라이덴" 으로 읽혀 혼선 —
+# T-260709-56: 터미널 에코(자기→자기)는 라우팅 줄이 "작업 노드 → 작업 노드" 으로 읽혀 혼선 —
 # 자기 노드 입력은 ⌨️ 헤더 + 본문만. 노드간(from≠to)은 📤 라우팅 카드 유지.
 TERMINAL_INPUT_HEADER = "⌨️ 터미널 입력"
 AMBIENT_DIRECTIVE_LIMIT = 400
@@ -278,6 +285,15 @@ def bool_env(name: str, default: bool = False) -> bool:
     return (env(name, fallback) or fallback).lower() in {"1", "true", "yes", "on"}
 
 
+SUGGESTED_REPLY_OPEN_RE = re.compile(r"^<추천답변(?P<attrs>(?:\s+[^>\r\n]*)?)>")
+SUGGESTED_REPLY_CLASS_RE = re.compile(
+    r'(?:^|\s)class\s*=\s*(?:"(?P<quoted>[^"]+)"|(?P<bare>[^\s>]+))',
+    re.I,
+)
+SUGGESTED_REPLY_CLOSE_RE = re.compile(r"\s*<\s*/\s*[^<>\r\n]+\s*>\s*$")
+SUGGESTED_REPLY_FORCED_CLASSES = {"auto-ok", "hold"}
+
+
 @dataclass(frozen=True)
 class SuggestedReply:
     body: str
@@ -285,62 +301,42 @@ class SuggestedReply:
     declared_class: str
 
 
-SUGGESTED_REPLY_LINE_RE = re.compile(
-    r'^<추천답변(?:\s+class=(?:"(?P<quoted>[^"]+)"|(?P<bare>[^\s>]+)))?'
-    r'>(?P<reply>[^\r\n]+?)\s*</\s*추천답변\s*>\s*$'
-)
-
-
 def parse_suggested_reply(text: str) -> SuggestedReply:
     original = text or ""
     lines = original.rstrip("\r\n").splitlines()
     if not lines:
         return SuggestedReply(original, "", "")
-    match = SUGGESTED_REPLY_LINE_RE.fullmatch(lines[-1])
-    if not match:
+    marker = lines[-1]
+    open_match = SUGGESTED_REPLY_OPEN_RE.match(marker)
+    if not open_match:
         return SuggestedReply(original, "", "")
-    return SuggestedReply(
-        "\n".join(lines[:-1]).rstrip(),
-        match.group("reply").strip(),
-        (match.group("quoted") or match.group("bare") or "").strip().lower(),
-    )
+    body = "\n".join(lines[:-1]).rstrip()
+    class_match = SUGGESTED_REPLY_CLASS_RE.search(open_match.group("attrs"))
+    declared_class = (
+        (class_match.group("quoted") or class_match.group("bare") or "")
+        if class_match
+        else ""
+    ).strip().lower()
+    content = SUGGESTED_REPLY_CLOSE_RE.sub("", marker[open_match.end() :]).strip()
+    return SuggestedReply(body, content, declared_class)
 
 
 def suggested_reply_messages(text: str, enabled: bool, surface: str) -> list[str]:
-    parsed = parse_suggested_reply(text)
-    if parsed.reply:
-        if not parsed.body:
-            return [parsed.reply]
-        if enabled and surface == "aniki_dm":
-            return [parsed.body, parsed.reply]
-        if not enabled and surface == "aniki_dm" and parsed.declared_class:
-            return [text or ""]
-        return [parsed.body]
     original = text or ""
-    trimmed = original.rstrip("\r\n")
-    lines = trimmed.splitlines()
-    if not lines:
-        return [original]
-    marker = lines[-1]
-    open_tag = "<추천답변>"
-    if not marker.startswith(open_tag):
-        return [original]
-    body = "\n".join(lines[:-1]).rstrip()
-    match = re.fullmatch(
-        r"(?P<content>[^\r\n]+?)\s*<\s*/\s*[^<>\r\n]*답변\s*>\s*",
-        marker[len(open_tag) :],
-    )
-    if not match:
-        if body:
-            return [body]
-        content = marker[len(open_tag) :].split("<", 1)[0].strip()
-        return [content] if content else [""]
-    content = match.group("content").strip()
-    if not body:
-        return [content]
-    if enabled and surface == "aniki_dm":
-        return [body, content]
-    return [body]
+    parsed = parse_suggested_reply(original)
+    if not parsed.reply:
+        if parsed.body == original:
+            return [original]
+        return [parsed.body] if parsed.body else [""]
+    if not parsed.body:
+        return [parsed.reply]
+    # A declared class marker always splits in the DM so the raw tag never
+    # leaks into the answer body, mirroring the Claude bridge (T-260716-07/-08).
+    if surface == "aniki_dm" and (
+        enabled or parsed.declared_class in SUGGESTED_REPLY_FORCED_CLASSES
+    ):
+        return [parsed.body, parsed.reply]
+    return [parsed.body]
 
 
 SUGGESTED_REPLY_CONFIRMATION_EMOJI = "👀"
@@ -380,6 +376,91 @@ def apply_suggested_reply_confirmation(
         return
     if not reacted:
         log("SEND", "suggested reply confirmation failed (non-fatal)")
+
+
+EYE_ACTIVITY_DIRECTIONS = ("↖", "↗", "↘", "↙")
+EYE_ACTIVITY_EDIT_MIN_SECONDS = 3.0
+EYE_ACTIVITY_MAX_EDITS = 40
+
+
+def eye_activity_frames(label: str, enabled: bool, surface: str) -> list[str]:
+    if not enabled or surface != "aniki_dm":
+        return []
+    clean_label = " ".join((label or "응답 처리 중").split())[:80] or "응답 처리 중"
+    return [f"👀{direction} {clean_label}" for direction in EYE_ACTIVITY_DIRECTIONS]
+
+
+def codex_activity_indicator_context(
+    label: str,
+    enabled: bool,
+    surface: str,
+    origin: str | None,
+    prompt: str,
+    message_id: int,
+) -> tuple[list[str], int]:
+    """Render Codex activity without quoting the user's prompt.
+
+    ``message_id`` remains an input so fixtures prove that even a valid reply
+    candidate is intentionally ignored.  The final answer keeps its native
+    reply contract; only this ephemeral progress card is detached.
+    """
+    if origin != "telegram" or not normalize_prompt(prompt):
+        return [], 0
+    frames = eye_activity_frames(label, enabled, surface)
+    if not frames:
+        return [], 0
+    return frames, 0
+
+
+def start_eye_activity_loop(
+    telegram: Any,
+    stop_event: threading.Event,
+    frames: list[str],
+    reply_to_message_id: int = 0,
+) -> threading.Thread | None:
+    send_activity = getattr(telegram, "send_activity_indicator", None)
+    edit_activity = getattr(telegram, "edit_activity_indicator", None)
+    delete_activity = getattr(telegram, "delete_activity_indicator", None)
+    if not frames or not all(callable(method) for method in (send_activity, edit_activity, delete_activity)):
+        return None
+
+    def loop() -> None:
+        if stop_event.is_set():
+            return
+        try:
+            message_id = send_activity(frames[0], reply_to_message_id or None)
+        except Exception as exc:  # noqa: BLE001
+            log("ACTIVITY", f"eyes start skipped: {exc}")
+            return
+        if not message_id:
+            log("ACTIVITY", "eyes start skipped: send failed")
+            return
+        try:
+            frame_index = 1
+            edits = 0
+            while edits < EYE_ACTIVITY_MAX_EDITS:
+                if stop_event.wait(EYE_ACTIVITY_EDIT_MIN_SECONDS):
+                    break
+                try:
+                    if not edit_activity(message_id, frames[frame_index % len(frames)]):
+                        break
+                except Exception as exc:  # noqa: BLE001
+                    log("ACTIVITY", f"eyes edit skipped: {exc}")
+                    break
+                edits += 1
+                frame_index += 1
+            if not stop_event.is_set():
+                stop_event.wait()
+        finally:
+            try:
+                if not delete_activity(message_id):
+                    log("ACTIVITY", "eyes cleanup skipped: delete failed")
+            except Exception as exc:  # noqa: BLE001
+                log("ACTIVITY", f"eyes cleanup skipped: {exc}")
+
+    worker = threading.Thread(target=loop, daemon=True, name="crb-eyes-activity")
+    worker.start()
+    return worker
 
 
 def clamp(value: int, minimum: int, maximum: int) -> int:
@@ -488,6 +569,24 @@ def _self_update_is_pip_managed() -> bool:
     return "site-packages" in path or "dist-packages" in path
 
 
+def _self_update_is_local_install() -> bool:
+    """Return True for direct/local installs that PyPI must not overwrite.
+
+    PEP 610 requires pip to write ``direct_url.json`` when a distribution came
+    from a wheel path, source tree, VCS checkout, or another direct URL. Normal
+    package-index installs do not carry that file. Treat even malformed direct
+    origin metadata as local so an internal build fails closed.
+    """
+    try:
+        from importlib.metadata import distribution
+
+        direct_url = distribution(SELF_UPDATE_PACKAGE).read_text("direct_url.json")
+        return direct_url is not None
+    except Exception as exc:  # noqa: BLE001 — missing metadata means index install
+        log("UPDATE", f"install origin check skipped: {exc}")
+        return False
+
+
 def _self_update_version_tuple(text: str) -> tuple[int, ...]:
     parts: list[int] = []
     for chunk in str(text).split("."):
@@ -541,11 +640,59 @@ def self_update_available() -> str | None:
         return None
 
 
-def perform_self_update(latest: str) -> None:
-    """pip-upgrade to `latest` then re-exec so the new code runs. Fail-safe: any
-    error leaves the running version untouched."""
+@dataclass(frozen=True)
+class SelfUpdateResult:
+    status: str
+    message: str
+    restart_requested: bool = False
+
+
+def _self_update_notify(notify: Callable[[str], object] | None, message: str) -> None:
+    if notify is None:
+        return
     try:
-        log("UPDATE", f"upgrading {SELF_UPDATE_PACKAGE} -> {latest}")
+        notify(message)
+    except Exception as exc:  # noqa: BLE001 — chat feedback cannot break updater safety
+        log("UPDATE", f"chat feedback failed: {exc}")
+
+
+def _self_update_failure_message(latest: str, output: str, returncode: int) -> str:
+    lowered = output.lower()
+    if "externally-managed-environment" in lowered or "pep 668" in lowered:
+        reason = "Python externally-managed-environment(PEP 668)"
+        manual = f"pipx install --force {SELF_UPDATE_PACKAGE}"
+    elif "--user" in lowered and (
+        "pip 26" in lowered or "not supported" in lowered or "no longer" in lowered
+    ):
+        reason = "pip 26에서 --user 설치 미지원"
+        manual = f"pipx install --force {SELF_UPDATE_PACKAGE}"
+    else:
+        reason = f"pip 종료 코드 {returncode}"
+        manual = f"python -m pip install --upgrade {SELF_UPDATE_PACKAGE}"
+    return f"❌ v{latest} 업데이트 실패: {reason}. 수동: {manual}"
+
+
+def perform_self_update(
+    latest: str,
+    *,
+    notify: Callable[[str], object] | None = None,
+) -> SelfUpdateResult:
+    """Upgrade to ``latest``, report the outcome, then re-exec on success.
+
+    Direct/local wheel installs are never replaced with the public PyPI build.
+    Any install error leaves the running version untouched.
+    """
+    if _self_update_is_local_install():
+        message = (
+            f"ℹ️ v{latest} 자동 업데이트 건너뜀: 로컬/내부 휠 설치본이라 PyPI로 덮지 않습니다. "
+            "설치에 사용한 로컬 휠 절차로 갱신하세요."
+        )
+        log("UPDATE", "local/direct install detected; PyPI upgrade skipped")
+        _self_update_notify(notify, message)
+        return SelfUpdateResult("skipped_local", message)
+
+    log("UPDATE", f"upgrading {SELF_UPDATE_PACKAGE} -> {latest}")
+    try:
         proc = subprocess.run(
             [sys.executable, "-m", "pip", "install", "--upgrade", f"{SELF_UPDATE_PACKAGE}=={latest}"],
             capture_output=True,
@@ -553,14 +700,33 @@ def perform_self_update(latest: str) -> None:
             timeout=300,
         )
         if proc.returncode != 0:
-            detail = (proc.stderr or proc.stdout or "").strip()[:200]
+            output = (proc.stderr or proc.stdout or "").strip()
+            detail = output[:200]
             log("UPDATE", f"pip upgrade failed (staying put): {detail}")
-            return
-        os.environ[f"{SELF_UPDATE_PREFIX}_SELF_UPDATED"] = latest
-        log("UPDATE", f"upgraded to {latest}; restarting")
+            message = _self_update_failure_message(latest, output, proc.returncode)
+            _self_update_notify(notify, message)
+            return SelfUpdateResult("failed", message)
+    except Exception as exc:  # noqa: BLE001
+        log("UPDATE", f"self-update install error (staying put): {exc}")
+        message = f"❌ v{latest} 업데이트 실패: pip 실행 오류. 수동: python -m pip install --upgrade {SELF_UPDATE_PACKAGE}"
+        _self_update_notify(notify, message)
+        return SelfUpdateResult("failed", message)
+
+    os.environ[f"{SELF_UPDATE_PREFIX}_SELF_UPDATED"] = latest
+    message = f"✅ {SELF_UPDATE_PACKAGE} v{latest} 설치 성공 — 지금 브릿지를 재시작합니다."
+    log("UPDATE", f"upgraded to {latest}; restarting")
+    _self_update_notify(notify, message)
+    try:
         os.execv(sys.executable, [sys.executable, "-m", SELF_UPDATE_MODULE] + sys.argv[1:])
     except Exception as exc:  # noqa: BLE001
         log("UPDATE", f"self-update error (new version active next restart): {exc}")
+        message = (
+            f"⚠️ {SELF_UPDATE_PACKAGE} v{latest} 설치 성공, 자동 재시작 실패. "
+            "브릿지를 수동 재시작하면 신버전이 적용됩니다."
+        )
+        _self_update_notify(notify, message)
+        return SelfUpdateResult("installed_restart_failed", message)
+    return SelfUpdateResult("updated", message, restart_requested=True)
 
 
 def node_defaults() -> tuple[str, str]:
@@ -607,7 +773,7 @@ def read_json(path: Path) -> dict[str, Any] | None:
 def _atomic_tmp(path: Path) -> tuple[int, Path]:
     # T-260704-39 F7: tmp 는 호출마다 유니크(mkstemp) — 고정 '<name>.tmp' 는 동시
     # 쓰기가 같은 경로를 공유하다 첫 replace 후 두번째 replace 가 FileNotFoundError
-    # 로 죽는 race. claude 브릿지 F5(T-260704-37, 라이덴 크래시 실측)와 동일 클래스 선제수리.
+    # 로 죽는 race. claude 브릿지 F5(T-260704-37, 작업 노드 크래시 실측)와 동일 클래스 선제수리.
     fd, name = tempfile.mkstemp(prefix=path.name + ".", suffix=".tmp", dir=str(path.parent))
     return fd, Path(name)
 
@@ -866,7 +1032,7 @@ def codex_bridge_launchd_label(node: str) -> str:
 def codex_bridge_restart_command(node: str) -> list[str]:
     """codex 텔레그램 브릿지 재시작 명령(플랫폼 분기).
 
-    macOS 본진/맥미니는 launchd 잡(노드별 라벨)으로, Linux 노드(라이덴/데스크탑/노트북)는
+    macOS 제어 노드/macOS 노드는 launchd 잡(노드별 라벨)으로, Linux 노드(작업 노드/데스크탑/작업 노드)는
     systemd user unit(codex-bridge.service)으로 브릿지를 관리한다. 기존엔 launchctl 만 호출해
     launchctl 부재인 Linux 노드에서 재시작 버튼이 무동작이었다(T-260630-18, PR #246 리뷰노트).
     """
@@ -1040,6 +1206,20 @@ def format_reasoning_mirror(text: str) -> str:
     return f"{REASONING_HEADER}\n{body}" if body else ""
 
 
+def flow_mirror_enabled(configured_enabled: bool = False) -> bool:
+    """Return the explicit env toggle, runtime flag, or a test/config override.
+
+    An explicit ``CRB_FLOW_MIRROR`` value wins over the flag.  With neither
+    present the feature is OFF.  ``configured_enabled`` supports an explicitly
+    constructed Config while production Config remains default-OFF and observes
+    flag creation/removal at runtime.
+    """
+    configured = os.environ.get(FLOW_MIRROR_ENV)
+    if configured is not None and configured.strip():
+        return configured.strip().lower() in {"1", "true", "yes", "on"}
+    return os.path.exists(FLOW_MIRROR_FLAG) or configured_enabled
+
+
 def flow_context_summary(text: str, limit: int = 40) -> str:
     """Extract a stable, friendly one-line context for a live flow card."""
     for raw in strip_node_emoji_header(text or "").splitlines():
@@ -1055,13 +1235,14 @@ def flow_context_summary(text: str, limit: int = 40) -> str:
             line = line.split(" — ", 1)[1]
         line = re.sub(r"^T-\d{6}-\d+\s*(?:[—:|-]+\s*)?", "", line).strip()
         line = re.sub(r"(?:진행해\s*줘|진행해\s*주세요|해\s*줘|해\s*주세요)[.!]?\s*$", "", line).strip()
-        if line:
-            return _flow_cap_text(line, limit)
+        if not line:
+            continue
+        return _flow_cap_text(line, limit)
     return "작업 진행"
 
 
 def flow_card_steps(text: str) -> tuple[list[str], str]:
-    """Group consecutive identical tool labels and return lines/current step."""
+    """Group consecutive identical tool labels and return rendered lines/current step."""
     groups: list[dict[str, Any]] = []
     for raw in flow_mirror_body(text).splitlines():
         line = raw.strip()
@@ -1094,6 +1275,7 @@ def format_flow_mirror(
     emoji: str = "",
     context: str = "",
     now: datetime | None = None,
+    autonomous: bool = False,
 ) -> str:
     lines, current = flow_card_steps(text)
     if not lines:
@@ -1105,7 +1287,8 @@ def format_flow_mirror(
     node_emoji = emoji or mapped_emoji or default_emoji
     timestamp = (now or datetime.now(KST)).astimezone(KST).strftime("%H:%M")
     header = f"{node_emoji} {label} · {flow_context_summary(context)} · {timestamp}"
-    footer = f"→ 진행중 · 현재: {current}"
+    state = "노드 자율 진행중" if autonomous else "진행중"
+    footer = f"→ {state} · 현재: {current}"
     available = max(1, FLOW_MIRROR_LIMIT - len(header) - len(footer) - 4)
     while len(lines) > 1 and len("\n".join(lines)) > available:
         lines.pop(0)
@@ -1168,8 +1351,42 @@ def format_ambient_directive(
     return f"{AMBIENT_DIRECTIVE_HEADER}\n{out}" if out else ""
 
 
+_DIRECTIVE_ROUTE_META_RE = re.compile(
+    r"^from=\S+\s*\|?\s*task=(?:T-[0-9A-Za-z-]+)?(?:\s*\|\s*title=.*)?$",
+    re.IGNORECASE,
+)
+_DIRECTIVE_REPORT_META_RE = re.compile(
+    r"^(?:engine=[^\s|]+\s+)?task=T-[0-9A-Za-z-]+\s+title=.*$",
+    re.IGNORECASE,
+)
+_DIRECTIVE_BOILERPLATE_RE = re.compile(
+    r"^\[(?:claude-skills HEAD|CLAUDE-REVIEW-ROUTE|NODE-ACK-)",
+    re.IGNORECASE,
+)
+
+
+def strip_internal_prompt_headers(text: str) -> str:
+    """Remove only leading transport metadata before rendering a DM card."""
+    lines = (text or "").splitlines()
+    while lines:
+        first = lines[0].strip()
+        if not first:
+            lines.pop(0)
+            continue
+        if not (
+            _DIRECTIVE_ROUTE_META_RE.match(first)
+            or _DIRECTIVE_REPORT_META_RE.match(first)
+            or _DIRECTIVE_BOILERPLATE_RE.match(first)
+        ):
+            break
+        lines.pop(0)
+    return "\n".join(lines).strip()
+
+
 def format_sent_directive(text: str, from_alias: str, to_alias: str) -> str:
-    body = strip_inline_node_emoji_header(strip_node_emoji_header(text or "")).strip()
+    body = strip_internal_prompt_headers(
+        strip_inline_node_emoji_header(strip_node_emoji_header(text or ""))
+    )
     if not body:
         return ""
     if (from_alias or "").strip() == (to_alias or "").strip():
@@ -1196,37 +1413,18 @@ def flow_step_summary(text: str, limit: int = FLOW_MIRROR_LINE_LIMIT) -> str:
     body = " ".join(strip_node_emoji_header(text).split())
     if body.startswith(REASONING_HEADER):
         body = body[len(REASONING_HEADER) :].strip()
-    # Tool one-liners are already collapsed and detail-capped by
-    # function_call_flow_summary. Keep them whole so the live card has parity
-    # with Claude's icon-labelled steps.
-    if body.startswith(
-        (
-            "▶ ",
-            "⌨️ ",
-            "🖊 ",
-            "🖼 ",
-            "🎨 ",
-            "🗂 ",
-            "⚡ ",
-            "🌐 ",
-            "🔗 ",
-            "🖱 ",
-            "📄 ",
-            "📈 ",
-            "🌤 ",
-            "🏟 ",
-            "🕒 ",
-            "🔧 ",
-        )
-    ):
+    # function_call one-liners ("• <label> · <detail>") are already collapsed and
+    # length-capped (no ellipsis) by function_call_flow_summary — keep them whole
+    # so the claude-parity flow card shows the full tool detail. (T-260628-43)
+    if body.startswith("• "):
         return body.strip()
     if len(body) > limit:
         body = body[:limit].rstrip() + "…"
     return body.strip()
 
 
-# Tool-call → Korean label map for the flow card (claude parity). Each Codex
-# function_call becomes one short icon-labelled line instead of long
+# Tool-call → Korean label map for the flow card (claude parity). Each codex
+# function_call becomes ONE short line "• <label> · <detail>" instead of long
 # commentary prose that overflowed and got ellipsis-truncated. (T-260628-43)
 TOOL_LABEL_KO = {
     "exec_command": "▶ 실행",
@@ -1576,6 +1774,164 @@ def function_call_flow_summary(payload: dict[str, Any]) -> str:
     detail = flow_tool_detail(name, detail)
     detail = compact_flow_detail(detail)
     return f"{label} · {detail}".rstrip(" ·").rstrip() if not detail else f"{label} · {detail}"
+
+
+_FLOW_SCREEN_BULLET_RE = re.compile(r"^\s*[•◦]\s+(?P<body>.*?)\s*$")
+_FLOW_SCREEN_HOOK_RE = re.compile(
+    r"^\d+\s+(?:Pre|Post)ToolUse\s+hooks?$",
+    re.IGNORECASE,
+)
+
+
+def _join_screen_wrapped_parts(parts: list[str]) -> str:
+    value = ""
+    for part in parts:
+        clean = " ".join(part.split())
+        if not clean:
+            continue
+        if not value:
+            value = clean
+        elif value.endswith(("-", "/", "\\")):
+            value += clean
+        else:
+            value += f" {clean}"
+    return value.strip()
+
+
+def _screen_command_detail(body: str, block: list[str]) -> str:
+    parts = [body]
+    for raw in block:
+        line = raw.strip()
+        if line.startswith("└"):
+            break
+        if line.startswith("│"):
+            continuation = line[1:].strip()
+            if continuation and not continuation.startswith("…"):
+                parts.append(continuation)
+    return _join_screen_wrapped_parts(parts)
+
+
+def _screen_explored_detail(block: list[str]) -> str:
+    parts: list[str] = []
+    collecting = False
+    for raw in block:
+        line = raw.strip()
+        if line.startswith(("└", "├")):
+            line = line[1:].strip()
+            collecting = True
+        elif line.startswith("│"):
+            if not collecting:
+                continue
+            line = line[1:].strip()
+        elif not collecting:
+            continue
+        if not line:
+            if collecting and parts:
+                break
+            continue
+        if line.startswith("…") or "ctrl + t to view transcript" in line:
+            continue
+        if re.fullmatch(r"[─━═_\s]+", line):
+            break
+        parts.append(line)
+    return _join_screen_wrapped_parts(parts)
+
+
+def _screen_direct_action_detail(body: str, block: list[str]) -> str:
+    parts = [body]
+    for raw in block:
+        line = raw.strip()
+        if not line:
+            break
+        if line.startswith(("└", "├", "│", "…")):
+            break
+        if re.match(r"^(?:\d+\s|@@|[+-]{3})", line):
+            break
+        parts.append(line)
+    detail = _join_screen_wrapped_parts(parts)
+    return re.sub(r"\s*\(\+\d+(?:\s+-\d+)?\)\s*$", "", detail).strip()
+
+
+def codex_screen_flow_summary(body: str, block: list[str] | None = None) -> str:
+    """Map one allow-listed Codex TUI activity row to a Korean flow step."""
+    value = " ".join((body or "").split())
+    block = block or []
+    if not value or value.startswith(("Working ", "Conversation interrupted")):
+        return ""
+
+    run_match = re.match(r"^(?:Ran|Running)\s+(.+)$", value, re.IGNORECASE)
+    if run_match:
+        command = _screen_command_detail(run_match.group(1), block)
+        if _FLOW_SCREEN_HOOK_RE.fullmatch(command):
+            return ""
+        detail = compact_flow_detail(summarize_shell_command(command))
+        return f"▶ 실행 · {detail}" if detail else "▶ 실행"
+
+    explored_match = re.match(r"^Explored(?:\s+(.+))?$", value, re.IGNORECASE)
+    if explored_match:
+        detail = explored_match.group(1) or _screen_explored_detail(block)
+        if detail:
+            return codex_screen_flow_summary(detail)
+        return "🔎 탐색"
+
+    direct_actions = (
+        (r"^(?:Read|Viewed)\s+(.+)$", "📄 읽기"),
+        (r"^(?:Searched|Search)\s+(.+)$", "🔎 검색"),
+        (r"^(?:Listed|List)\s+(.+)$", "📁 파일 찾기"),
+        (r"^(?:Edited|Updated|Modified)\s+(.+)$", "🖊 편집"),
+        (r"^(?:Added|Created|Wrote)\s+(.+)$", "🖊 작성"),
+        (r"^(?:Deleted|Removed)\s+(.+)$", "🗑 삭제"),
+    )
+    for pattern, label in direct_actions:
+        match = re.match(pattern, value, re.IGNORECASE)
+        if match:
+            detail = _screen_direct_action_detail(match.group(1), block)
+            detail = compact_flow_detail(detail)
+            return f"{label} · {detail}" if detail else label
+
+    call_match = re.match(r"^(?:Called|Used)\s+([^\s(]+)(?:\s+(.+))?$", value, re.IGNORECASE)
+    if call_match:
+        label = tool_label_ko(call_match.group(1))
+        detail = compact_flow_detail((call_match.group(2) or "").strip())
+        return f"{label} · {detail}" if detail else label
+    return ""
+
+
+def extract_codex_flow_steps(screen: str) -> list[str]:
+    """Extract best-effort tool/stage rows from the visible Codex REPL screen.
+
+    Only known TUI activity verbs are accepted.  Assistant commentary and tool
+    output remain excluded, which keeps an open-loop scrape from turning prose
+    into false tool events.
+    """
+    lines = clean_pane_lines(screen or "")
+    steps: list[str] = []
+    for index, raw in enumerate(lines):
+        match = _FLOW_SCREEN_BULLET_RE.match(raw)
+        if not match:
+            continue
+        block: list[str] = []
+        for following in lines[index + 1 :]:
+            if _FLOW_SCREEN_BULLET_RE.match(following) or following.lstrip().startswith("›"):
+                break
+            block.append(following)
+        summary = codex_screen_flow_summary(match.group("body"), block)
+        if summary:
+            steps.append(summary)
+    if not steps and screen_has_repl_busy_marker(screen):
+        return ["⏳ 작업 중"]
+    return steps
+
+
+def appended_flow_steps(previous: list[str], current: list[str]) -> list[str]:
+    """Return screen steps appended after a possibly scrolled visible suffix."""
+    if not current or previous == current:
+        return []
+    max_overlap = min(len(previous), len(current))
+    for overlap in range(max_overlap, 0, -1):
+        if previous[-overlap:] == current[:overlap]:
+            return current[overlap:]
+    return list(current)
 
 
 def flow_mirror_dedup_key(text: str, scope: str = "") -> str:
@@ -2098,9 +2454,10 @@ class Config:
     transport_mode: str = "tmux"
     conpty_state_path: Path | None = None
     conpty_timeout_ms: int = 5000
-    suggested_reply_bubble: bool = False
+    suggested_reply_bubble: bool = True
     suggested_reply_confirmation_enabled: bool = True
     native_turn_stale_seconds: int = 300
+    activity_eyes_enabled: bool = True
 
     @classmethod
     def from_env(cls) -> "Config":
@@ -2194,7 +2551,7 @@ class Config:
             state_ring_cap=int_env("CRB_STATE_RING_CAP", 64, minimum=1),
             bridge_kill=bool_env("CRB_KILL", False),
             reasoning_mirror=bool_env("CRB_REASONING_MIRROR", True),
-            flow_mirror=bool_env("CRB_FLOW_MIRROR", True),
+            flow_mirror=bool_env(FLOW_MIRROR_ENV, False),
             signal_path=optional_path_env("CRB_SIGNAL_PATH", env("TAB_LOCAL_INPUT")),
             directive_signal_path=optional_path_env(DIRECTIVE_SIGNAL_ENV, str(state_dir / "received-directive.jsonl")),
             transport_mode=(env("CRB_REPL_TRANSPORT", "tmux") or "tmux").strip().lower(),
@@ -2203,13 +2560,14 @@ class Config:
                 or str(default_conpty_state)
             ).expanduser(),
             conpty_timeout_ms=int_env("CRB_CONPTY_TIMEOUT_MS", 5000, minimum=100),
-            suggested_reply_bubble=bool_env("SUGGESTED_REPLY_BUBBLE", False),
+            suggested_reply_bubble=bool_env("SUGGESTED_REPLY_BUBBLE", True),
             suggested_reply_confirmation_enabled=bool_env("CRB_SUGGESTED_REPLY_EYES", True),
             native_turn_stale_seconds=int_env(
                 "CRB_NATIVE_TURN_STALE_SECONDS",
                 300,
                 minimum=0,
             ),
+            activity_eyes_enabled=bool_env("CRB_ACTIVITY_EYES", True),
         )
 
     @property
@@ -2229,6 +2587,10 @@ class Config:
     @property
     def offset_file(self) -> Path:
         return self.state_dir / f"codex-repl-bridge-{self.node}.offset"
+
+    @property
+    def poll_heartbeat_file(self) -> Path:
+        return self.state_dir / f"codex-repl-bridge-{self.node}.poll-heartbeat"
 
     @property
     def pid_file(self) -> Path:
@@ -2462,6 +2824,46 @@ class TelegramClient:
             log("TGERR", f"sendChatAction rejected: {detail}")
         return ok
 
+    def send_activity_indicator(self, text: str, reply_to_message_id: int | None = None) -> int | None:
+        params: dict[str, Any] = {"chat_id": self.chat_id, "text": text}
+        if reply_to_message_id:
+            params["reply_to_message_id"] = reply_to_message_id
+            params["allow_sending_without_reply"] = "true"
+        payload = self.call(
+            "sendMessage",
+            _request_timeout=10,
+            _attempts=1,
+            _retry_delay=0,
+            **params,
+        )
+        result = payload.get("result") if isinstance(payload, dict) else None
+        if isinstance(result, dict) and isinstance(result.get("message_id"), int):
+            return int(result["message_id"])
+        return None
+
+    def edit_activity_indicator(self, message_id: int, text: str) -> bool:
+        payload = self.call(
+            "editMessageText",
+            _request_timeout=10,
+            _attempts=1,
+            _retry_delay=0,
+            chat_id=self.chat_id,
+            message_id=message_id,
+            text=text,
+        )
+        return bool(payload and payload.get("ok"))
+
+    def delete_activity_indicator(self, message_id: int) -> bool:
+        payload = self.call(
+            "deleteMessage",
+            _request_timeout=10,
+            _attempts=1,
+            _retry_delay=0,
+            chat_id=self.chat_id,
+            message_id=message_id,
+        )
+        return bool(payload and payload.get("ok"))
+
     def set_message_reaction(self, message_id: int, emoji: str) -> bool:
         payload = self.call(
             "setMessageReaction",
@@ -2501,7 +2903,7 @@ class TelegramClient:
         url = f"https://api.telegram.org/file/bot{self.token}/{quoted_path}"
         request = urllib.request.Request(url)
         # T-260705-43: 단발 통짜 read()는 텔레그램 파일서버 지연 국면에
-        # 'read operation timed out' 으로 그대로 실패(2026-07-05 본진+라이덴 크로스노드 재현).
+        # 'read operation timed out' 으로 그대로 실패(2026-07-05 제어 노드+작업 노드 크로스노드 재현).
         # chunk read 는 소켓 타임아웃이 청크마다 갱신되고, transient 실패는 백오프 재시도.
         last_err: Exception | None = None
         for attempt in range(3):
@@ -3033,6 +3435,14 @@ CONPTY_DESCRIPTOR_SCHEMA = 1
 CONPTY_MAX_FRAME_BYTES = 256 * 1024
 
 
+class ConPtyIpcUnavailable(RuntimeError):
+    """The named pipe could not be opened, so no request bytes were written."""
+
+
+class ConPtyGenerationChanged(RuntimeError):
+    """The host rejected a request for a stale descriptor generation."""
+
+
 class ConPtyTransport:
     """Authenticated client for a foreground bridge-owned Windows ConPTY host."""
 
@@ -3047,17 +3457,55 @@ class ConPtyTransport:
         self.state_path = config.conpty_state_path or (
             config.state_dir / "codex-telegram-bridge" / "repl-host.json"
         )
+        self._requester = requester
+        self._request_lock = threading.Lock()
+        self.generation, self.capability, self.pipe_name = self._read_descriptor()
+
+    def _identity(self) -> tuple[str, str, str]:
+        return self.generation, self.capability, self.pipe_name
+
+    def _read_descriptor(self) -> tuple[str, str, str]:
         descriptor = read_json(self.state_path)
         if not descriptor:
             raise RuntimeError("ConPTY host descriptor is missing")
-        self.generation = self._descriptor_value(descriptor, "generation", minimum=16)
-        self.capability = self._descriptor_value(descriptor, "capability", minimum=32)
-        self.pipe_name = self._descriptor_value(descriptor, "pipe_name", minimum=12)
         if descriptor.get("schema") != CONPTY_DESCRIPTOR_SCHEMA:
             raise RuntimeError("ConPTY host descriptor schema mismatch")
-        if not self.pipe_name.startswith("\\\\.\\pipe\\codex-repl-host-"):
+        generation = self._descriptor_value(descriptor, "generation", minimum=16)
+        capability = self._descriptor_value(descriptor, "capability", minimum=32)
+        pipe_name = self._descriptor_value(descriptor, "pipe_name", minimum=12)
+        if not pipe_name.startswith("\\\\.\\pipe\\codex-repl-host-"):
             raise RuntimeError("ConPTY host descriptor pipe is invalid")
-        self._requester = requester
+        return generation, capability, pipe_name
+
+    def _reload_descriptor_locked(self) -> bool:
+        previous = self._identity()
+        self.generation, self.capability, self.pipe_name = self._read_descriptor()
+        changed = self._identity() != previous
+        if changed:
+            log("REPL", f"ConPTY descriptor rebound generation={self.generation[:8]}")
+        return changed
+
+    def _wait_for_descriptor_change_locked(
+        self, previous: tuple[str, str, str]
+    ) -> bool:
+        deadline = time.monotonic() + max(
+            0.1, int(self.config.conpty_timeout_ms) / 1000.0
+        )
+        while time.monotonic() < deadline:
+            try:
+                self._reload_descriptor_locked()
+            except RuntimeError:
+                pass
+            if self._identity() != previous:
+                return True
+            time.sleep(0.05)
+        return False
+
+    def rebind(self) -> bool:
+        """Reload the owned-host descriptor after a native turn is lost."""
+
+        with self._request_lock:
+            return self._reload_descriptor_locked()
 
     @staticmethod
     def _descriptor_value(descriptor: dict[str, Any], key: str, minimum: int) -> str:
@@ -3075,15 +3523,33 @@ class ConPtyTransport:
         wait_named_pipe = ctypes.windll.kernel32.WaitNamedPipeW
         wait_named_pipe.argtypes = [ctypes.c_wchar_p, ctypes.c_uint32]
         wait_named_pipe.restype = ctypes.c_int
-        if not wait_named_pipe(self.pipe_name, timeout_ms):
-            raise RuntimeError("ConPTY host IPC is unavailable")
+        deadline = time.monotonic() + (timeout_ms / 1000.0)
         encoded = (json.dumps(request, ensure_ascii=False, separators=(",", ":")) + "\n").encode(
             "utf-8"
         )
         if len(encoded) > CONPTY_MAX_FRAME_BYTES:
             raise RuntimeError("ConPTY IPC frame is too large")
+        # The host creates one named-pipe instance per request. Retry only the
+        # connection-establishment gap between instances; never replay after a
+        # write because a paste may already have reached the TUI.
+        pipe = None
+        last_open_error: OSError | None = None
+        while pipe is None:
+            remaining_ms = max(0, int((deadline - time.monotonic()) * 1000))
+            if remaining_ms <= 0:
+                raise ConPtyIpcUnavailable(
+                    "ConPTY host IPC is unavailable"
+                ) from last_open_error
+            if not wait_named_pipe(self.pipe_name, remaining_ms):
+                time.sleep(0.01)
+                continue
+            try:
+                pipe = open(self.pipe_name, "r+b", buffering=0)
+            except OSError as exc:
+                last_open_error = exc
+                time.sleep(0.01)
         try:
-            with open(self.pipe_name, "r+b", buffering=0) as pipe:
+            with pipe:
                 pipe.write(encoded)
                 response = bytearray()
                 while len(response) <= CONPTY_MAX_FRAME_BYTES:
@@ -3104,27 +3570,62 @@ class ConPtyTransport:
         return payload
 
     def _request(self, op: str, **params: Any) -> dict[str, Any]:
-        request_id = secrets.token_hex(12)
-        request = {
-            "schema": CONPTY_DESCRIPTOR_SCHEMA,
-            "request_id": request_id,
-            "generation": self.generation,
-            "capability": self.capability,
-            "op": op,
-            **params,
-        }
-        response = self._requester(request) if self._requester else self._pipe_request(request)
-        if not isinstance(response, dict):
-            raise RuntimeError("ConPTY host IPC response is invalid")
-        if response.get("request_id") != request_id:
-            raise RuntimeError("ConPTY host IPC response id mismatch")
-        response_generation = str(response.get("generation", ""))
-        if not secrets.compare_digest(response_generation, self.generation):
-            raise RuntimeError("ConPTY host generation changed")
-        if response.get("ok") is not True:
-            code = str(response.get("error", "request_failed"))
-            raise RuntimeError(f"ConPTY host rejected request: {code}")
-        return response
+        # JSONL watching, health checks, and queue draining share one pipe.
+        # Serialize them so a busy single instance is never treated as death.
+        with self._request_lock:
+            previous = self._identity()
+            try:
+                self._reload_descriptor_locked()
+            except RuntimeError:
+                if not self._wait_for_descriptor_change_locked(previous):
+                    raise
+
+            for attempt in range(2):
+                request_identity = self._identity()
+                request_id = secrets.token_hex(12)
+                request = {
+                    "schema": CONPTY_DESCRIPTOR_SCHEMA,
+                    "request_id": request_id,
+                    "generation": self.generation,
+                    "capability": self.capability,
+                    "op": op,
+                    **params,
+                }
+                try:
+                    response = (
+                        self._requester(request)
+                        if self._requester
+                        else self._pipe_request(request)
+                    )
+                except ConPtyIpcUnavailable:
+                    if attempt == 0 and self._wait_for_descriptor_change_locked(
+                        request_identity
+                    ):
+                        continue
+                    raise
+                if not isinstance(response, dict):
+                    raise RuntimeError("ConPTY host IPC response is invalid")
+                if response.get("request_id") != request_id:
+                    raise RuntimeError("ConPTY host IPC response id mismatch")
+                response_generation = str(response.get("generation", ""))
+                if not secrets.compare_digest(response_generation, self.generation):
+                    error = ConPtyGenerationChanged("ConPTY host generation changed")
+                    rejected_stale = (
+                        response.get("ok") is not True
+                        and response.get("error") == "generation_mismatch"
+                    )
+                    if (
+                        attempt == 0
+                        and rejected_stale
+                        and self._wait_for_descriptor_change_locked(request_identity)
+                    ):
+                        continue
+                    raise error
+                if response.get("ok") is not True:
+                    code = str(response.get("error", "request_failed"))
+                    raise RuntimeError(f"ConPTY host rejected request: {code}")
+                return response
+        raise RuntimeError("ConPTY host IPC retry exhausted")
 
     def verify(self) -> None:
         self._request("verify")
@@ -3704,9 +4205,13 @@ class ParsedScreenOption:
 
 
 OPTION_LINE_RE = re.compile(
-    r"^(?:(?:\[(?P<bracket>[A-Za-z0-9]{1,3})\])|(?P<value>[A-Za-z0-9]{1,3})[\.\)])\s+"
+    r"^(?:(?:\[(?P<bracket>[A-Za-z]|[0-9]{1,2})\])|"
+    r"(?P<value>[A-Za-z]|[0-9]{1,2})[\.\)])\s+"
     r"(?P<label>.+?)\s*$"
 )
+CHOICE_BOX_EDGE_CHARS = "│┃║"
+CHOICE_CHROME_CHARS = frozenset("─━═_┌┐└┘┬┴├┤┼╭╮╰╯╦╩╠╣╬╴╵╶╷")
+CHOICE_BOX_TOP_CHARS = "┌╭"
 CHOICE_HINT_RE = re.compile(
     r"\b("
     r"press\s+enter|enter\s+to\s+confirm|esc\s+to\s+cancel|escape\s+to\s+cancel|"
@@ -3741,6 +4246,22 @@ def is_choice_hint_line(line: str) -> bool:
     return bool(CHOICE_HINT_RE.search(line.strip()))
 
 
+def normalize_choice_line(line: str) -> str:
+    stripped = line.strip()
+    while stripped and stripped[0] in CHOICE_BOX_EDGE_CHARS:
+        stripped = stripped[1:].lstrip()
+    while stripped and stripped[-1] in CHOICE_BOX_EDGE_CHARS:
+        stripped = stripped[:-1].rstrip()
+    return stripped
+
+
+def is_choice_chrome_line(line: str) -> bool:
+    stripped = normalize_choice_line(line)
+    return not stripped or all(
+        char.isspace() or char in CHOICE_CHROME_CHARS for char in stripped
+    )
+
+
 def split_trailing_shortcut(label: str, value: str) -> tuple[str, str]:
     match = re.search(r"\(([^()]+)\)\s*$", label)
     if not match:
@@ -3757,8 +4278,8 @@ def split_trailing_shortcut(label: str, value: str) -> tuple[str, str]:
 
 
 def is_option_boundary(line: str) -> bool:
-    stripped = line.strip()
-    if not stripped:
+    stripped = normalize_choice_line(line)
+    if is_choice_chrome_line(stripped):
         return True
     if is_choice_hint_line(stripped):
         return True
@@ -3788,7 +4309,7 @@ def parse_screen_options(lines: list[str]) -> list[ParsedScreenOption]:
         current = None
 
     for line_index, raw_line in enumerate(lines):
-        stripped = raw_line.strip()
+        stripped = normalize_choice_line(raw_line)
         selected = stripped.startswith(("›", ">"))
         normalized = stripped[1:].strip() if selected else stripped
         match = OPTION_LINE_RE.match(normalized)
@@ -3809,6 +4330,64 @@ def parse_screen_options(lines: list[str]) -> list[ParsedScreenOption]:
 
     flush()
     return options
+
+
+def option_sequence_key(value: str) -> tuple[str, int] | None:
+    if value.isdigit():
+        return "number", int(value)
+    if len(value) == 1 and value.isalpha() and value.isascii():
+        return "letter", ord(value.upper()) - ord("A") + 1
+    return None
+
+
+def select_choice_option_block(
+    options: list[ParsedScreenOption],
+) -> list[ParsedScreenOption]:
+    blocks: list[list[ParsedScreenOption]] = []
+    for option in options:
+        if not blocks:
+            blocks.append([option])
+            continue
+        previous = blocks[-1][-1]
+        previous_key = option_sequence_key(previous.value)
+        current_key = option_sequence_key(option.value)
+        if (
+            previous_key is not None
+            and current_key is not None
+            and previous_key[0] == current_key[0]
+            and current_key[1] == previous_key[1] + 1
+        ):
+            blocks[-1].append(option)
+        else:
+            blocks.append([option])
+
+    candidates = [block for block in blocks if len(block) >= 2]
+    selected = [block for block in candidates if any(option.selected for option in block)]
+    if selected:
+        return selected[-1]
+    return candidates[-1] if candidates else []
+
+
+def extract_choice_title(lines: list[str], option_start: int) -> str:
+    parts: list[str] = []
+    for raw_line in reversed(lines[:option_start]):
+        if any(char in raw_line for char in CHOICE_BOX_TOP_CHARS):
+            break
+        stripped = normalize_choice_line(raw_line)
+        if not stripped:
+            if parts:
+                break
+            continue
+        if is_choice_chrome_line(stripped):
+            continue
+        parts.append(" ".join(stripped.split()))
+        if len(parts) >= 8:
+            break
+    return " ".join(reversed(parts)) or "Select one option"
+
+
+def canonical_choice_signature_text(text: str) -> str:
+    return "".join(text.split()).casefold()
 
 
 def approval_fallback_key(option: ParsedScreenOption) -> str:
@@ -3918,7 +4497,7 @@ def parse_choice_prompt(screen: str) -> ChoicePrompt | None:
     if yes_no:
         return yes_no
 
-    parsed_options = parse_screen_options(tail)
+    parsed_options = select_choice_option_block(parse_screen_options(tail))
     if len(parsed_options) < 2:
         return None
     has_selected = any(option.selected for option in parsed_options)
@@ -3927,23 +4506,23 @@ def parse_choice_prompt(screen: str) -> ChoicePrompt | None:
         return None
 
     first_line_index = min(option.line_index for option in parsed_options)
-    title_candidates = [line.strip() for line in tail[:first_line_index] if line.strip()]
-    title = title_candidates[-1] if title_candidates else "Select one option"
+    title = extract_choice_title(tail, first_line_index)
     options = tuple(
         ChoiceOption(
             value=option.value,
             label=option.label,
             key=option.key,
-            index=option.index,
+            index=index,
             selected=option.selected,
         )
-        for option in parsed_options[:12]
+        for index, option in enumerate(parsed_options[:12])
     )
     signature_source = "\n".join(
         [
-            title,
+            canonical_choice_signature_text(title),
             *[
-                f"{option.value}:{option.label}:{option.key}:{int(option.selected)}"
+                f"{option.value.casefold()}:"
+                f"{canonical_choice_signature_text(option.label)}:{option.key.casefold()}"
                 for option in options
             ],
         ]
@@ -4102,11 +4681,16 @@ class Bridge:
         self.typing_lock = threading.Lock()
         self.long_running_progress_lock = threading.Lock()
         self.telegram_fallback_lock = threading.Lock()
+        self.native_recovery_lock = threading.Lock()
+        self.poll_heartbeat_lock = threading.Lock()
         self.approval_lock = threading.Lock()
         self.choice_lock = threading.Lock()
         self.repl_typing_stop: threading.Event | None = None
         self.long_running_progress_stop: threading.Event | None = None
         self.telegram_fallback_stop: threading.Event | None = None
+        self.native_recovery_pending = False
+        self.native_recovery_retry_at = 0.0
+        self.last_poll_heartbeat_at = 0.0
         self.pending_telegram: list[str] = []
         self.pending_approval: ApprovalPrompt | None = None
         self.pending_approval_message_id: int | None = None
@@ -4129,6 +4713,8 @@ class Bridge:
         self.flow_message_id = 0
         self.flow_body = ""
         self.flow_scope = ""
+        self.flow_screen_snapshot: list[str] = []
+        self.last_structured_flow_at = 0.0
         # ⚙️ 받은지시 카드를 코덱스 답의 앵커로 재사용 (T-260630-48 phase2, claude 브릿지 동형):
         # 노드-origin 답 도착 시 새 카드 대신 받은지시 카드를 in-place edit 해 받은지시→코덱스답을
         # 1장으로 통합(받은지시/코덱스답 2장 중복 제거). 0 = 열린 앵커 없음. 휘발성(미persist).
@@ -4223,12 +4809,64 @@ class Bridge:
             last_activity = self.last_repl_activity_at
         return last_activity > 0 and time.monotonic() - last_activity <= grace_seconds
 
+    def flow_mirror_active(self) -> bool:
+        return flow_mirror_enabled(bool(getattr(self.config, "flow_mirror", False)))
+
+    def prime_flow_screen_snapshot(self) -> bool:
+        """Record the current visible steps without emitting them as a new turn."""
+        if not self.flow_mirror_active() or not getattr(self.repl, "supports_pane_features", True):
+            return False
+        try:
+            screen = self.repl.capture_screen(FLOW_MIRROR_SCREEN_CAPTURE_LINES)
+        except Exception as exc:  # noqa: BLE001
+            log("FLOW", f"screen baseline failed (non-fatal): {exc}")
+            return False
+        with self.lock:
+            self.flow_screen_snapshot = extract_codex_flow_steps(screen)
+        return True
+
+    def poll_flow_mirror_screen(self) -> bool:
+        """Feed newly visible REPL activities into the one-card flow renderer."""
+        if not self.flow_mirror_active() or not getattr(self.repl, "supports_pane_features", True):
+            return False
+        with self.lock:
+            scope = self.active_telegram_prompt or self.current_flow_scope
+        if not scope:
+            return False
+        try:
+            screen = self.repl.capture_screen(FLOW_MIRROR_SCREEN_CAPTURE_LINES)
+        except Exception as exc:  # noqa: BLE001
+            log("FLOW", f"screen capture failed (non-fatal): {exc}")
+            return False
+        current = extract_codex_flow_steps(screen)
+        if not current:
+            return False
+        with self.lock:
+            previous = list(self.flow_screen_snapshot)
+            self.flow_screen_snapshot = list(current)
+            structured_age = time.monotonic() - self.last_structured_flow_at
+        new_steps = appended_flow_steps(previous, current)
+        if not new_steps:
+            return False
+        # JSONL function_call records are more precise.  When one just arrived,
+        # keep the screen snapshot current but do not duplicate its TUI rendering.
+        if structured_age <= FLOW_MIRROR_SCREEN_FALLBACK_SECONDS:
+            log("FLOW", "screen steps covered by recent structured event")
+            return False
+        emitted = False
+        for step in new_steps:
+            key = flow_mirror_dedup_key(step, scope)
+            self.handle_flow_event(step, key, source="screen")
+            emitted = True
+        return emitted
+
     def handle_user_event(self, text: str) -> None:
         self.mark_repl_activity()
         self.suppress_until_user = False
         self.pending_reasoning_mirror = None
         self.reset_flow_card()
         self.current_flow_scope = normalize_prompt(text)
+        self.prime_flow_screen_snapshot()
         if self.consume_pending_match(text):
             self.current_origin = "telegram"
             log("JSONL", "matched Telegram-origin prompt")
@@ -4287,17 +4925,19 @@ class Bridge:
             self.last_public_progress = format_progress_summary(text, 220)
         self.pending_reasoning_mirror = (message, key)
 
-    def handle_flow_event(self, text: str, key: str) -> None:
+    def handle_flow_event(self, text: str, key: str, source: str = "jsonl") -> None:
         if is_copy_payload_message(text):
             self.handle_copy_payload_event(text)
             return
         self.mark_repl_activity()
         with self.lock:
             self.last_public_progress = format_progress_summary(text, 220)
+            if source != "screen":
+                self.last_structured_flow_at = time.monotonic()
         if not self.has_repl_typing():
             log("TYPE", "recover from flow")
             self.begin_repl_typing()
-        if not self.config.flow_mirror:
+        if not self.flow_mirror_active():
             return
         scope = self.active_telegram_prompt or self.current_flow_scope
         flow_key = flow_mirror_dedup_key(text, scope)
@@ -4458,6 +5098,7 @@ class Bridge:
         with self.lock:
             self.current_origin = None
             self.current_flow_scope = ""
+            self.flow_screen_snapshot = []
             self.last_repl_activity_at = 0.0
             self.suppress_until_user = True
 
@@ -4915,7 +5556,7 @@ class Bridge:
         # JSONL 만으론 노드주입 vs 사람 수동입력을 구분 못 하므로, 신뢰성 있는 ack 스크립트가
         # 남긴 신호만 카드화(수동입력 오미러 X). flow_mirror ON 한정. 시작 시 기존 엔트리는
         # 건너뛰고(END seek) 이후 새 append 만 emit. Non-fatal — 메시지 전달엔 영향 X.
-        if not self.config.flow_mirror:
+        if not self.flow_mirror_active():
             return
         path = self.config.directive_signal_path
         if path is None:
@@ -5013,8 +5654,10 @@ class Bridge:
         self, max_seconds: int | None = None, watch_interrupt: bool = False
     ) -> threading.Event:
         stop_event = threading.Event()
+        activity_frames, activity_reply_to = self.eye_activity_context()
 
         def loop() -> None:
+            start_eye_activity_loop(self.telegram, stop_event, activity_frames, activity_reply_to)
             deadline = time.monotonic() + max_seconds if max_seconds else None
             pulse_count = 0
             last_ok: bool | None = None
@@ -5023,6 +5666,8 @@ class Bridge:
             while not stop_event.is_set():
                 if deadline is not None and time.monotonic() >= deadline:
                     break
+                if watch_interrupt and pulse_count >= 1:
+                    self.poll_flow_mirror_screen()
                 # Every other pulse (~8s), check whether codex aborted the turn.
                 # Require consecutive hits for interrupt/capture failures to ignore transients.
                 if watch_interrupt and pulse_count >= 1 and pulse_count % 2 == 0:
@@ -5053,9 +5698,27 @@ class Bridge:
                 if wait_seconds <= 0:
                     break
                 stop_event.wait(wait_seconds)
+            stop_event.set()
 
         threading.Thread(target=loop, daemon=True, name="crb-typing").start()
         return stop_event
+
+    def eye_activity_context(self) -> tuple[list[str], int]:
+        chat_id = getattr(self.config, "chat_id", getattr(self.telegram, "chat_id", ""))
+        surface = "aniki_dm" if is_private_chat_id(chat_id) else "mesh_group"
+        enabled = bool(getattr(self.config, "activity_eyes_enabled", False))
+        with self.lock:
+            origin = self.current_origin
+            prompt = self.active_telegram_prompt
+            message_id = self.active_telegram_message_id
+        return codex_activity_indicator_context(
+            "응답 처리 중",
+            enabled,
+            surface,
+            origin,
+            prompt,
+            int(message_id or 0),
+        )
 
     def has_repl_typing(self) -> bool:
         with self.typing_lock:
@@ -5153,6 +5816,7 @@ class Bridge:
             self.telegram_fallback_sent = False
             self.reset_flow_card()
         self.set_active_telegram_prompt(prompt, started_at, message_id or 0)
+        self.prime_flow_screen_snapshot()
         self.set_copy_payload_pair_contract(prompt)
         self.start_telegram_fallback(prompt)
         self.start_long_running_progress(prompt)
@@ -5183,6 +5847,55 @@ class Bridge:
         with self.long_running_progress_lock:
             self.long_running_progress_stop = stop_event
         threading.Thread(target=loop, daemon=True, name="crb-long-progress").start()
+
+    def record_poll_heartbeat(self, *, force: bool = False) -> None:
+        """Persist a metadata-only heartbeat for the Windows watchdog."""
+
+        if getattr(self.repl, "supports_pane_features", True):
+            return
+        path = getattr(self.config, "poll_heartbeat_file", None)
+        if not isinstance(path, Path):
+            return
+        now = time.time()
+        with self.poll_heartbeat_lock:
+            if not force and now - self.last_poll_heartbeat_at < 10.0:
+                return
+            try:
+                write_text_atomic(path, f"{int(now)}\n")
+            except OSError as exc:
+                log("TG", f"poll heartbeat write failed: {exc}")
+                return
+            self.last_poll_heartbeat_at = now
+
+    def recover_native_transport_after_turn_loss(self, *, force: bool = False) -> bool:
+        """Rebind a native host without stopping the Telegram polling loop."""
+
+        if getattr(self.repl, "supports_pane_features", True):
+            return True
+        with self.native_recovery_lock:
+            if not force and not self.native_recovery_pending:
+                return True
+            now = time.monotonic()
+            if not force and now < self.native_recovery_retry_at:
+                return False
+            self.native_recovery_retry_at = now + 5.0
+            rebind = getattr(self.repl, "rebind", None)
+            if not callable(rebind):
+                self.native_recovery_pending = True
+                log("REPL", "native turn-loss recovery unavailable: transport cannot rebind")
+                return False
+            try:
+                changed = bool(rebind())
+                self.repl.verify()
+            except Exception as exc:  # noqa: BLE001
+                self.native_recovery_pending = True
+                log("REPL", f"native turn-loss rebind pending: {exc}")
+                return False
+            self.native_recovery_pending = False
+            self.native_recovery_retry_at = 0.0
+            log("REPL", f"native turn-loss rebind complete changed={changed}")
+        self.record_poll_heartbeat(force=True)
+        return True
 
     def native_turn_loss_reason(self, elapsed_seconds: float) -> str:
         """Native ConPTY has no pane busy marker, so a lost turn (host
@@ -5228,6 +5941,7 @@ class Bridge:
         self.finish_duplicate_final_turn()
         with self.long_running_progress_lock:
             self.long_running_progress_stop = None
+        self.recover_native_transport_after_turn_loss(force=True)
         return True
 
     def start_telegram_fallback(self, prompt: str) -> None:
@@ -5422,6 +6136,15 @@ class Bridge:
         label = "context" if context_only else "status"
         log("TG", f"{label} -> {'Codex footer' if context_only else 'Codex REPL live capture'}")
         self.begin_repl_typing()
+
+        def capture_live_status() -> str:
+            try:
+                self.clear_and_paste_prompt("/status", label)
+                time.sleep(1.0)
+                return self.repl.capture_screen(120)
+            finally:
+                self.clear_composer_before_telegram_input(f"{label} capture")
+
         try:
             # /status must render the live TUI limit bars on every node. A visible
             # footer is only a safe shortcut for /context, which needs one value.
@@ -5435,13 +6158,9 @@ class Bridge:
                 wide_context = getattr(self.repl, "temporary_window_width", None)
                 if callable(wide_context):
                     with wide_context(STATUS_WIDE_CAPTURE_COLUMNS):
-                        self.clear_and_paste_prompt("/status", label)
-                        time.sleep(1.0)
-                        screen = self.repl.capture_screen(120)
+                        screen = capture_live_status()
                 else:
-                    self.clear_and_paste_prompt("/status", label)
-                    time.sleep(1.0)
-                    screen = self.repl.capture_screen(120)
+                    screen = capture_live_status()
                 answer = (
                     extract_codex_context_text(screen)
                     if context_only
@@ -5790,7 +6509,7 @@ class Bridge:
                     callback_query_id=str(callback.get("id") or ""),
                     text="업데이트를 시작합니다…",
                 )
-            perform_self_update(data.split("::", 1)[1])
+            perform_self_update(data.split("::", 1)[1], notify=self.telegram.send)
             return True
         if data.startswith(f"{BRIDGE_RESTART_CALLBACK_PREFIX}:"):
             message = callback.get("message") if isinstance(callback.get("message"), dict) else {}
@@ -6591,7 +7310,7 @@ class Bridge:
         if not latest:
             return
         if bool_env(f"{SELF_UPDATE_PREFIX}_AUTO_UPDATE", False):
-            perform_self_update(latest)
+            perform_self_update(latest, notify=self.telegram.send)
             return
         current = _self_update_installed_version() or "?"
         try:
@@ -6605,9 +7324,13 @@ class Bridge:
     def telegram_loop(self) -> None:
         offset_raw = read_text(self.config.offset_file)
         offset = int(offset_raw) if offset_raw.isdigit() else 0
+        self.record_poll_heartbeat(force=True)
         self.offer_update_if_available()
         while not self.stop_event.is_set():
+            self.recover_native_transport_after_turn_loss()
+            self.record_poll_heartbeat()
             response = self.telegram.call("getUpdates", offset=offset, timeout=self.config.poll_timeout)
+            self.record_poll_heartbeat()
             if not response or not response.get("ok"):
                 time.sleep(2)
                 continue
@@ -6749,6 +7472,7 @@ class Bridge:
         if getattr(self.repl, "supports_pane_features", True):
             approval_thread = threading.Thread(target=self.approval_loop, daemon=True)
             approval_thread.start()
+            self.prime_flow_screen_snapshot()
             self.recover_repl_liveness("startup")
             liveness_thread = threading.Thread(target=self.liveness_loop, daemon=True)
             liveness_thread.start()

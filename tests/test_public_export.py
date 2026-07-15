@@ -10,7 +10,6 @@ from unittest import mock
 class PublicExportTest(unittest.TestCase):
     def test_imports_public_bridge_and_defaults(self):
         path = Path(__file__).resolve().parents[1] / "codex_repl_bridge.py"
-        home = str(Path.home())
         spec = importlib.util.spec_from_file_location("codex_repl_bridge", path)
         self.assertIsNotNone(spec)
         self.assertIsNotNone(spec.loader)
@@ -22,17 +21,15 @@ class PublicExportTest(unittest.TestCase):
             os.environ,
             {
                 "CRB_CHAT_ID": "123456789",
-                "CRB_TOKEN_FILE": str(Path(home) / ".config/codex-telegram-bridge/token.json"),
-                "HOME": home,
-                "USERPROFILE": home,
+                "CRB_TOKEN_FILE": str(Path.home() / ".config/codex-telegram-bridge/token.json"),
             },
             clear=True,
         ):
             cfg = mod.Config.from_env()
         self.assertEqual(cfg.chat_id, "123456789")
-        self.assertEqual(cfg.state_dir.parts[-3:], (".local", "state", "codex-telegram-bridge"))
+        self.assertTrue(str(cfg.state_dir).endswith(".local/state/codex-telegram-bridge"))
         self.assertTrue(str(cfg.directive_signal_path).endswith("received-directive.jsonl"))
-        self.assertFalse(cfg.suggested_reply_bubble)
+        self.assertTrue(cfg.suggested_reply_bubble)
         self.assertIn(
             "SUGGESTED_REPLY_BUBBLE=1",
             (path.parent / "config.example.env").read_text(encoding="utf-8"),
@@ -66,7 +63,7 @@ class PublicExportTest(unittest.TestCase):
         private_calls = []
         private.call = lambda method, **params: private_calls.append((method, params)) or {"ok": True}
         self.assertEqual(private.with_emoji_prefix("🙂😄👋 hello"), "hello")
-        self.assertEqual(private.with_emoji_prefix("🍎"), "🍎")
+        self.assertEqual(private.with_emoji_prefix("🙂"), "🙂")
         private.send("answer", reply_to_message_id=42)
         self.assertEqual(private_calls[-1][1]["reply_to_message_id"], 42)
 
@@ -95,7 +92,43 @@ class PublicExportTest(unittest.TestCase):
             telegram_chunk=4096,
         )
 
-        self.assertEqual(bridge.telegram_chunks("🍎"), ["🍎"])
+        self.assertEqual(bridge.telegram_chunks("🙂"), ["🙂"])
+
+    def test_self_update_feedback_and_local_wheel_guard_are_exported(self):
+        path = Path(__file__).resolve().parents[1] / "codex_repl_bridge.py"
+        spec = importlib.util.spec_from_file_location("codex_repl_bridge_update", path)
+        mod = importlib.util.module_from_spec(spec)
+        sys.modules[spec.name] = mod
+        spec.loader.exec_module(mod)
+
+        class LocalDistribution:
+            def read_text(self, name):
+                if name == "direct_url.json":
+                    return '{"url":"file:///tmp/codex-telegram-bridge.whl"}'
+                return None
+
+        notices = []
+        with mock.patch("importlib.metadata.distribution", return_value=LocalDistribution()), \
+             mock.patch.object(mod.subprocess, "run") as run:
+            result = mod.perform_self_update("9.9.9", notify=notices.append)
+        run.assert_not_called()
+        self.assertEqual(result.status, "skipped_local")
+        self.assertIn("PyPI", notices[-1])
+
+        failed = SimpleNamespace(
+            returncode=1,
+            stdout="",
+            stderr="error: externally-managed-environment (PEP 668)",
+        )
+        notices.clear()
+        with mock.patch.object(mod, "_self_update_is_local_install", return_value=False), \
+             mock.patch.object(mod.subprocess, "run", return_value=failed), \
+             mock.patch.object(mod.os, "execv") as execv:
+            result = mod.perform_self_update("9.9.9", notify=notices.append)
+        execv.assert_not_called()
+        self.assertEqual(result.status, "failed")
+        self.assertIn("PEP 668", notices[-1])
+        self.assertIn("pipx install --force codex-telegram-bridge", notices[-1])
 
 
 if __name__ == "__main__":
