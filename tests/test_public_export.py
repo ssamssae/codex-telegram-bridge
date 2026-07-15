@@ -17,11 +17,16 @@ class PublicExportTest(unittest.TestCase):
         sys.modules[spec.name] = mod
         spec.loader.exec_module(mod)
         self.assertEqual(mod.node_defaults()[0], "codex")
+        home = str(Path.home())
         with mock.patch.dict(
             os.environ,
             {
                 "CRB_CHAT_ID": "123456789",
-                "CRB_TOKEN_FILE": str(Path.home() / ".config/codex-telegram-bridge/token.json"),
+                "CRB_TOKEN_FILE": str(Path(home) / ".config/codex-telegram-bridge/token.json"),
+                # clear=True wipes USERPROFILE; Windows Path.expanduser() then
+                # raises RuntimeError, so keep home visible (public CI #12 fix).
+                "HOME": home,
+                "USERPROFILE": home,
             },
             clear=True,
         ):
