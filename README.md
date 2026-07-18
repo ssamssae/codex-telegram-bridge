@@ -17,6 +17,38 @@ Default `repl` mode is REPL sync, not a separate hidden chat. Your terminal
 stays the source of truth, the transcript remains readable, and Telegram becomes
 the remote control when you are away from the keyboard.
 
+## Features At A Glance
+
+Everything in the first table works out of the box. Everything in the second
+table is optional: each feature is one switch away, and each row links to the
+section that explains it in plain words.
+
+Always on, no configuration needed:
+
+| Feature | What it gives you |
+| --- | --- |
+| Phone control of a live Codex TUI | Prompts from Telegram land in your real, visible Codex session |
+| Final-answer relay | The bridge watches Codex's JSONL log and returns only finished answers |
+| Media in | Send screenshots, videos, voice notes, and files from Telegram ([REPL Mode Media Support](#repl-mode-media-support)) |
+| Media out | Generated images and files come back to your phone ([Answer Media Attachments](#answer-media-attachments)) |
+| Suggested replies | Tap-to-send follow-up suggestions under answers (on by default in private chats) |
+| Approval & selection prompts | Codex's y/n and menu prompts become Telegram buttons ([REPL Mode Approval Prompts](#repl-mode-approval-prompts)) |
+| Restart backfill | Answers you missed while the bridge was down are delivered on restart ([REPL Mode Restart Backfill](#repl-mode-restart-backfill)) |
+| Update check with one-tap upgrade | On startup the bridge checks PyPI and offers an upgrade button |
+
+Optional — flip one switch when you want more:
+
+| Feature | Default | Turn it on with | Details |
+| --- | --- | --- | --- |
+| Flow mirror — live card of each step in the current turn | off | `CRB_FLOW_MIRROR=1` | [Configuration](#configuration) |
+| Reasoning mirror — stream Codex's thinking summaries | off | `CRB_REASONING_MIRROR=1` | [Configuration](#configuration) |
+| Voice-note transcription hook | off | `CRB_AUDIO_TRANSCRIBE_CMD` | [Configuration](#configuration) |
+| Service watchdog — auto-restart a dead bridge | off until installed | setup wizard offers it | [Service Watchdog](#service-watchdog) |
+| Native Windows without WSL (text-only, easiest) | off | Windows Option A | [Windows quickstart](#windows-quickstart-5-min) |
+| WSL + tmux full visible REPL on Windows | off | Windows Option B | [Windows quickstart](#windows-quickstart-5-min) |
+| Emergency kill switch | armed | `touch` the `CRB_KILL` file | [Configuration](#configuration) |
+| Tuning knobs — backfill window, typing liveness, attachment caps | safe defaults | edit `bridge.env` | [Configuration](#configuration) |
+
 ## Beginner Quick Start
 
 ### 1. What this does

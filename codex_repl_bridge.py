@@ -82,6 +82,8 @@ def unlock_handle(handle) -> None:
 
 HOME = Path.home()
 KST = timezone(timedelta(hours=9), "KST")
+# mesh_send.py can spend 30s in three requests plus 3s in default backoff.
+DEFAULT_BRIDGE_MESH_SEND_TIMEOUT = 35.0
 NODE_EMOJI_LINES = {"\U0001f34e", "\U0001f3ed", "\U0001fa9f", "\U0001f5a5", "\U0001f4bb", "\U0001f916"}
 
 
@@ -237,7 +239,7 @@ REPL_BUSY_RE = re.compile(
     re.IGNORECASE,
 )
 REPL_ACTIVE_BUSY_RE = re.compile(
-    r"esc to interru|interrupt to stop|^[•*]\s*Working\b|Churning|Saut[eé]ed|✻|✽",
+    r"esc to interru|interrupt to stop|^[•◦*]\s*Working\b|Churning|Saut[eé]ed|✻|✽",
     re.IGNORECASE,
 )
 REPL_QUEUED_RE = re.compile(r"\bQueued follow-up inputs\b", re.IGNORECASE)
@@ -2697,7 +2699,10 @@ class TelegramClient:
     ) -> dict[str, Any] | None:
         self.assert_outbound_chat(params.get("chat_id"))
         cutover_payload = mesh_cutover_call(method, params)
-        if cutover_payload is not None:
+        fallback_legacy = bool(
+            cutover_payload and cutover_payload.get("_mesh_cutover") == "fallback_legacy"
+        )
+        if cutover_payload is not None and not fallback_legacy:
             return cutover_payload
         data = urllib.parse.urlencode(params).encode()
         url = f"{self.api}/{method}"
@@ -2712,7 +2717,19 @@ class TelegramClient:
                 request = urllib.request.Request(url, data=data)
                 with urllib.request.urlopen(request, timeout=_request_timeout) as response:
                     payload = json.load(response)
-                mesh_ledger_record(method, params.get("chat_id"), params.get("text"), payload, message_id=params.get("message_id"))
+                ledger_result = (
+                    "fallback_delivered"
+                    if fallback_legacy and isinstance(payload, dict) and payload.get("ok")
+                    else None
+                )
+                mesh_ledger_record(
+                    method,
+                    params.get("chat_id"),
+                    params.get("text"),
+                    payload,
+                    result=ledger_result,
+                    message_id=params.get("message_id"),
+                )
                 return payload if isinstance(payload, dict) else None
             except urllib.error.HTTPError as exc:
                 body = exc.read().decode("utf-8", errors="replace")
@@ -4144,11 +4161,11 @@ def clean_pane_lines(screen: str) -> list[str]:
 def repl_pane_activity_from_screen(screen: str, max_lines: int) -> str:
     state = ""
     active_turn = False
+    # tmux pads the pane with blank rows. Drop them before taking the tail so
+    # the Working row cannot flap outside the short typing-watch window.
     lines = [
-        line.strip()
-        for line in clean_pane_lines(screen or "")[-max_lines:]
-        if line.strip()
-    ]
+        line.strip() for line in clean_pane_lines(screen or "") if line.strip()
+    ][-max_lines:]
     for cleaned in lines:
         if any(marker in cleaned for marker in CODEX_INTERRUPT_MARKERS):
             state = "interrupt"
