@@ -17,6 +17,49 @@ Default `repl` mode is REPL sync, not a separate hidden chat. Your terminal
 stays the source of truth, the transcript remains readable, and Telegram becomes
 the remote control when you are away from the keyboard.
 
+## 5-Minute Quick Start
+
+Already have the Codex CLI installed and signed in? You are three steps from
+driving it from your phone. (First time making a Telegram bot? The slower,
+click-by-click version is in [Beginner Quick Start](#beginner-quick-start)
+below — start there instead.)
+
+**1. Install the bridge** (Linux, macOS, or WSL on Windows):
+
+```bash
+pipx install codex-telegram-bridge
+```
+
+Prefer an isolated virtual environment, or on native Windows? See
+[Install from PyPI](#4-install-from-pypi) and the
+[Windows quickstart](#windows-quickstart-5-min).
+
+**2. Create your private bot and copy its token.** In Telegram, open a chat with
+[`@BotFather`](https://t.me/BotFather), send `/newbot`, pick any name, and copy
+the token it hands back — it looks like `1234567890:AbCd...`. Keep it private:
+paste it only into the setup prompt below, never into a chat.
+
+**3. Start Codex in tmux, then run setup:**
+
+```bash
+tmux -L codex new -s codex   # terminal 1: your visible Codex session
+codex
+```
+
+```bash
+codex-telegram-bridge setup  # terminal 2
+```
+
+The wizard asks for the token, waits for you to send `/start` to your new bot,
+detects your chat, and installs a background service. Now text your bot: the
+prompt appears in your visible Codex session and the final answer returns to
+Telegram. (Native Windows without tmux: run `codex-telegram-bridge setup --mode
+exec` for text-only turns.)
+
+That is the whole happy path. Everything below is reference — the guided beginner
+walkthrough, the public export model, media, approvals, Windows modes, and
+advanced settings.
+
 ## Features At A Glance
 
 Everything in the first table works out of the box. Everything in the second

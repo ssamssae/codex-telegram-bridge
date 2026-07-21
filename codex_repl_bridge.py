@@ -132,7 +132,21 @@ FLOW_MIRROR_LINE_LIMIT = 100
 # edit-in-place message (no length-based rollover to a new message). Older steps
 # scroll off instead of spawning multiple long cards. (T-260628-36)
 FLOW_MIRROR_WINDOW = 6
-FLOW_MIRROR_EDIT_MIN_SECONDS = 1.0
+
+
+def _flow_mirror_edit_min_seconds(default: float = 1.0) -> float:
+    # T-260719-028 b안 저빈도 뷰어: ConPTY 단일 경로에서 흐름 카드가 유일한 가시 창이라
+    # 편집 페이싱을 런처가 env 로 늘릴 수 있게 한다 (conpty 런처 기본 5s). 0~60 클램프.
+    raw = os.environ.get("CRB_FLOW_MIRROR_EDIT_MIN_SECONDS", "").strip()
+    if not raw:
+        return default
+    try:
+        return min(60.0, max(0.0, float(raw)))
+    except ValueError:
+        return default
+
+
+FLOW_MIRROR_EDIT_MIN_SECONDS = _flow_mirror_edit_min_seconds()
 FLOW_MIRROR_SCREEN_CAPTURE_LINES = 120
 FLOW_MIRROR_SCREEN_FALLBACK_SECONDS = 2.0
 # ⚙️ A2 받은-지시 카드 (T-260630-22): 노드/오케가 codex REPL 에 주입한 디렉티브를 결과(코덱스
@@ -172,6 +186,38 @@ IMAGE_DELIVERY_CLAIM_NEGATIVE_RE = re.compile(
 
 def utf16_code_units(text: str) -> int:
     return len(text.encode("utf-16-le")) // 2
+
+
+def split_by_utf16_budget(text: str, budget: int) -> list[str]:
+    """Split ``text`` into chunks each ≤ ``budget`` UTF-16 code units.
+
+    Telegram's sendMessage length limit is counted in UTF-16 code units, not
+    Python str code points. A non-BMP character (emoji, U+10000+) costs 2 units;
+    a BMP character costs 1. Slicing by ``text[:budget]`` (code points) can thus
+    overflow the real limit: an emoji-heavy chunk near the budget nearly doubles
+    in UTF-16 length, the API returns 400, and that chunk (and everything after
+    it) drops silently while earlier chunks already sent. We iterate whole
+    characters — never splitting a surrogate pair, since Python str chars are
+    atomic — and start a new chunk before the running UTF-16 cost would exceed
+    ``budget``. Always returns at least one chunk (possibly empty) so callers
+    that iterate the result keep working. (T-260720-035, mirrors T-260720-034)
+    """
+    if budget < 1:
+        budget = 1
+    chunks: list[str] = []
+    current: list[str] = []
+    units = 0
+    for ch in text:
+        weight = 2 if ord(ch) > 0xFFFF else 1
+        if current and units + weight > budget:
+            chunks.append("".join(current))
+            current = []
+            units = 0
+        current.append(ch)
+        units += weight
+    if current or not chunks:
+        chunks.append("".join(current))
+    return chunks
 
 
 def split_answer_for_code_blocks(text: str) -> list[dict[str, Any]]:
@@ -755,6 +801,14 @@ def mesh_ledger_record(*args, **kwargs):
 
 def mesh_cutover_call(method, params):
     return None
+
+
+# T-260720-033: alt3 narrative toggle reads an internal cutover flag that
+# does not exist for public users. Its definition lived in the stripped
+# _NODE_ALIAS_LABELS..read_text block, but call sites survive in newer internal
+# commits (NameError otherwise). Public export stays on v0.1 directive cards.
+def alt3_narrative_enabled() -> bool:
+    return False
 
 
 def read_text(path: Path) -> str:
@@ -2481,13 +2535,19 @@ class Config:
         local_app_data = env("LOCALAPPDATA")
         native_state_root = Path(local_app_data) if local_app_data else state_dir
         default_conpty_state = native_state_root / "codex-telegram-bridge" / "repl-host.json"
+        chat_id = env("CRB_CHAT_ID", env("TAB_CHAT_ID", "") or "") or ""
+        if not chat_id:
+            raise SystemExit(
+                "codex-repl-telegram-bridge: no Telegram chat id configured — set "
+                "CRB_CHAT_ID (or TAB_CHAT_ID). Refusing to start with a hardcoded "
+                "default. (T-260720-035 fix 3)"
+            )
         return cls(
             node=node,
             emoji=env("CRB_EMOJI", env("TAB_PREFIX", default_emoji) or default_emoji)
             or default_emoji,
             token_file=token_file,
-            chat_id=env("CRB_CHAT_ID", env("TAB_CHAT_ID", "") or "")
-            or "",
+            chat_id=chat_id,
             state_dir=state_dir,
             tmux_bin=env("CRB_TMUX_BIN", "tmux") or "tmux",
             tmux_socket=env("CRB_TMUX_SOCKET", env("TAB_AGENT_TMUX_SOCKET", "codex") or "codex")
@@ -2589,6 +2649,10 @@ class Config:
     @property
     def offset_file(self) -> Path:
         return self.state_dir / f"codex-repl-bridge-{self.node}.offset"
+
+    @property
+    def processed_file(self) -> Path:
+        return self.state_dir / f"codex-repl-bridge-{self.node}.processed"
 
     @property
     def poll_heartbeat_file(self) -> Path:
@@ -2955,21 +3019,11 @@ class TelegramClient:
     def chunks(self, text: str) -> list[str]:
         text = text or "(empty response)"
         text = self.with_emoji_prefix(text)
-        out = [text[: self.chunk_size]]
-        rest = text[self.chunk_size :]
-        while rest:
-            out.append(rest[: self.chunk_size])
-            rest = rest[self.chunk_size :]
-        return out
+        return split_by_utf16_budget(text, self.chunk_size)
 
     def raw_chunks(self, text: str) -> list[str]:
         text = text or "(empty response)"
-        out = [text[: self.chunk_size]]
-        rest = text[self.chunk_size :]
-        while rest:
-            out.append(rest[: self.chunk_size])
-            rest = rest[self.chunk_size :]
-        return out
+        return split_by_utf16_budget(text, self.chunk_size)
 
     def send_copy_content(self, text: str) -> list[int] | None:
         message_ids: list[int] = []
@@ -2983,9 +3037,26 @@ class TelegramClient:
             message_ids.append(int(result["message_id"]))
         return message_ids
 
-    def send(self, text: str, reply_to_message_id: int | None = None) -> bool:
+    # T-260719-028 b안: viewer=True 는 가시측(흐름/에코 카드) 발신 — 본선(final answer)의
+    # flood 재시도 예산(최대 3×61s 대기)을 소비하지 않는 단발 fast-fail 로 보낸다. 뷰어
+    # 발신은 jsonl 스레드(답변 발신과 공유)에서 돌므로, 429 폭주 시 카드 1회 유실로
+    # 끝나야지 본선을 분 단위로 세워선 안 된다 (구브릿지 가시측 429 행업 재발 방지).
+    VIEWER_CALL_BUDGET: dict[str, Any] = {
+        "_request_timeout": 10,
+        "_attempts": 1,
+        "_retry_delay": 0,
+    }
+
+    def send(
+        self,
+        text: str,
+        reply_to_message_id: int | None = None,
+        *,
+        viewer: bool = False,
+    ) -> bool:
         ok = True
         sent_count = 0
+        call_budget = dict(self.VIEWER_CALL_BUDGET) if viewer else {}
         for segment in split_answer_for_code_blocks(text or "(empty response)"):
             body = str(segment.get("body") or "")
             if segment.get("code"):
@@ -3003,8 +3074,12 @@ class TelegramClient:
                     # §5-4 — 루트 삭제 등 거부 케이스 포함 유실 0.
                     params["reply_to_message_id"] = reply_to_message_id
                     params["allow_sending_without_reply"] = "true"
-                payload = self.call("sendMessage", **params)
-                ok = ok and bool(payload and payload.get("ok"))
+                payload = self.call("sendMessage", **call_budget, **params)
+                chunk_ok = bool(payload and payload.get("ok"))
+                ok = ok and chunk_ok
+                if viewer and not chunk_ok:
+                    # 뷰어 발신은 첫 실패에서 즉시 포기 — 잔여 chunk 로 스레드를 더 잡지 않는다.
+                    return False
                 sent_count += 1
         return ok
 
@@ -3028,9 +3103,11 @@ class TelegramClient:
         )
         return bool(payload and payload.get("ok"))
 
-    def send_message_id(self, text: str) -> int | None:
+    def send_message_id(self, text: str, *, viewer: bool = False) -> int | None:
+        call_budget = dict(self.VIEWER_CALL_BUDGET) if viewer else {}
         payload = self.call(
             "sendMessage",
+            **call_budget,
             chat_id=self.chat_id,
             text=self.with_emoji_prefix(text),
         )
@@ -3039,9 +3116,11 @@ class TelegramClient:
             return int(result["message_id"])
         return None
 
-    def edit(self, message_id: int, text: str) -> bool:
+    def edit(self, message_id: int, text: str, *, viewer: bool = False) -> bool:
+        call_budget = dict(self.VIEWER_CALL_BUDGET) if viewer else {}
         payload = self.call(
             "editMessageText",
+            **call_budget,
             chat_id=self.chat_id,
             message_id=message_id,
             text=self.with_emoji_prefix(text),
@@ -4908,7 +4987,7 @@ class Bridge:
         message = format_sent_directive(text, from_alias=node, to_alias=node)
         if not message:
             return
-        if not self.telegram.send(message):
+        if not self.telegram.send(message, viewer=True):
             log("SEND", "sent-directive echo failed")
             return
         log("SEND", "sent terminal-origin directive card")
@@ -4919,7 +4998,7 @@ class Bridge:
         message = format_ambient_directive(text, from_node=None, task=None)
         if not message:
             return
-        if not self.telegram.send(message):
+        if not self.telegram.send(message, viewer=True):
             log("SEND", "received-directive telegram echo failed")
             return
         log("SEND", "sent received-directive telegram echo")
@@ -4989,7 +5068,8 @@ class Bridge:
                     node=str(getattr(self.config, "node", "")),
                     emoji=str(getattr(self.config, "emoji", "")),
                     context=scope,
-                )
+                ),
+                viewer=True,
             )
             if not message_id:
                 log("SEND", "flow mirror failed")
@@ -5007,6 +5087,7 @@ class Bridge:
                     emoji=str(getattr(self.config, "emoji", "")),
                     context=scope,
                 ),
+                viewer=True,
             ):
                 log("SEND", "flow mirror edit failed")
                 return
@@ -5618,7 +5699,7 @@ class Bridge:
             return
         self.reset_flow_card()
         try:
-            message_id = self.telegram.send_message_id(body)
+            message_id = self.telegram.send_message_id(body, viewer=True)
             if message_id:
                 # ⚙️ T-260630-48 phase2 — 받은지시 카드를 코덱스 답의 앵커로 보관.
                 self.ambient_directive_message_id = message_id
@@ -7338,9 +7419,33 @@ class Bridge:
         except Exception as exc:  # noqa: BLE001
             log("UPDATE", f"update offer failed: {exc}")
 
+    def _load_processed_update_ids(self) -> list[int]:
+        """Durable ring of recently handled Telegram update_ids (dedup guard)."""
+        raw = read_text(self.config.processed_file)
+        try:
+            data = json.loads(raw) if raw.strip() else []
+        except (ValueError, TypeError):
+            data = []
+        cap = max(1, self.config.state_ring_cap)
+        ring: list[int] = []
+        for item in data if isinstance(data, list) else []:
+            try:
+                ring.append(int(item))
+            except (ValueError, TypeError):
+                continue
+        return ring[-cap:]
+
+    def _remember_processed_update(self, update_id: int, ring: list[int]) -> None:
+        ring.append(update_id)
+        cap = max(1, self.config.state_ring_cap)
+        if len(ring) > cap:
+            del ring[: len(ring) - cap]
+        write_text_atomic(self.config.processed_file, json.dumps(ring))
+
     def telegram_loop(self) -> None:
         offset_raw = read_text(self.config.offset_file)
         offset = int(offset_raw) if offset_raw.isdigit() else 0
+        processed_ids = self._load_processed_update_ids()
         self.record_poll_heartbeat(force=True)
         self.offer_update_if_available()
         while not self.stop_event.is_set():
@@ -7354,66 +7459,80 @@ class Bridge:
             for update in response.get("result", []):
                 if not isinstance(update, dict) or "update_id" not in update:
                     continue
-                offset = int(update["update_id"]) + 1
+                update_id = int(update["update_id"])
+                offset = update_id + 1
+                if update_id in processed_ids:
+                    # Already delivered by a prior run that crashed before the
+                    # offset was persisted; ack it now without re-injecting.
+                    write_text_atomic(self.config.offset_file, offset)
+                    continue
+                # Deliver BEFORE persisting the offset: a hard crash mid-delivery
+                # then leaves this update un-acked, so Telegram redelivers it on
+                # restart (at-least-once) instead of losing the user's message.
+                # The processed-id ring above stops a double injection when the
+                # crash lands between delivery and the offset write. (T-260720-035)
+                self.process_telegram_update(update)
+                self._remember_processed_update(update_id, processed_ids)
                 write_text_atomic(self.config.offset_file, offset)
 
-                callback = update.get("callback_query")
-                if isinstance(callback, dict):
-                    if self.handle_callback_query(callback):
-                        continue
+    def process_telegram_update(self, update: dict[str, Any]) -> None:
+        callback = update.get("callback_query")
+        if isinstance(callback, dict):
+            if self.handle_callback_query(callback):
+                return
 
-                message = update.get("message") or update.get("edited_message")
-                if not isinstance(message, dict):
-                    continue
-                chat = message.get("chat") if isinstance(message.get("chat"), dict) else {}
-                if str(chat.get("id")) != self.config.chat_id:
-                    continue
-                raw_text = message.get("text")
-                if isinstance(raw_text, str):
-                    hold_response = release_hold_response(raw_text.strip())
-                    if hold_response:
-                        self.telegram.send(hold_response)
-                        continue
-                try:
-                    prompt = self.prompt_from_telegram_message(message, int(update["update_id"]))
-                except Exception as exc:  # noqa: BLE001
-                    log("TG", f"media download failed: {exc}")
-                    self.telegram.send(f"codex REPL media delivery failed: {exc}. 다시 보내주시면 재시도합니다.")
-                    continue
-                if not prompt.text.strip():
-                    continue
-                if self.handle_approval_text(prompt.text):
-                    continue
-                if self.handle_choice_text(prompt.text):
-                    continue
-                if prompt.image_path and self.config.image_mode == "exec":
-                    self.handle_image_prompt(prompt)
-                    continue
-                if prompt.text.strip().lower() in {"/start", "/ping"}:
-                    self.telegram.send("codex REPL bridge running")
-                    continue
-                if self.handle_status_command(prompt.text):
-                    continue
-                log("TG", "prompt -> Codex REPL")
-                self.begin_repl_typing()
-                slash_command = is_codex_slash_command(prompt.text)
-                self.begin_telegram_prompt_tracking(prompt.text, message_id=prompt.message_id)
-                try:
-                    self.clear_and_paste_prompt(prompt.text, "telegram prompt")
-                    if slash_command:
-                        time.sleep(0.8)
-                        had_slash_error = self.handle_slash_command_result(prompt.text)
-                        if should_stop_typing_after_slash_command(prompt.text, had_slash_error):
-                            self.stop_repl_typing()
-                            self.stop_long_running_progress()
-                            self.clear_active_telegram_prompt()
-                except Exception as exc:  # noqa: BLE001
+        message = update.get("message") or update.get("edited_message")
+        if not isinstance(message, dict):
+            return
+        chat = message.get("chat") if isinstance(message.get("chat"), dict) else {}
+        if str(chat.get("id")) != self.config.chat_id:
+            return
+        raw_text = message.get("text")
+        if isinstance(raw_text, str):
+            hold_response = release_hold_response(raw_text.strip())
+            if hold_response:
+                self.telegram.send(hold_response)
+                return
+        try:
+            prompt = self.prompt_from_telegram_message(message, int(update["update_id"]))
+        except Exception as exc:  # noqa: BLE001
+            log("TG", f"media download failed: {exc}")
+            self.telegram.send(f"codex REPL media delivery failed: {exc}. 다시 보내주시면 재시도합니다.")
+            return
+        if not prompt.text.strip():
+            return
+        if self.handle_approval_text(prompt.text):
+            return
+        if self.handle_choice_text(prompt.text):
+            return
+        if prompt.image_path and self.config.image_mode == "exec":
+            self.handle_image_prompt(prompt)
+            return
+        if prompt.text.strip().lower() in {"/start", "/ping"}:
+            self.telegram.send("codex REPL bridge running")
+            return
+        if self.handle_status_command(prompt.text):
+            return
+        log("TG", "prompt -> Codex REPL")
+        self.begin_repl_typing()
+        slash_command = is_codex_slash_command(prompt.text)
+        self.begin_telegram_prompt_tracking(prompt.text, message_id=prompt.message_id)
+        try:
+            self.clear_and_paste_prompt(prompt.text, "telegram prompt")
+            if slash_command:
+                time.sleep(0.8)
+                had_slash_error = self.handle_slash_command_result(prompt.text)
+                if should_stop_typing_after_slash_command(prompt.text, had_slash_error):
                     self.stop_repl_typing()
                     self.stop_long_running_progress()
-                    log("REPL", f"paste failed: {exc}")
-                    self.resolve_midreport_obligation("blocked", "codex REPL delivery failed")
                     self.clear_active_telegram_prompt()
-                    self.telegram.send(f"codex REPL delivery failed: {exc}")
+        except Exception as exc:  # noqa: BLE001
+            self.stop_repl_typing()
+            self.stop_long_running_progress()
+            log("REPL", f"paste failed: {exc}")
+            self.resolve_midreport_obligation("blocked", "codex REPL delivery failed")
+            self.clear_active_telegram_prompt()
+            self.telegram.send(f"codex REPL delivery failed: {exc}")
 
     def ensure_signal_fifo(self) -> None:
         path = self.config.signal_path
