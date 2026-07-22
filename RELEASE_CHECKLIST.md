@@ -5,11 +5,14 @@ automation repo. Forks can skip the export step and run the scans/tests
 directly against their working tree.
 
 - Run `scripts/codex-bridge-oss-export.sh` (private repo).
-- Run the exported package test.
-- `tests/test_agent_runtime.py` is exported with the runtime because it contains
-  platform guards for POSIX FIFO and Windows process checks. Sync the remaining
-  public `tests/` with any behavior change manually (v0.6.4 gap: 3 cases had to
-  be ported by hand).
+- Run the exported package test — `scripts/tests/test_codex_bridge_oss_export.sh`
+  runs the full exported suite via `unittest discover`, exactly as the public CI.
+- `PUBLIC_TESTS.manifest` (packaging/codex-telegram-bridge) is the single source
+  of truth for the public `tests/` directory; the export self-test asserts the
+  exported tests/ equals it exactly (T-260721-003). Only `test_agent_runtime.py`
+  is hand-maintained (POSIX FIFO / Windows process-check platform guards) — update
+  it by hand on behavior change. Every other public test is export-produced and
+  cannot drift. Never hand-edit a test directly in the public repo.
 - Confirm the secret/internal scan has zero matches.
 - Confirm `CRB_DIRECTIVE_SIGNAL_PATH` points to a public local-state path or is disabled.
 - Build + validate the PyPI distribution before upload:

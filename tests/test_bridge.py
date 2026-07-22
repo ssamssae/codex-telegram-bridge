@@ -112,7 +112,7 @@ class BridgeTests(unittest.TestCase):
             bridge = tab.Bridge(cfg, tab.CodexBackend(cfg), FakeTelegram())
 
             self.assertEqual(bridge.telegram_chunks("🙂😄👋 answer"), ["answer"])
-            self.assertEqual(bridge.telegram_chunks("🍎"), ["🍎"])
+            self.assertEqual(bridge.telegram_chunks("🎉"), ["🎉"])
 
     def test_group_chat_keeps_prefix(self):
         with tempfile.TemporaryDirectory() as tmpdir:
