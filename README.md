@@ -644,6 +644,32 @@ If more than one new Codex JSONL session appears during startup, the host stops
 instead of guessing. A restarted host uses a new generation and capability, so
 an old bridge cannot redirect queued input into the new session.
 
+### Attach window — watch and type from another terminal (Windows)
+
+A foreground host shows its own TUI. A host that runs hidden — a scheduled task,
+a detached launcher — shows it nowhere, and resuming the session in a second
+terminal would only share the conversation file, not the screen: prompts sent
+from Telegram never appear there.
+
+The attach client subscribes to the append-only raw stream the host already tees
+to disk and forwards your keystrokes back through the host IPC, so a single
+window both shows the live screen and types into it:
+
+```powershell
+python -m codex_conpty_attach
+```
+
+`Ctrl+]` detaches. `Ctrl+C` is forwarded to Codex rather than closing the window.
+`--replay 0` starts from now instead of repainting recent output, `--read-only`
+watches without sending anything, and `--columns/--rows` match a host that was
+started with non-default dimensions.
+
+The client never owns the pseudoconsole — the host keeps it — so attaching and
+detaching cannot disturb the running session. Two requirements: the host must be
+writing the raw stream (on by default; `CODEX_CONPTY_LIVE_RAW=""` disables it),
+and the window must be the same size as the host (`--columns 120 --rows 40` by
+default, matching the host defaults) or redrawn lines will not line up.
+
 Token safety rule: BotFather shows the token in Telegram, but you should copy it
 from BotFather and paste it into the local setup wizard in your terminal. In
 Telegram, send only `/start` or normal prompts to your bot.

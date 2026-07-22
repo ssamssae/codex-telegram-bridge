@@ -67,6 +67,9 @@ def encode_key(key: str) -> bytes:
         "enter": b"\r",
         "return": b"\r",
         "tab": b"\t",
+        # T-260722-089: 이름이 없으면 공백을 보낼 방법이 없다 — 아래 strip() 이
+        # " " 를 빈 문자열로 만들어 단일 문자 경로가 받지 못한다.
+        "space": b" ",
         "escape": b"\x1b",
         "esc": b"\x1b",
         "up": b"\x1b[A",
