@@ -335,6 +335,41 @@ def send_space(descriptor: dict, native: bool) -> tuple[dict, bool]:
     return response, native
 
 
+def host_notice(probe: dict) -> str:
+    """붙기 전에 알려줄 한 줄. 차단이 아니라 안내다.
+
+    session_bound 는 resume-by-id 를 하는 쪽(옛 cx)에나 필요한 조건이다. attach 는 raw
+    스트림을 구독하고 key op 로 입력을 넣을 뿐이라 바인딩 여부와 무관하게 동작한다 —
+    이걸 차단 조건으로 쓰면 호스트 재기동 직후처럼 세션이 아직 없는 창에 붙지 못한다.
+    """
+
+    if not probe.get("session_bound"):
+        return "세션 미바인딩 — 화면·입력은 그대로 되고, 첫 프롬프트가 들어가면 세션이 생깁니다."
+    return ""
+
+
+def probe_host(descriptor: dict, state_path: Path) -> tuple[dict, dict]:
+    """verify 왕복. 실패하면 상태 파일을 다시 읽어 한 번만 재시도한다.
+
+    호스트가 재기동하면 파이프 이름과 generation 이 바뀐다. 그 교체 창에 걸린 클라이언트가
+    쥐고 있던 옛 이름으로 계속 두드리면 영영 닿지 못하므로, 새 descriptor 로 한 번 갈아탄다.
+    """
+
+    try:
+        return descriptor, pipe_request(
+            str(descriptor["pipe_name"]), build_request(descriptor, "verify")
+        )
+    except (TimeoutError, OSError):
+        try:
+            refreshed = load_descriptor(state_path)
+        except (OSError, ValueError, SystemExit) as error:
+            # 재기동 중이면 상태 파일이 잠깐 없거나 반쯤 쓰인 상태일 수 있다.
+            raise TimeoutError("host descriptor unreadable") from error
+        return refreshed, pipe_request(
+            str(refreshed["pipe_name"]), build_request(refreshed, "verify")
+        )
+
+
 def run(args: argparse.Namespace) -> int:
     if os.name != "nt":
         print("이 클라이언트는 Windows 에서만 동작합니다 (ConPTY 호스트가 Windows 전용).", file=sys.stderr)
@@ -355,14 +390,18 @@ def run(args: argparse.Namespace) -> int:
         print("crb 0.9.3 이상 호스트가 떠 있어야 합니다.", file=sys.stderr)
         return 4
 
+    notice = ""
     if not args.read_only:
-        probe = pipe_request(str(descriptor["pipe_name"]), build_request(descriptor, "verify"))
+        try:
+            descriptor, probe = probe_host(descriptor, state_path)
+        except (TimeoutError, OSError):
+            print("호스트 IPC 에 닿지 못했습니다 — 호스트가 재기동 중이면 잠시 뒤 다시 실행하세요.", file=sys.stderr)
+            print(f"  상태 파일: {state_path}", file=sys.stderr)
+            return 5
         if not probe.get("ok"):
             print(f"호스트 IPC 거부: {probe.get('error')}", file=sys.stderr)
             return 5
-        if not probe.get("session_bound"):
-            print("세션이 아직 안 붙었습니다 — 봇에 프롬프트를 한 번 보낸 뒤 다시 실행하세요.", file=sys.stderr)
-            return 6
+        notice = host_notice(probe)
 
     warning = "" if args.no_resize else resize_console(args.columns, args.rows)
 
@@ -379,6 +418,8 @@ def run(args: argparse.Namespace) -> int:
         out.write(b"\x1b[2J\x1b[H")  # 이전 콘솔 내용 지우고 시작
         if warning:
             out.write(("[attach] " + warning + "\r\n").encode("utf-8"))
+        if notice:
+            out.write(("[attach] " + notice + "\r\n").encode("utf-8"))
         out.write(
             f"[attach] {raw_path.name} 구독 · 입력은 호스트로 전달 · 나가기 Ctrl+] \r\n".encode("utf-8")
         )
