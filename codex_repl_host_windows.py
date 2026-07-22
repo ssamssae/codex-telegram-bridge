@@ -981,6 +981,7 @@ def writer_loop(
     inputs: OrderedInputQueue,
     stop: threading.Event,
     input_activity: dict[str, int] | None = None,
+    live: Any | None = None,
 ) -> None:
     while not stop.is_set() and pty.alive():
         try:
@@ -992,10 +993,169 @@ def writer_loop(
         try:
             if input_activity is not None and input_activity.get("first_ns", 0) == 0:
                 input_activity["first_ns"] = time.time_ns()
+            # 텔레그램 주입은 무에코라 콘솔에 흔적이 없다 — 라이브 파일에만 마커를 남겨
+            # 뷰어에서 "무엇이 주입됐는지" 가 보이게 한다 (T-260722-066).
+            if live is not None and frame.source == "ipc":
+                live.note(f"주입 <- {summarize_injection(frame.payload)}")
             pty.write(frame.payload)
         except OSError:
             stop.set()
             return
+
+
+DEFAULT_LIVE_RAW_MAX_BYTES = 8 * 1024 * 1024
+
+
+def default_live_raw_path() -> Path:
+    """호스트 state_path 와 같은 관례(LOCALAPPDATA/codex-telegram-bridge/)를 쓴다."""
+    base = os.environ.get("LOCALAPPDATA") or str(Path.home())
+    return Path(base) / "codex-telegram-bridge" / "conpty-live.raw"
+
+
+class LiveRawSink:
+    """conpty raw 출력을 stdout 과 append-only 파일에 동시에 흘리는 tee (T-260722-066).
+
+    발원: 사용자 실사용 증상 — PowerShell 에서 세션 접속은 되는데 텔레그램 주입
+    프롬프트·출력이 터미널에 안 보인다. 근본원인은 버그가 아니라 가시성 설계갭으로,
+    raw 출력이 인메모리 RawOutputBuffer 에만 남아 밖에서 볼 방법이 없었다. 파일로
+    흘려 뷰어(codex-conpty-live-view.ps1)가 tail 할 수 있게 한다.
+
+    설계 제약:
+      - 파일 IO 실패가 호스트를 죽이면 안 된다 → 1회 경고 후 stdout 전용으로 강등.
+      - 콘솔 출력이 파일 문제로 유실되면 안 된다 → passthrough 를 먼저 쓴다.
+      - 무한증식 금지 → 크기 상한 초과 시 <path>.1 로 1회전(총 2배 상한).
+      - 주입 무에코 설계 유지 → note() 마커는 **파일에만** 쓴다. stdout 에 쓰면
+        codex TUI 로 에코되어 렌더링을 깨고 무에코 계약을 위반한다.
+    """
+
+    def __init__(
+        self,
+        path: Path,
+        passthrough: Any,
+        max_bytes: int = DEFAULT_LIVE_RAW_MAX_BYTES,
+    ) -> None:
+        self._path = path
+        self._passthrough = passthrough
+        self._max_bytes = max(0, int(max_bytes))
+        self._lock = threading.Lock()
+        self._handle: Any | None = None
+        self._size = 0
+        self._degraded = False
+        self._open()
+
+    @property
+    def path(self) -> Path:
+        return self._path
+
+    def _open(self) -> None:
+        try:
+            self._path.parent.mkdir(parents=True, exist_ok=True)
+            self._handle = open(self._path, "ab", buffering=0)
+            self._size = self._path.stat().st_size
+        except OSError as exc:
+            self._degrade(f"open {self._path} failed: {exc}")
+
+    def _degrade(self, reason: str) -> None:
+        if not self._degraded:
+            self._degraded = True
+            safe_log(f"live raw sink disabled ({reason}); stdout only")
+        handle, self._handle = self._handle, None
+        if handle is not None:
+            try:
+                handle.close()
+            except OSError:
+                pass
+
+    def _rotate_locked(self) -> None:
+        handle, self._handle = self._handle, None
+        if handle is not None:
+            try:
+                handle.close()
+            except OSError:
+                pass
+        try:
+            rotated = self._path.with_name(self._path.name + ".1")
+            os.replace(self._path, rotated)
+        except OSError as exc:
+            self._degrade(f"rotate failed: {exc}")
+            return
+        self._open()
+
+    def _write_file_locked(self, data: bytes) -> None:
+        if self._handle is None:
+            return
+        if self._max_bytes and self._size + len(data) > self._max_bytes:
+            self._rotate_locked()
+            if self._handle is None:
+                return
+        try:
+            self._handle.write(data)
+            self._size += len(data)
+        except OSError as exc:
+            self._degrade(f"write failed: {exc}")
+
+    def write(self, data: bytes) -> int:
+        # 콘솔이 먼저다 — 파일 쪽 문제로 사람이 보는 출력을 잃지 않는다.
+        written = self._passthrough.write(data)
+        with self._lock:
+            self._write_file_locked(data)
+        return written if written is not None else len(data)
+
+    def flush(self) -> None:
+        try:
+            self._passthrough.flush()
+        finally:
+            with self._lock:
+                if self._handle is not None:
+                    try:
+                        self._handle.flush()
+                    except OSError as exc:
+                        self._degrade(f"flush failed: {exc}")
+
+    def note(self, text: str) -> None:
+        """사람이 읽는 이벤트 마커 1줄 — 파일 전용(stdout 무에코 계약 유지)."""
+        stamp = time.strftime("%Y-%m-%d %H:%M:%S")
+        line = f"\r\n[{stamp}] {text}\r\n".encode("utf-8", "replace")
+        with self._lock:
+            self._write_file_locked(line)
+
+    def close(self) -> None:
+        with self._lock:
+            handle, self._handle = self._handle, None
+            if handle is not None:
+                try:
+                    handle.close()
+                except OSError:
+                    pass
+
+
+def summarize_injection(payload: bytes, limit: int = 120) -> str:
+    """주입 페이로드를 마커용 1줄 요약으로 축약한다 (제어문자 제거·길이 컷)."""
+    text = payload.decode("utf-8", "replace")
+    text = re.sub(r"[\x00-\x1f\x7f]+", " ", text)
+    text = re.sub(r"\s+", " ", text).strip()
+    if not text:
+        return "(제어 키 입력)"
+    if len(text) > limit:
+        return text[:limit] + f"… (+{len(text) - limit}자)"
+    return text
+
+
+def build_live_raw_sink(passthrough: Any) -> LiveRawSink | None:
+    """env 로 경로·상한을 정한다. 경로를 빈 문자열로 두면 비활성."""
+    configured = os.environ.get("CODEX_CONPTY_LIVE_RAW")
+    if configured is None:
+        target = default_live_raw_path()
+    else:
+        raw_path = configured.strip()
+        if not raw_path:
+            return None
+        target = Path(raw_path).expanduser()
+    try:
+        max_bytes = int(os.environ.get("CODEX_CONPTY_LIVE_MAX_BYTES", DEFAULT_LIVE_RAW_MAX_BYTES))
+    except ValueError:
+        max_bytes = DEFAULT_LIVE_RAW_MAX_BYTES
+    return LiveRawSink(target, passthrough, max_bytes)
 
 
 def output_loop(
@@ -1126,8 +1286,18 @@ def run_host(args: argparse.Namespace) -> int:
     session_holder: dict[str, Path | None] = {"path": None}
     input_activity: dict[str, int] = {"first_ns": 0}
 
+    # raw 출력을 append-only 파일로도 흘린다 — 뷰어가 tail 해서 사용자 콘솔에 실시간
+    # 표시할 수 있게 하는 배관 (T-260722-066). 실패해도 stdout 전용으로 계속 돈다.
+    live_sink = build_live_raw_sink(sys.stdout.buffer)
+    if live_sink is not None:
+        safe_log(f"live raw sink -> {live_sink.path}")
+        live_sink.note(f"conpty host start pid={child_pid} generation={generation[:8]}")
+
     output_thread = threading.Thread(
-        target=output_loop, args=(pty, output, stop), daemon=True, name="conpty-output"
+        target=output_loop,
+        args=(pty, output, stop, live_sink),
+        daemon=True,
+        name="conpty-output",
     )
     output_thread.start()
     keyboard_thread = threading.Thread(
@@ -1152,7 +1322,7 @@ def run_host(args: argparse.Namespace) -> int:
             return 3
         writer_thread = threading.Thread(
             target=writer_loop,
-            args=(pty, inputs, stop, input_activity),
+            args=(pty, inputs, stop, input_activity, live_sink),
             daemon=True,
             name="conpty-input",
         )
