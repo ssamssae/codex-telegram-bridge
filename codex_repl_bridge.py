@@ -124,6 +124,15 @@ FLOW_MIRROR_LIMIT = 1500
 # parity without changing a service definition.
 FLOW_MIRROR_ENV = "CRB_FLOW_MIRROR"
 FLOW_MIRROR_FLAG = os.path.expanduser("~/.config/codex-telegram-bridge/flow-mirror.on")
+# ⚙️ 침묵구간 하트비트 (T-260727-104 — claude 브릿지 T-260727-076 의 쌍둥이).
+# 카드는 이벤트가 있을 때만 렌더된다. 워커가 한 도구를 오래 도는 구간엔 이벤트가 없어 카드가
+# 정지하고, 그 정지는 죽은 턴과 화면상 완전히 같다. 값은 claude 쪽과 동일하게 둔다 —
+# 쌍둥이가 갈라지면 사용자가 노드마다 다른 규칙을 외워야 한다.
+FLOW_HEARTBEAT_SECONDS = 45.0
+# ⚠️ 상한이 안전핀이다. 무한 하트비트는 **죽은 턴이 영원히 살아있어 보이는** 정반대 사고이고,
+# 원 증상보다 위험하다. 상한을 넘기면 갱신을 멈추고 카드를 얼린다(= 종전 동작).
+FLOW_HEARTBEAT_MAX_TICKS = 40
+FLOW_HEARTBEAT_MAX_FAILURES = 3
 # Per-step line cap: each flow event is collapsed to ONE short line (claude
 # parity) instead of the full multi-line narration. Keeps many steps inside one
 # edit-in-place card instead of overflowing into many long messages.
@@ -1341,8 +1350,10 @@ def format_flow_mirror(
     label, mapped_emoji = node_label_emoji(node_token)
     label = label or node_token or "작업 노드"
     node_emoji = emoji or mapped_emoji or default_emoji
+    # 쌍둥이 렌더러 — claude-telegram-bridge.py 의 동명 함수와 같은 이유로 "갱신" 라벨을 단다.
+    # (두 카드 형식이 갈라지면 사용자가 노드마다 다른 규칙을 외워야 한다, T-260727-068)
     timestamp = (now or datetime.now(KST)).astimezone(KST).strftime("%H:%M")
-    header = f"{node_emoji} {label} · {flow_context_summary(context)} · {timestamp}"
+    header = f"{node_emoji} {label} · {flow_context_summary(context)} · 갱신 {timestamp}"
     state = "노드 자율 진행중" if autonomous else "진행중"
     footer = f"→ {state} · 현재: {current}"
     available = max(1, FLOW_MIRROR_LIMIT - len(header) - len(footer) - 4)
@@ -4817,6 +4828,13 @@ class Bridge:
         self.ambient_directive_message_id = 0
         self.ambient_directive_body = ""
         self.flow_last_edit_at = 0.0
+        # T-260727-104 하트비트 상태. flow_last_edit_at 을 재사용하지 않는 이유 —
+        # 그 필드는 wait_for_flow_edit_budget 의 레이트리밋 기준점이고 최초 send 경로에서는
+        # 찍히지 않는다(<=0 이면 예산 대기를 건너뛰는 계약). 여기에 하트비트 기준을 얹으면
+        # 그 계약을 건드리게 되므로 별도 필드를 둔다. reset_flow_card 가 함께 비운다.
+        self.flow_last_render_at = 0.0
+        self.flow_heartbeat_ticks = 0
+        self.flow_heartbeat_failures = 0
         self.last_public_progress: str = ""
         self.telegram_fallback_sent = False
         self.session_path: Path | None = None
@@ -5076,6 +5094,7 @@ class Bridge:
                 return
             self.flow_body = candidate
             self.flow_message_id = message_id
+            self.flow_last_render_at = time.monotonic()  # T-260727-104 하트비트 기준점
             log("SEND", f"sent flow mirror mid={message_id}")
         else:
             self.wait_for_flow_edit_budget()
@@ -5093,6 +5112,7 @@ class Bridge:
                 return
             self.flow_body = candidate
             self.flow_last_edit_at = time.monotonic()
+            self.flow_last_render_at = self.flow_last_edit_at  # T-260727-104 하트비트 기준점
             log("SEND", f"edited flow mirror mid={self.flow_message_id}")
         self.persist_state(event_key=dedup_key)
 
@@ -5106,9 +5126,80 @@ class Bridge:
         self.flow_body = ""
         self.flow_scope = ""
         self.flow_last_edit_at = 0.0
+        # T-260727-104: 하트비트 정지 지점. 이 메서드는 턴 종료(:최종답 발송)·새 user 이벤트·
+        # scope 전환에서 불리므로, 여기서 비우면 하트비트가 턴보다 오래 살 수 없다.
+        self.flow_last_render_at = 0.0
+        self.flow_heartbeat_ticks = 0
+        self.flow_heartbeat_failures = 0
         # persisted across restart (anti-fragmentation): clear the saved card id too, so a
         # restart right after reset starts a fresh card instead of resuming a stale one.
         self.persist_state()
+
+    def maybe_heartbeat_flow_card(self, now: float | None = None) -> bool:
+        """침묵 구간에서 ⚙️ 카드를 주기 재렌더해 '갱신' 시각을 전진시킨다 (T-260727-104).
+
+        claude 브릿지 T-260727-076 의 쌍둥이. 정지 보장 방식만 다르다 —
+        claude 는 ActiveTurn.flow_closed 를 보고, 여기서는 **카드의 존재 자체**를 본다:
+        codex 는 턴 종료에 완료 라벨을 덧씌우지 않고 reset_flow_card() 로 카드를 놓아버리므로
+        `flow_message_id != 0` 이 곧 '턴 진행중' 이다. reset 이 그 값을 0 으로 만드는 순간
+        하트비트도 멎으므로, 독립 타이머 없이 구조적으로 턴보다 오래 살 수 없다.
+
+        jsonl_loop(카드를 렌더하는 그 스레드)에서만 불린다 — 별도 스레드였다면
+        flow_body/flow_message_id 를 두고 본 렌더 경로와 경합했을 것이다.
+        """
+        # ⚠️ 인자는 bool 이다 — config 객체를 그대로 넘기면 항상 truthy 라 토글이 무력화된다.
+        # 정본 호출 형태는 :5295 의 flow_mirror_enabled(bool(getattr(config,"flow_mirror",False))).
+        if not flow_mirror_enabled(bool(getattr(self.config, "flow_mirror", False))):
+            return False
+        if getattr(self.config, "bridge_kill", False):
+            return False
+        # 정지 조건 — 카드 없음(= 턴 없음/미러 OFF/이벤트 0) 이면 그 자리에서 끝.
+        if not self.flow_message_id or not self.flow_body:
+            return False
+        if self.flow_heartbeat_failures >= FLOW_HEARTBEAT_MAX_FAILURES:
+            return False
+        if self.flow_heartbeat_ticks >= FLOW_HEARTBEAT_MAX_TICKS:
+            # 상한 도달 — 갱신을 멈추고 카드를 얼린다(종전 동작). 상수 주석 참조.
+            return False
+        now = time.monotonic() if now is None else now
+        last = self.flow_last_render_at
+        if last <= 0 or (now - last) < FLOW_HEARTBEAT_SECONDS:
+            return False
+        mid = self.flow_message_id
+        try:
+            body = format_flow_mirror(
+                self.flow_body,
+                node=str(getattr(self.config, "node", "")),
+                emoji=str(getattr(self.config, "emoji", "")),
+                context=self.flow_scope,
+            )
+            if not body:
+                return False
+            # edit 직전 재확인 — 렌더 준비 중 턴이 끝나 카드가 리셋됐을 수 있다.
+            if self.flow_message_id != mid:
+                return False
+            ok = self.telegram.edit(mid, body, viewer=True)
+        except Exception as exc:  # noqa: BLE001
+            ok = False
+            log("SEND", f"flow heartbeat edit raised (non-fatal): {exc}")
+        if not ok:
+            self.flow_heartbeat_failures += 1
+            # 실패해도 기준점을 전진시킨다 — 안 그러면 0.5초 tick 마다 재시도해 429 를 키운다.
+            self.flow_last_render_at = now
+            log(
+                "SEND",
+                f"flow heartbeat failed (non-fatal) mid={mid} "
+                f"fail={self.flow_heartbeat_failures}/{FLOW_HEARTBEAT_MAX_FAILURES}",
+            )
+            return False
+        self.flow_heartbeat_failures = 0
+        self.flow_heartbeat_ticks += 1
+        self.flow_last_render_at = now
+        log(
+            "SEND",
+            f"flow heartbeat mid={mid} tick={self.flow_heartbeat_ticks}/{FLOW_HEARTBEAT_MAX_TICKS}",
+        )
+        return True
 
     def wait_for_flow_edit_budget(self) -> None:
         if self.flow_last_edit_at <= 0:
@@ -5646,6 +5737,9 @@ class Bridge:
                 ):
                     log("JSONL", f"watch error: {exc}")
             self.poll_directive_signals()
+            # ⚙️ T-260727-104 — 여기가 침묵 구간이다(새 줄 없이 한 바퀴 돌았다).
+            # 자체 시간 상한을 들고 있어 0.5초 tick 마다 불려도 실제 edit 은 45초에 1회다.
+            self.maybe_heartbeat_flow_card()
             time.sleep(0.5)
 
     def poll_directive_signals(self) -> None:
