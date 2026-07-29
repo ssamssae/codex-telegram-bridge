@@ -117,6 +117,22 @@ def strip_leading_emoji_decoration(text: str) -> str:
     return value[index:].lstrip() if seen_decoration else value
 REASONING_HEADER = "\U0001f9e0 코덱스 사고"
 REASONING_MIRROR_LIMIT = 3500
+# T-260728-076: 클로드 브릿지의 사고 미러 표시 수리 2건을 쌍둥이에 맞춘다.
+#   원본 = T-260728-095(마커 raw 유출) + T-260728-100(볼드 별표 평문화).
+#   두 브릿지의 미러는 같은 화면(사용자 폰)에 같은 모양으로 나가야 하므로 표시
+#   규칙은 런타임 휴면 여부와 무관하게 동일해야 한다.
+# TAG_RE = 완전한 태그(열기·닫기·공백 변종). 안의 문구는 사고 내용이라 남긴다.
+# TAIL_RE = 초안이 잘려 닫는 '>' 가 없는 파편 — 줄 끝까지 걷어낸다.
+#   반드시 TAG_RE 부터다: TAIL_RE 를 먼저 물리면 `<추천답변 …>초안</추천답변>` 한 줄에서
+#   초안 본문까지 통째로 먹는다.
+SUGGESTED_REPLY_MARKER_TAG_RE = re.compile(r"<\s*/?\s*추천답변(?:\s[^>\r\n]*)?\s*>")
+SUGGESTED_REPLY_MARKER_TAIL_RE = re.compile(r"<\s*/?\s*추천답변[^\r\n]*")
+# 미러는 parse_mode 없이 sendMessage 로 나가므로 `**볼드**` 가 별표째 글자로 보인다.
+#   파스모드를 켜는 대신 벗기는 이유 = 사고 원문은 마크다운 특수문자가 빽빽해
+#   이스케이프 하나만 새도 400 이 나고 미러가 통째로 사라진다.
+#   ⚠️ 홑별표는 건드리지 않는다 — 글롭(test_mesh_*·*.sh)·곱셈에 흔해 짝지어 지우면
+#   사이의 본문을 통째로 먹는다.
+MIRROR_BOLD_RE = re.compile(r"\*\*(?=\S)(.+?)(?<=\S)\*\*")
 FLOW_MIRROR_HEADER = "⚙️ 작업 흐름"
 FLOW_MIRROR_LIMIT = 1500
 # T-260714-43: default-OFF flow mirror gate. The env override matches the existing public
@@ -657,6 +673,73 @@ def _self_update_version_tuple(text: str) -> tuple[int, ...]:
     return tuple(parts)
 
 
+def _self_update_marker_path() -> Path:
+    """Disk twin of the ``<PREFIX>_SELF_UPDATED`` env guard.
+
+    The env marker only survives ``os.execv``. Any restart from outside that
+    lineage — systemd ``Restart=always``, the watchdog, a manual restart —
+    clears it, so a bridge that cannot come up after an update re-runs the
+    updater on every restart and re-sends the success notice each time. The
+    units run ``RestartUSec=5s``, i.e. **12 chat messages a minute**
+    (T-260729-006: 사용자 폰에 1분여 13건). This file outlives the lineage.
+    """
+    root = (
+        os.environ.get(f"{SELF_UPDATE_PREFIX}_STATE_DIR")
+        or os.environ.get("TAB_STATE_DIR")
+        or "~/.local/state/codex-telegram-bridge"
+    )
+    return Path(root).expanduser() / f"{SELF_UPDATE_PACKAGE}-self-updated"
+
+
+def _self_update_marked_version() -> str | None:
+    """Return the version an earlier run already installed, else None. Never raises."""
+    try:
+        text = _self_update_marker_path().read_text(encoding="utf-8").strip()
+    except Exception:  # noqa: BLE001 — missing/unreadable marker just means "no record"
+        return None
+    return text or None
+
+
+def _self_update_mark_installed(version: str) -> None:
+    """Persist ``version`` so a restart does not re-run the same update. Never raises."""
+    try:
+        path = _self_update_marker_path()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(f"{version}\n", encoding="utf-8")
+    except Exception as exc:  # noqa: BLE001 — updater safety must not hinge on this write
+        log("UPDATE", f"could not persist self-update marker: {exc}")
+
+
+def _self_update_notice_path() -> Path:
+    """The last failure notice already delivered to chat.
+
+    Repeat **failure** notices storm exactly like the repeat success notices did:
+    the updater re-runs on every restart, pip fails again, and another ❌ lands in
+    the chat every 5 seconds. Success is covered by the install marker above, but
+    a failure has to stay retryable — a transient pip/network error should still
+    resolve itself. So this silences the duplicate *message*, not the retry.
+    """
+    return _self_update_marker_path().with_name(f"{SELF_UPDATE_PACKAGE}-last-notice")
+
+
+def _self_update_notice_seen(key: str) -> bool:
+    """True when this exact notice was already delivered. Never raises."""
+    try:
+        return _self_update_notice_path().read_text(encoding="utf-8").strip() == key
+    except Exception:  # noqa: BLE001 — no record means "not sent yet"
+        return False
+
+
+def _self_update_record_notice(key: str) -> None:
+    """Remember the notice just delivered. Never raises."""
+    try:
+        path = _self_update_notice_path()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(f"{key}\n", encoding="utf-8")
+    except Exception as exc:  # noqa: BLE001 — updater safety must not hinge on this write
+        log("UPDATE", f"could not persist self-update notice: {exc}")
+
+
 def _self_update_latest() -> str | None:
     try:
         req = urllib.request.Request(
@@ -674,8 +757,9 @@ def _self_update_latest() -> str | None:
 
 def self_update_available() -> str | None:
     """Return the newer PyPI version string if an update should be offered, else None.
-    Returns None for opt-out, source checkouts, already-updated lineage, offline,
-    or when already current. Never raises."""
+    Returns None for opt-out, source checkouts, already-updated lineage (env marker
+    or the disk marker that survives restarts), offline, or when already current.
+    Never raises."""
     try:
         if bool_env(f"{SELF_UPDATE_PREFIX}_NO_UPDATE_CHECK", False):
             return None
@@ -691,6 +775,15 @@ def self_update_available() -> str | None:
             return None
         if _self_update_version_tuple(latest) <= _self_update_version_tuple(current):
             return None
+        marked = _self_update_marked_version()
+        if marked and _self_update_version_tuple(latest) <= _self_update_version_tuple(marked):
+            # An earlier run already installed this version. If the installed-version
+            # probe still reports the old one, the install is not taking effect and
+            # retrying would loop — one notice per version, not one per restart.
+            # The chat button path calls perform_self_update() directly, so a human
+            # can still force a retry.
+            log("UPDATE", f"v{latest} already installed by an earlier run; skipping (disk guard)")
+            return None
         return latest
     except Exception as exc:  # noqa: BLE001
         log("UPDATE", f"version check error: {exc}")
@@ -704,13 +797,29 @@ class SelfUpdateResult:
     restart_requested: bool = False
 
 
-def _self_update_notify(notify: Callable[[str], object] | None, message: str) -> None:
+def _self_update_notify(
+    notify: Callable[[str], object] | None,
+    message: str,
+    *,
+    once_key: str | None = None,
+) -> None:
+    """Send ``message`` to chat. With ``once_key``, send it at most once per key.
+
+    Only the automatic path passes a key — a human pressing the update button
+    always gets an answer, even if it repeats.
+    """
     if notify is None:
+        return
+    if once_key is not None and _self_update_notice_seen(once_key):
+        log("UPDATE", f"duplicate notice suppressed ({once_key})")
         return
     try:
         notify(message)
     except Exception as exc:  # noqa: BLE001 — chat feedback cannot break updater safety
         log("UPDATE", f"chat feedback failed: {exc}")
+        return
+    if once_key is not None:
+        _self_update_record_notice(once_key)
 
 
 def _self_update_failure_message(latest: str, output: str, returncode: int) -> str:
@@ -733,11 +842,18 @@ def perform_self_update(
     latest: str,
     *,
     notify: Callable[[str], object] | None = None,
+    quiet_repeat: bool = False,
 ) -> SelfUpdateResult:
     """Upgrade to ``latest``, report the outcome, then re-exec on success.
 
     Direct/local wheel installs are never replaced with the public PyPI build.
     Any install error leaves the running version untouched.
+
+    ``quiet_repeat`` drops a non-success notice that is identical to the last one
+    already sent. The automatic path sets it, because a restart loop would repeat
+    the same ❌ every few seconds (T-260729-006). A human pressing the update
+    button leaves it False and always gets an answer. The retry itself is never
+    suppressed — only the duplicate message.
     """
     if _self_update_is_local_install():
         message = (
@@ -745,7 +861,9 @@ def perform_self_update(
             "설치에 사용한 로컬 휠 절차로 갱신하세요."
         )
         log("UPDATE", "local/direct install detected; PyPI upgrade skipped")
-        _self_update_notify(notify, message)
+        _self_update_notify(
+            notify, message, once_key=f"skipped_local:{latest}" if quiet_repeat else None
+        )
         return SelfUpdateResult("skipped_local", message)
 
     log("UPDATE", f"upgrading {SELF_UPDATE_PACKAGE} -> {latest}")
@@ -761,15 +879,20 @@ def perform_self_update(
             detail = output[:200]
             log("UPDATE", f"pip upgrade failed (staying put): {detail}")
             message = _self_update_failure_message(latest, output, proc.returncode)
-            _self_update_notify(notify, message)
+            _self_update_notify(
+                notify, message, once_key=f"failed:{latest}" if quiet_repeat else None
+            )
             return SelfUpdateResult("failed", message)
     except Exception as exc:  # noqa: BLE001
         log("UPDATE", f"self-update install error (staying put): {exc}")
         message = f"❌ v{latest} 업데이트 실패: pip 실행 오류. 수동: python -m pip install --upgrade {SELF_UPDATE_PACKAGE}"
-        _self_update_notify(notify, message)
+        _self_update_notify(
+            notify, message, once_key=f"failed:{latest}" if quiet_repeat else None
+        )
         return SelfUpdateResult("failed", message)
 
     os.environ[f"{SELF_UPDATE_PREFIX}_SELF_UPDATED"] = latest
+    _self_update_mark_installed(latest)
     message = f"✅ {SELF_UPDATE_PACKAGE} v{latest} 설치 성공 — 지금 브릿지를 재시작합니다."
     log("UPDATE", f"upgraded to {latest}; restarting")
     _self_update_notify(notify, message)
@@ -781,7 +904,9 @@ def perform_self_update(
             f"⚠️ {SELF_UPDATE_PACKAGE} v{latest} 설치 성공, 자동 재시작 실패. "
             "브릿지를 수동 재시작하면 신버전이 적용됩니다."
         )
-        _self_update_notify(notify, message)
+        _self_update_notify(
+            notify, message, once_key=f"restart_failed:{latest}" if quiet_repeat else None
+        )
         return SelfUpdateResult("installed_restart_failed", message)
     return SelfUpdateResult("updated", message, restart_requested=True)
 
@@ -792,6 +917,9 @@ def node_defaults() -> tuple[str, str]:
 
 # Public sender labels — 받은-지시 신호의 from=<alias> (또는 hostname) 를 (한글 라벨, 이모지) 로
 # 매핑. claude-telegram-bridge.py node_label_emoji 동형. 받은-지시 카드 "발신 → 수신" 줄용.
+#   T-260725-051: 표시층 전환의 미러 잔여 정리. 바뀌는 것은 라벨뿐이고 키는 그대로다
+#   (기존 키로 들어와도 계속 해석된다). 상세 배경·경계는 PR/티켓 본문에 둔다 —
+#   ⚠️ 이 파일은 공개 export 대상이라 모듈 주석에 내부 토폴로지를 적으면 그대로 나간다.
 _NODE_ALIAS_LABELS: dict[str, tuple[str, str]] = {}
 _NODE_HOST_LABELS: list[tuple[str, tuple[str, str]]] = []
 
@@ -1097,9 +1225,10 @@ def codex_bridge_launchd_label(node: str) -> str:
 def codex_bridge_restart_command(node: str) -> list[str]:
     """codex 텔레그램 브릿지 재시작 명령(플랫폼 분기).
 
-    macOS 제어 노드/macOS 노드는 launchd 잡(노드별 라벨)으로, Linux 노드(작업 노드/데스크탑/작업 노드)는
-    systemd user unit(codex-bridge.service)으로 브릿지를 관리한다. 기존엔 launchctl 만 호출해
+    macOS 노드는 launchd 잡(노드별 라벨)으로, Linux 노드는 systemd user unit
+    (codex-bridge.service)으로 브릿지를 관리한다. 기존엔 launchctl 만 호출해
     launchctl 부재인 Linux 노드에서 재시작 버튼이 무동작이었다(T-260630-18, PR #246 리뷰노트).
+    ※ 노드 별칭을 예시로 적지 않는다 — 공개 export 어휘 게이트가 금지어로 본다 (T-260729-023).
     """
     if sys.platform == "darwin":
         return [
@@ -1267,7 +1396,13 @@ def strip_inline_node_emoji_header(text: str) -> str:
 
 
 def format_reasoning_mirror(text: str) -> str:
-    body = truncate_text(strip_node_emoji_header(text), REASONING_MIRROR_LIMIT).strip()
+    # 자르기 前에 중화한다 (T-260728-076, 원본 T-260728-095/100) — 뒤에 자르면
+    # 마커가 반쪽으로 잘려('<추천답변 class="au') 정규식이 못 잡고, 볼드는 짝이
+    # 갈라져 '**잘린' 처럼 여는 별표만 남는다.
+    neutralized = SUGGESTED_REPLY_MARKER_TAG_RE.sub("", text)
+    neutralized = SUGGESTED_REPLY_MARKER_TAIL_RE.sub("", neutralized)
+    neutralized = MIRROR_BOLD_RE.sub(r"\1", neutralized)
+    body = truncate_text(strip_node_emoji_header(neutralized), REASONING_MIRROR_LIMIT).strip()
     return f"{REASONING_HEADER}\n{body}" if body else ""
 
 
@@ -1500,7 +1635,9 @@ TOOL_LABEL_KO = {
     "view_image": "🖼 이미지 확인",
     "imagegen": "🎨 이미지 생성",
     "update_plan": "🗂 계획",
-    "parallel": "⚡ 병렬 실행",
+    # 구 라벨의 U+26A1 은 노드 이모지와 겹쳐 공개 export 어휘 게이트에 걸린다.
+    # 일반 아이콘으로 교체했고, 주석에도 글리프를 직접 쓰지 않는다 (T-260729-023).
+    "parallel": "⏩ 병렬 실행",
     "web": "🌐 브라우저",
     "web_open": "🌐 브라우저",
     "open_page": "🌐 브라우저",
@@ -7502,7 +7639,8 @@ class Bridge:
         if not latest:
             return
         if bool_env(f"{SELF_UPDATE_PREFIX}_AUTO_UPDATE", False):
-            perform_self_update(latest, notify=self.telegram.send)
+            # 자동 경로만 중복 알림을 죽인다 — 버튼(사람)은 늘 답을 받는다.
+            perform_self_update(latest, notify=self.telegram.send, quiet_repeat=True)
             return
         current = _self_update_installed_version() or "?"
         try:
