@@ -47,7 +47,8 @@ class ViewerBudgetSmokeTest(unittest.TestCase):
         calls.clear()
         self.assertFalse(client.send(long_text, viewer=False))
         # Non-viewer keeps trying every chunk (no fast-fail, no budget kwargs).
-        self.assertGreater(len(calls), viewer_calls)
+        # Mainline also stops at the first failed chunk, retaining the cursor for retry.
+        self.assertEqual(len(calls), viewer_calls)
         self.assertNotIn("_attempts", calls[0][1])
 
 
