@@ -5,13 +5,13 @@ The default transport targets the existing `cx` / `tmux -L codex` REPL. An
 opt-in native Windows transport talks to a foreground bridge-owned ConPTY host.
 
 - Telegram text is pasted into the visible Codex TUI.
-- Final answers are read from Codex's JSONL session file, not from screen
-  scraping.
+- Main-thread final answers are read from Codex's JSONL session file.
+- Ephemeral /btw replies use a separately owned, completed-pane mirror.
 - Answers typed directly in the REPL are mirrored to Telegram too.
 
 There is no supported late-attach input API for an arbitrary Codex TUI. The
 tmux transport attaches only to its configured pane; the native host launches
-and owns its child. Reply extraction always uses the structured session log.
+and owns its child. The /btw fallback is scoped to this transport's pane.
 """
 
 from __future__ import annotations
@@ -39,6 +39,13 @@ from dataclasses import dataclass, replace
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Callable, Protocol, runtime_checkable
+
+_SCRIPTS_DIR = str(Path(__file__).resolve().parent)
+if _SCRIPTS_DIR not in sys.path:
+    sys.path.insert(0, _SCRIPTS_DIR)
+import bridge_flow_progress as _flow_progress  # noqa: E402
+from bridge_public_text import strip_memory_citation  # noqa: E402
+from codex_side_reply import SideReplyMirror, latest_completed_side_reply, is_side_screen, prompt_key  # noqa: E402
 
 try:
     import fcntl
@@ -140,6 +147,18 @@ FLOW_MIRROR_LIMIT = 1500
 # parity without changing a service definition.
 FLOW_MIRROR_ENV = "CRB_FLOW_MIRROR"
 FLOW_MIRROR_FLAG = os.path.expanduser("~/.config/codex-telegram-bridge/flow-mirror.on")
+# Default user cards hide tools/commands/paths. Opt-in restores the previous
+# detailed lines without changing the flow-mirror on/off flag.
+FLOW_MIRROR_DETAIL_ENV = "CRB_FLOW_MIRROR_DETAIL"
+FLOW_MIRROR_DETAIL_FLAG = os.path.expanduser("~/.config/codex-telegram-bridge/flow-mirror-detail.on")
+FLOW_STAGE_READ = _flow_progress.FLOW_STAGE_READ
+FLOW_STAGE_EDIT = _flow_progress.FLOW_STAGE_EDIT
+FLOW_STAGE_TEST = _flow_progress.FLOW_STAGE_TEST
+FLOW_STAGE_WORK = _flow_progress.FLOW_STAGE_WORK
+FLOW_STAGE_WRAP = _flow_progress.FLOW_STAGE_WRAP
+FLOW_EASY_STAGES = _flow_progress.FLOW_EASY_STAGES
+# Turn-end footer. These are turn states, not "user goal complete".
+FLOW_DONE_LABELS = dict(_flow_progress.FLOW_DONE_LABELS)
 # ⚙️ 침묵구간 하트비트 (T-260727-104 — claude 브릿지 T-260727-076 의 쌍둥이).
 # 카드는 이벤트가 있을 때만 렌더된다. 워커가 한 도구를 오래 도는 구간엔 이벤트가 없어 카드가
 # 정지하고, 그 정지는 죽은 턴과 화면상 완전히 같다. 값은 claude 쪽과 동일하게 둔다 —
@@ -245,6 +264,8 @@ def split_by_utf16_budget(text: str, budget: int) -> list[str]:
     return chunks
 
 
+
+
 def split_answer_for_code_blocks(text: str) -> list[dict[str, Any]]:
     segments: list[dict[str, Any]] = []
     cursor = 0
@@ -257,10 +278,10 @@ def split_answer_for_code_blocks(text: str) -> list[dict[str, Any]]:
         if code.endswith("\n"):
             code = code[:-1]
         if code:
-            segment: dict[str, Any] = {"body": code, "code": True}
+            item: dict[str, Any] = {"body": code, "code": True}
             if language:
-                segment["language"] = language
-            segments.append(segment)
+                item["language"] = language
+            segments.append(item)
         cursor = match.end()
     tail = text[cursor:].strip()
     if tail:
@@ -303,6 +324,44 @@ BRIDGE_RESTART_CALLBACK_PREFIX = "crb_restart"
 STATUS_COMMANDS = {"status", "/status"}
 CONTEXT_COMMANDS = {"context", "/context"}
 LONG_RUNNING_SLASH_COMMANDS = {"/goal"}
+SESSION_RESET_SLASH_COMMANDS = {"/clear"}
+CLEAR_SLASH_COMPLETE = "세션을 클리어했습니다."
+CLEAR_SLASH_DELIVERED = "클리어 요청을 전달했습니다. 세션 전환을 확인하면 완료로 알려줄게."
+CLEAR_SLASH_BUSY = "지금 다른 작업 중이라 클리어는 실행하지 않았습니다. 작업이 끝난 뒤 다시 요청해 주세요."
+CLEAR_SLASH_SIDE_UNAVAILABLE = "이전 /clear는 보조 대화에서 거부돼 세션을 비우지 않았어. 이제 텔레그램에서 /clear를 다시 보내면 메인 대화 전환부터 처리할게."
+CLEAR_SLASH_SWITCH_FAILED = "메인 대화로 전환된 것을 확인하지 못해 초기화하지 않았어. 잠시 뒤 텔레그램에서 /clear를 다시 보내줘."
+CLEAR_SLASH_TIMEOUT = "세션 전환을 확인하지 못했습니다. 완료로 표시하지 않습니다."
+CLEAR_WATCH_TIMEOUT_SEC = 90
+CLEAR_IDLE_COMPOSER_RE = re.compile(r"Ask Codex to do anything", re.IGNORECASE)
+CLEAR_RESUME_HINT_RE = re.compile(
+    r"To continue this session,\s*run\s+codex resume.*?([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})",
+    re.IGNORECASE | re.DOTALL,
+)
+CLEAR_RESUME_HINT_INTRO_RE = re.compile(
+    r"To continue this session,\s*run\s+codex resume",
+    re.IGNORECASE,
+)
+CLEAR_RESUME_UUID_LINE_RE = re.compile(
+    r"^\(([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})\)$",
+    re.IGNORECASE,
+)
+CLEAR_RESUME_UUID_AT_END_RE = re.compile(
+    r"\(([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})\)\s*$",
+    re.IGNORECASE,
+)
+CLEAR_RESUME_UUID_INCOMPLETE_OPEN_RE = re.compile(
+    r"\(([0-9a-f-]{0,36})$",
+    re.IGNORECASE,
+)
+# Native wrap: intro + adjacent title fragments. UUID may be its own line,
+# at the end of a continuation, or split mid-token by Codex TUI hard wrap
+# (capture-pane -J does not join that wrap). Blank line ends the block.
+CLEAR_RESUME_HINT_WRAP_LINES = 5
+CLEAR_DISABLED_RE = re.compile(r"'/clear' is disabled while a task is in progress", re.IGNORECASE)
+ROLLOUT_SESSION_ID_RE = re.compile(
+    r"([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})(?:\.jsonl)?$",
+    re.IGNORECASE,
+)
 STATUS_WIDE_CAPTURE_COLUMNS = 132
 ANSI_RE = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]")
 REPL_BUSY_RE = re.compile(
@@ -311,6 +370,12 @@ REPL_BUSY_RE = re.compile(
 )
 REPL_ACTIVE_BUSY_RE = re.compile(
     r"esc to interru|interrupt to stop|^[•◦*]\s*Working\b|Churning|Saut[eé]ed|✻|✽",
+    re.IGNORECASE,
+)
+# A live Codex status row, including narrow-pane truncation and background count.
+# Prose mentioning Working or the interrupt shortcut is not such a row.
+REPL_WORKING_STATUS_RE = re.compile(
+    r"^(?:[•◦*]\s*)?Working(?:\s*\([^)]*\)?(?:\s*[·•].*)?)?$",
     re.IGNORECASE,
 )
 REPL_QUEUED_RE = re.compile(r"\bQueued follow-up inputs\b", re.IGNORECASE)
@@ -451,7 +516,13 @@ def apply_suggested_reply_confirmation(
         log("SEND", "suggested reply confirmation failed (non-fatal)")
 
 
-EYE_ACTIVITY_DIRECTIONS = ("↖", "↗", "↘", "↙")
+# T-260730-062 — claude-telegram-bridge.py 와 같은 렌더러의 형제 사본이다. 표시에서
+# 이모지·화살표를 뺀다. 두 브릿지 프레임은 공용 renderer fixture 가 ★동일하도록 강제하므로
+# 한쪽만 바꿀 수 없다.
+# 프레임이 전부 같아지면 editMessageText 가 400(message is not modified)을 내고 회전이
+# 죽으므로, 이모지 대신 텍스트(가운뎃점)로 프레임을 다르게 만든다.
+# 사유·불변식 전문은 claude-telegram-bridge.py 의 같은 상수 주석 참조.
+EYE_ACTIVITY_SUFFIXES = ("", "·", "··", "···")
 EYE_ACTIVITY_EDIT_MIN_SECONDS = 3.0
 EYE_ACTIVITY_MAX_EDITS = 40
 
@@ -460,7 +531,7 @@ def eye_activity_frames(label: str, enabled: bool, surface: str) -> list[str]:
     if not enabled or surface != "aniki_dm":
         return []
     clean_label = " ".join((label or "응답 처리 중").split())[:80] or "응답 처리 중"
-    return [f"👀{direction} {clean_label}" for direction in EYE_ACTIVITY_DIRECTIONS]
+    return [f"{clean_label}{suffix}" for suffix in EYE_ACTIVITY_SUFFIXES]
 
 
 def codex_activity_indicator_context(
@@ -1039,6 +1110,11 @@ def is_fast_slash_command(text: str) -> bool:
     return command.split("@", 1)[0] == "/fast"
 
 
+def is_session_reset_slash_command(text: str) -> bool:
+    command = slash_command_token(text)
+    return command.split("@", 1)[0] in SESSION_RESET_SLASH_COMMANDS
+
+
 def should_stop_typing_after_slash_command(text: str, had_error: bool) -> bool:
     return had_error or not slash_command_keeps_typing(text)
 
@@ -1319,6 +1395,104 @@ def extract_unrecognized_slash_error(screen: str, command: str) -> str:
     return ""
 
 
+def rollout_session_id(path: str) -> str:
+    match = ROLLOUT_SESSION_ID_RE.search(str(path or "").replace("\\", "/"))
+    return match.group(1).lower() if match else ""
+
+
+def _incomplete_resume_uuid_open(line: str) -> bool:
+    """True when TUI wrap split ``(uuid)`` so this line ends inside the id.
+
+    Includes a bare trailing ``(`` (0 hex chars) and a full 36-char id that is
+    still missing the closing ``)``. A complete ``(uuid)`` at end of line is
+    not incomplete.
+    """
+    if CLEAR_RESUME_UUID_AT_END_RE.search(line or ""):
+        return False
+    return bool(CLEAR_RESUME_UUID_INCOMPLETE_OPEN_RE.search(line or ""))
+
+
+def resume_hint_session_id(screen: str) -> str:
+    """UUID from a native /clear resume receipt.
+
+    Same-line receipts still match. Hermes 81-col hard-wraps the title so the
+    UUID may sit on the next line as ``(uuid)``, at the end of a wrapped title
+    fragment, or split mid-token (``(01a`` / ``08f32-…c)``). ``capture-pane -J``
+    does not join Codex TUI wrap. Only the intro plus the next adjacent
+    non-empty title/UUID lines are scanned and concatenated without inserting
+    characters. A blank line ends the block so a later paragraph UUID is not
+    bound. Unrelated ``(`` lines still stop the block. Quoted/prompt prefixes
+    are skipped. Whole-screen DOTALL is not used.
+    """
+    lines = [ANSI_RE.sub("", line or "").strip() for line in (screen or "").splitlines()]
+    for index, stripped in enumerate(lines):
+        if not stripped or stripped.startswith("›") or stripped.startswith(">"):
+            continue
+        match = CLEAR_RESUME_HINT_RE.search(stripped)
+        if match:
+            return match.group(1).lower()
+        if not CLEAR_RESUME_HINT_INTRO_RE.search(stripped):
+            continue
+        if CLEAR_RESUME_UUID_LINE_RE.match(stripped):
+            continue
+        block = [stripped]
+        for follow in lines[index + 1 : index + 1 + CLEAR_RESUME_HINT_WRAP_LINES]:
+            if not follow:
+                break
+            if follow.startswith("›") or follow.startswith(">"):
+                break
+            uuid_only = CLEAR_RESUME_UUID_LINE_RE.match(follow)
+            if uuid_only:
+                return uuid_only.group(1).lower()
+            uuid_at_end = CLEAR_RESUME_UUID_AT_END_RE.search(follow)
+            if uuid_at_end:
+                return uuid_at_end.group(1).lower()
+            if CLEAR_RESUME_HINT_RE.search(follow):
+                break
+            if CLEAR_IDLE_COMPOSER_RE.search(follow):
+                break
+            if CLEAR_DISABLED_RE.search(follow):
+                break
+            if follow.startswith("■") or follow.startswith("Booting "):
+                break
+            if "(" in follow and not _incomplete_resume_uuid_open(follow):
+                break
+            block.append(follow)
+        joined = "".join(block)
+        joined_match = CLEAR_RESUME_HINT_RE.search(joined)
+        if joined_match:
+            return joined_match.group(1).lower()
+        # Intro without an adjacent receipt UUID is not a receipt.
+    return ""
+
+
+def visible_screen_confirms_clear_reset(screen: str, watch: dict[str, Any] | None = None) -> bool:
+    """Visible-pane resume hint after /clear. Blank, boot leftovers, quotes, and failed clear are not reset."""
+    text = ANSI_RE.sub("", screen or "")
+    if not text.strip():
+        return False
+    if screen_has_repl_busy_marker(text):
+        return False
+    if "'/clear' is unavailable in side conversations" in text:
+        return False
+    if CLEAR_DISABLED_RE.search(text):
+        return False
+    if extract_unrecognized_slash_error(text, "/clear"):
+        return False
+    if not CLEAR_IDLE_COMPOSER_RE.search(text):
+        return False
+    seen = resume_hint_session_id(text)
+    if not seen:
+        return False
+    watch = watch or {}
+    if watch.get("before_had_resume_hint") and seen == str(watch.get("before_resume_id") or "").lower():
+        return False
+    expected = rollout_session_id(str(watch.get("before_path") or ""))
+    if expected and seen != expected:
+        return False
+    return True
+
+
 def _clean_terminal_line(raw_line: str) -> str:
     line = ANSI_RE.sub("", raw_line).strip()
     if "│" in raw_line:
@@ -1327,27 +1501,77 @@ def _clean_terminal_line(raw_line: str) -> str:
     return re.sub(r"\s{2,}", " ", line).strip()
 
 
+FAST_MODE_NOTICE = {
+    "on": "패스트모드 켜졌습니다",
+    "off": "패스트모드 꺼졌습니다",
+}
+FAST_OBSERVE_CONFIRM_POLLS = 2
+
+
+def current_composer_footer_region(screen: str) -> str:
+    """Status lines below the last TUI composer ``›``.
+
+    Real 0.153.4 captures keep the live footer under ``› Ask Codex…``.
+    Transcript examples, code, and old footers sit above that prompt.
+    """
+    lines = clean_pane_lines(screen or "")
+    last_prompt = None
+    for index, line in enumerate(lines):
+        if line.strip().startswith("›"):
+            last_prompt = index
+    if last_prompt is None:
+        return ""
+    below = list(lines[last_prompt + 1 :])
+    while below and not below[-1].strip():
+        below.pop()
+    return "\n".join(below)
+
+
+def fast_model_identity(model: str) -> str:
+    tokens = model.split()
+    if tokens and tokens[-1].lower() == "fast":
+        tokens = tokens[:-1]
+    return " ".join(tokens)
+
+
+def parse_fast_mode_state(screen: str) -> tuple[str | None, str]:
+    """Current Fast tier from the live footer under the composer.
+
+    Isolated CLI 0.153.4:
+    off ``gpt-6-astra xhigh · … · Context N% used``
+    on  ``gpt-6-astra xhigh fast · … · Context N% used``
+    A-fast then ``gpt-5.3-codex-spark high · …`` has no fast token and is a
+    model change, not /fast off. Historical body footers are ignored.
+    """
+    region = current_composer_footer_region(screen)
+    if not region.strip():
+        return None, ""
+    footer = parse_codex_footer_status(region)
+    model = str(footer.get("model") or "").strip()
+    if not footer or not footer.get("context_used") or not model:
+        return None, ""
+    tokens = model.split()
+    if not tokens:
+        return None, ""
+    if tokens[-1].lower() == "fast":
+        if len(tokens) < 2:
+            return None, ""
+        return "on", "footer"
+    return "off", "footer"
+
+
+def parse_fast_mode_observation(screen: str) -> tuple[str | None, str, str]:
+    parsed, evidence = parse_fast_mode_state(screen)
+    if parsed is None:
+        return None, "", ""
+    region = current_composer_footer_region(screen)
+    footer = parse_codex_footer_status(region)
+    return parsed, evidence, fast_model_identity(str(footer.get("model") or ""))
+
+
 def extract_fast_mode_notice(screen: str) -> str:
-    lines = [_clean_terminal_line(line) for line in (screen or "").splitlines()]
-    lines = [line for line in lines if line]
-
-    for line in reversed(lines[-40:]):
-        normalized = line.lower()
-        if normalized == "fast":
-            return "패스트모드 켜졌습니다"
-        if re.search(r"\bfast(?:\s+mode)?\s*[:=-]?\s*(?:off|disabled)\b", normalized):
-            return "패스트모드 꺼졌습니다"
-        if re.search(r"\bfast(?:\s+mode)?\s*[:=-]?\s*(?:on|enabled)\b", normalized):
-            return "패스트모드 켜졌습니다"
-
-    for line in reversed(lines[-20:]):
-        normalized = line.lower()
-        if "context" not in normalized or "·" not in normalized:
-            continue
-        model_segment = normalized.split("·", 1)[0]
-        return "패스트모드 켜졌습니다" if re.search(r"\bfast\b", model_segment) else "패스트모드 꺼졌습니다"
-
-    return ""
+    state, _evidence = parse_fast_mode_state(screen)
+    return FAST_MODE_NOTICE.get(state or "", "")
 
 
 def suffix_from_metadata(file_name: str = "", mime_type: str = "", default: str = ".bin") -> str:
@@ -1420,6 +1644,45 @@ def flow_mirror_enabled(configured_enabled: bool = False) -> bool:
     return os.path.exists(FLOW_MIRROR_FLAG) or configured_enabled
 
 
+def flow_mirror_detail_enabled() -> bool:
+    """True restores previous tool/command/path lines. Default is easy Korean stages."""
+    return _flow_progress.detail_enabled(FLOW_MIRROR_DETAIL_ENV, FLOW_MIRROR_DETAIL_FLAG)
+
+
+def flow_done_label(status: str) -> str:
+    if status == "context_changed":
+        return "새 요청으로 전환"
+    return _flow_progress.flow_done_label(status)
+
+
+def format_flow_elapsed(seconds: float) -> str:
+    total = int(max(0.0, float(seconds)))
+    if total < 60:
+        return f"{total}초"
+    minutes, secs = divmod(total, 60)
+    if minutes < 60:
+        return f"{minutes}분 {secs}초" if secs else f"{minutes}분"
+    hours, minutes = divmod(minutes, 60)
+    return f"{hours}시간 {minutes}분" if minutes else f"{hours}시간"
+
+
+def is_test_run_text(text: str) -> bool:
+    return _flow_progress.is_test_run_text(text)
+
+
+def parse_certain_test_result(text: str) -> str | None:
+    """Disabled. Flow/tool/screen/commentary text is not a trusted current test result."""
+    return _flow_progress.parse_certain_test_result(text)
+
+
+def classify_flow_stage(name: str = "", detail: str = "", line: str = "") -> str:
+    return _flow_progress.classify_flow_stage(name=name, detail=detail, line=line)
+
+
+def user_visible_flow_line(text: str) -> str:
+    return _flow_progress.user_visible_flow_line(text, detail=flow_mirror_detail_enabled())
+
+
 def flow_context_summary(text: str, limit: int = 40) -> str:
     """Extract a stable, friendly one-line context for a live flow card."""
     for raw in strip_node_emoji_header(text or "").splitlines():
@@ -1441,31 +1704,22 @@ def flow_context_summary(text: str, limit: int = 40) -> str:
     return "작업 진행"
 
 
-def flow_card_steps(text: str) -> tuple[list[str], str]:
+
+
+
+
+
+
+
+
+def flow_card_steps(text: str, *, show_counts: bool | None = None, show_details: bool | None = None) -> tuple[list[str], str]:
     """Group consecutive identical tool labels and return rendered lines/current step."""
-    groups: list[dict[str, Any]] = []
-    for raw in flow_mirror_body(text).splitlines():
-        line = raw.strip()
-        if line.startswith("• "):
-            line = line[2:].strip()
-        if not line:
-            continue
-        label, separator, detail = line.partition(" · ")
-        label = label.strip()
-        detail = detail.strip() if separator else ""
-        if groups and groups[-1]["label"] == label:
-            groups[-1]["count"] += 1
-            if detail:
-                groups[-1]["detail"] = detail
-        else:
-            groups.append({"label": label, "detail": detail, "count": 1})
-    rendered: list[str] = []
-    for group in groups:
-        count = f" ×{group['count']}" if group["count"] > 1 else ""
-        detail = f" · {group['detail']}" if group["detail"] else ""
-        rendered.append(f"{group['label']}{count}{detail}")
-    current = str(groups[-1]["label"]) if groups else ""
-    return rendered, current
+    detailed = flow_mirror_detail_enabled() if show_counts is None else show_counts
+    keep_details = flow_mirror_detail_enabled() if show_details is None else show_details
+    return _flow_progress.collapse_flow_steps(
+        flow_mirror_body(text),
+        detail=bool(detailed and keep_details),
+    )
 
 
 def format_flow_mirror(
@@ -1476,6 +1730,9 @@ def format_flow_mirror(
     context: str = "",
     now: datetime | None = None,
     autonomous: bool = False,
+    done_label: str = "",
+    elapsed_text: str = "",
+    verify_line: str = "",
 ) -> str:
     lines, current = flow_card_steps(text)
     if not lines:
@@ -1489,8 +1746,13 @@ def format_flow_mirror(
     # (두 카드 형식이 갈라지면 사용자가 노드마다 다른 규칙을 외워야 한다, T-260727-068)
     timestamp = (now or datetime.now(KST)).astimezone(KST).strftime("%H:%M")
     header = f"{node_emoji} {label} · {flow_context_summary(context)} · 갱신 {timestamp}"
-    state = "노드 자율 진행중" if autonomous else "진행중"
-    footer = f"→ {state} · 현재: {current}"
+    if verify_line and verify_line not in lines:
+        lines.append(verify_line)
+    if done_label:
+        footer = f"→ {done_label} · 소요 {elapsed_text}" if elapsed_text else f"→ {done_label}"
+    else:
+        state = "노드 자율 진행중" if autonomous else "진행중"
+        footer = f"→ {state} · 현재: {current}"
     available = max(1, FLOW_MIRROR_LIMIT - len(header) - len(footer) - 4)
     while len(lines) > 1 and len("\n".join(lines)) > available:
         lines.pop(0)
@@ -1592,8 +1854,15 @@ def format_sent_directive(text: str, from_alias: str, to_alias: str) -> str:
     if not body:
         return ""
     if (from_alias or "").strip() == (to_alias or "").strip():
-        gist = body[:AMBIENT_DIRECTIVE_LIMIT].strip()
-        return f"{TERMINAL_INPUT_HEADER}\n{gist}" if gist else ""
+        # T-260910-012: 함대는 보낸 지시, 사람 터미널은 ⌨️ 전문. 400자 gist 금지.
+        try:
+            import terminal_turn_mirror as _turn_mirror
+        except ImportError:
+            _turn_mirror = None
+        if _turn_mirror is not None and _turn_mirror.is_approved_fleet_prompt(text or ""):
+            return _turn_mirror.format_sent_directive(text or "")
+        masked = (_turn_mirror.mask_secrets(body) if _turn_mirror is not None else body).strip()
+        return f"{TERMINAL_INPUT_HEADER}\n{masked}" if masked else ""
     sender_label, sender_emoji = node_label_emoji(from_alias)
     receiver_label, receiver_emoji = node_label_emoji(to_alias)
     sender = f"{sender_emoji} {sender_label}".strip()
@@ -2387,6 +2656,84 @@ def extract_task_id(text: str) -> str:
     return match.group(0) if match else ""
 
 
+MEDIA_ENVELOPE_HEADER_RE = re.compile(
+    r"^\[Telegram\s+(?:image|photo|video|audio|voice|file|document)\s+received\]",
+    re.IGNORECASE,
+)
+
+
+def media_prompt_label(prompt: str) -> str:
+    """미디어 봉투 프롬프트의 사람용 짧은 라벨. 비미디어 프롬프트는 "".
+
+    image_prompt_text() 봉투(local_path/지시문 포함)를 중간보고에 원문 인용하면
+    경로 덤프로 읽힌다 (실사고 2026-08-28, T-260828-023) — caption 이 있으면
+    caption 을, 없으면 일반 라벨을 쓴다.
+    """
+    text = (prompt or "").lstrip()
+    if not MEDIA_ENVELOPE_HEADER_RE.match(text):
+        return ""
+    for line in text.splitlines():
+        stripped = line.strip()
+        if stripped.lower().startswith("caption:"):
+            caption = " ".join(stripped.split(":", 1)[1].split())
+            if caption:
+                return f"받은 이미지: {caption}"
+    return "받은 이미지 확인"
+
+
+KST = timezone(timedelta(hours=9))
+MIDREPORT_SLOT_GRACE_SECONDS = 20
+
+
+def kst_now(ts: float | None = None) -> datetime:
+    return datetime.fromtimestamp(ts if ts is not None else time.time(), KST)
+
+
+def kst_midreport_slot_id(ts: float) -> str:
+    dt = kst_now(ts)
+    minute = 0 if dt.minute < 30 else 30
+    return dt.replace(minute=minute, second=0, microsecond=0).strftime("%Y-%m-%dT%H:%M")
+
+
+def next_kst_midreport_epoch(ts: float) -> float:
+    dt = kst_now(ts)
+    on_boundary = dt.second == 0 and dt.microsecond == 0 and dt.minute in (0, 30)
+    if on_boundary:
+        return dt.timestamp()
+    if dt.minute < 30:
+        return dt.replace(minute=30, second=0, microsecond=0).timestamp()
+    return (dt.replace(minute=0, second=0, microsecond=0) + timedelta(hours=1)).timestamp()
+
+
+def kst_midreport_due(
+    ts: float, last_slot: str, pending_slot: str = ""
+) -> tuple[bool, str, float]:
+    """Return (should_fire, slot_id, seconds_to_wait).
+
+    A failed send keeps ``pending_slot`` so the same half-hour can retry after
+    the 20s grace. Older pending slots are not backfilled.
+    """
+    slot_id = kst_midreport_slot_id(ts)
+    dt = kst_now(ts)
+    minute = 0 if dt.minute < 30 else 30
+    slot_start = dt.replace(minute=minute, second=0, microsecond=0)
+    into_slot = (dt - slot_start).total_seconds()
+
+    def wait_next() -> float:
+        nxt = next_kst_midreport_epoch(ts)
+        if nxt <= ts:
+            nxt = next_kst_midreport_epoch(ts + 1)
+        return max(0.05, nxt - ts)
+
+    if last_slot == slot_id:
+        return False, slot_id, wait_next()
+    if pending_slot == slot_id:
+        return True, slot_id, 0.0
+    if 0 <= into_slot <= MIDREPORT_SLOT_GRACE_SECONDS:
+        return True, slot_id, 0.0
+    return False, slot_id, wait_next()
+
+
 def format_long_running_progress_message(
     prompt: str,
     elapsed_seconds: float,
@@ -2457,6 +2804,7 @@ class JsonlEvent:
     start: int
     end: int
     key: str
+    turn_id: str = ""
 
 
 def session_identity(path: Path) -> SessionIdentity:
@@ -2482,6 +2830,55 @@ def parse_event_timestamp(record: dict[str, Any]) -> float:
     return parsed.timestamp()
 
 
+JSONL_USER_PAIR_SOURCES = frozenset({"event_msg", "response_item"})
+
+
+def jsonl_user_record_id(record: dict[str, Any]) -> str:
+    payload = record.get("payload") if isinstance(record.get("payload"), dict) else {}
+    for src in (payload, record):
+        if not isinstance(src, dict):
+            continue
+        for key in ("id", "item_id"):
+            value = src.get(key)
+            if value not in (None, "", 0):
+                return str(value)
+    return ""
+
+
+def jsonl_user_pair_duplicate(
+    previous: tuple[Any, ...] | None,
+    pair_sources: set[str],
+    text: str,
+    source: str,
+    timestamp: float,
+    record_id: str,
+) -> bool:
+    """True when this JSONL user line is the other half of the same input.
+
+    event_msg + response_item is one paste. After that pair is complete, the
+    next same-text line is a new inbound even inside the 2s window.
+    """
+    if not previous:
+        return False
+    prev_text, prev_source, prev_ts, prev_id = previous[0], previous[1], previous[2], previous[3]
+    if record_id and prev_id and record_id == prev_id:
+        return True
+    complementary = (
+        prev_text == text
+        and prev_source != source
+        and source in JSONL_USER_PAIR_SOURCES
+        and prev_source in JSONL_USER_PAIR_SOURCES
+        and timestamp > 0
+        and prev_ts > 0
+        and abs(timestamp - prev_ts) < 2
+    )
+    if not complementary:
+        return False
+    if len(pair_sources) >= 2 and source in pair_sources:
+        return False
+    return True
+
+
 def event_dedup_key(record: dict[str, Any], kind: str, text: str) -> str:
     raw = "\0".join(
         [
@@ -2490,6 +2887,13 @@ def event_dedup_key(record: dict[str, Any], kind: str, text: str) -> str:
             (text or "")[:512],
         ]
     )
+    return hashlib.sha256(raw.encode("utf-8", errors="replace")).hexdigest()
+
+
+def final_delivery_key(session_path: str, turn_id: str, text: str) -> str:
+    if not session_path or not turn_id:
+        return ""
+    raw = "\0".join(("final", session_path, turn_id, text.strip()))
     return hashlib.sha256(raw.encode("utf-8", errors="replace")).hexdigest()
 
 
@@ -2540,7 +2944,7 @@ def cursor_offset_for_state(state: dict[str, Any] | None, identity: SessionIdent
     return offset
 
 
-def parse_jsonl_event_line(line: str, start: int, end: int) -> JsonlEvent | None:
+def parse_jsonl_event_line(line: str, start: int, end: int, turn_id: str = "") -> JsonlEvent | None:
     try:
         record = json.loads(line)
     except json.JSONDecodeError:
@@ -2549,6 +2953,7 @@ def parse_jsonl_event_line(line: str, start: int, end: int) -> JsonlEvent | None
     if not event:
         return None
     kind, text = event
+    payload = record.get("payload") or {}
     return JsonlEvent(
         kind=kind,
         text=text,
@@ -2556,6 +2961,7 @@ def parse_jsonl_event_line(line: str, start: int, end: int) -> JsonlEvent | None
         start=start,
         end=end,
         key=event_dedup_key(record, kind, text),
+        turn_id=str(payload.get("turn_id") or turn_id),
     )
 
 
@@ -2563,6 +2969,7 @@ def read_tail_jsonl_events(path: Path, max_bytes: int) -> list[JsonlEvent]:
     size = path.stat().st_size
     start = max(0, size - max(1, max_bytes))
     events: list[JsonlEvent] = []
+    turn_id = ""
     with path.open("r", encoding="utf-8", errors="replace") as handle:
         handle.seek(start)
         if start > 0:
@@ -2573,7 +2980,14 @@ def read_tail_jsonl_events(path: Path, max_bytes: int) -> list[JsonlEvent]:
             if not line:
                 break
             line_end = handle.tell()
-            event = parse_jsonl_event_line(line, line_start, line_end)
+            try:
+                record = json.loads(line)
+                payload = record.get("payload") or {}
+                if record.get("type") == "event_msg" and payload.get("type") == "task_started":
+                    turn_id = str(payload.get("turn_id") or "")
+            except (json.JSONDecodeError, AttributeError):
+                pass
+            event = parse_jsonl_event_line(line, line_start, line_end, turn_id)
             if event:
                 events.append(event)
     return events
@@ -2595,13 +3009,21 @@ def eligible_backfill_events(
     after_user = [
         event
         for event in events[latest_user_index + 1 :]
-        if event.kind == "assistant" and event.text.strip()
+        if event.kind in {"assistant", "completion"} and event.text.strip()
     ]
     if not after_user:
         return []
     fresh = []
+    ordinary_answers = {
+        (event.turn_id, event.text.strip()) for event in after_user if event.kind == "assistant"
+    }
     for event in after_user:
+        if event.kind == "completion" and (event.turn_id, event.text.strip()) in ordinary_answers:
+            continue
         if ring_contains(state, event.key):
+            continue
+        delivery_key = final_delivery_key(str(state.get("session_path") or ""), event.turn_id, event.text)
+        if delivery_key and ring_contains(state, delivery_key):
             continue
         if event.timestamp <= 0:
             continue
@@ -2815,6 +3237,100 @@ class Config:
 # 고정 2s×N 재시도 예산이 통상 30s+ flood 대기를 못 넘겨 발신이 영구 유실되던 갭.
 TELEGRAM_FLOOD_MAX_WAITS = 3
 TELEGRAM_FLOOD_WAIT_CAP_SECONDS = 61.0
+JSONL_IDLE_SLEEP_SECONDS = 0.5
+# After a 429-exhausted send, jsonl must not retry the same cursor every idle tick.
+JSONL_SEND_FAIL_COOLDOWN_CAP_SECONDS = TELEGRAM_FLOOD_WAIT_CAP_SECONDS
+OUTBOUND_FLOOD_METHODS = frozenset(
+    {
+        "sendMessage",
+        "sendPhoto",
+        "sendDocument",
+        "sendMediaGroup",
+        "editMessageText",
+        "sendChatAction",
+    }
+)
+
+
+def jsonl_retry_sleep_seconds(
+    telegram: Any,
+    *,
+    send_failed: bool,
+    idle: float = JSONL_IDLE_SLEEP_SECONDS,
+    cap: float = JSONL_SEND_FAIL_COOLDOWN_CAP_SECONDS,
+    now: float | None = None,
+) -> float:
+    """Idle 0.5s tick, or remaining flood cooldown after a failed outbound send.
+
+    getUpdates is not gated here; telegram_loop stays independent.
+    """
+    if not send_failed:
+        return idle
+    extra = 0.0
+    getter = getattr(telegram, "outbound_retry_wait_seconds", None)
+    if callable(getter):
+        try:
+            extra = float(getter(now) if now is not None else getter())
+        except TypeError:
+            extra = float(getter() or 0.0)
+        except Exception:  # noqa: BLE001
+            extra = 0.0
+    if extra <= 0:
+        return idle
+    return max(idle, min(extra, cap))
+
+
+def typing_pulse_wait_seconds(
+    telegram: Any,
+    pulse_count: int,
+    *,
+    idle_first: float = 1.0,
+    idle_later: float = 4.0,
+    cap: float = TELEGRAM_FLOOD_WAIT_CAP_SECONDS,
+    now: float | None = None,
+) -> float:
+    """Typing interval: 1s then 4s, or remaining flood cooldown (capped).
+
+    sendChatAction is flood-gated. During a server not-before, wait the remaining
+    cooldown instead of POSTing every 4s. Cap matches jsonl so a 300s+ retry_after
+    does not freeze the stop event for minutes at a time.
+    """
+    base = idle_first if pulse_count <= 1 else idle_later
+    extra = 0.0
+    getter = getattr(telegram, "outbound_retry_wait_seconds", None)
+    if callable(getter):
+        try:
+            extra = float(getter(now) if now is not None else getter())
+        except TypeError:
+            extra = float(getter() or 0.0)
+        except Exception:  # noqa: BLE001
+            extra = 0.0
+    if extra <= 0:
+        return base
+    return max(base, min(extra, cap))
+
+
+def inbound_update_meta(update: dict[str, Any], expected_chat_id: str) -> dict[str, Any]:
+    """Body-free inbound stage for POLL/TGIN logs. Never includes text or tokens."""
+    uid = update.get("update_id")
+    if isinstance(update.get("callback_query"), dict):
+        return {"update_id": uid, "kind": "callback", "chat_match": None}
+    message = update.get("message") or update.get("edited_message")
+    if not isinstance(message, dict):
+        return {"update_id": uid, "kind": "no_message", "chat_match": False}
+    chat = message.get("chat") if isinstance(message.get("chat"), dict) else {}
+    match = str(chat.get("id")) == str(expected_chat_id)
+    raw = message.get("text")
+    if not isinstance(raw, str) or not raw.strip():
+        return {"update_id": uid, "kind": "empty_or_media", "chat_match": match}
+    stripped = raw.strip().lower()
+    if stripped in {"/start", "/ping"}:
+        kind = "ping"
+    elif stripped.startswith("/"):
+        kind = "slash"
+    else:
+        kind = "text"
+    return {"update_id": uid, "kind": kind, "chat_match": match}
 
 
 def telegram_retry_after_seconds(body: str, headers: Any = None, default: float = 3.0) -> float:
@@ -2885,6 +3401,18 @@ def assert_codex_egress_chat(token: str, chat_id: str | None) -> tuple[bool, str
     return True, expected
 
 
+def telegram_edit_error(payload: Any) -> str:
+    if not isinstance(payload, dict) or payload.get("ok") is not False or payload.get("error_code") != 400:
+        return ""
+    description = str(payload.get("description") or "")
+    unchanged = "Bad Request: message is not modified"
+    if description == unchanged or description.startswith(unchanged + ":"):
+        return "unchanged"
+    if description == "Bad Request: message to edit not found":
+        return "missing"
+    return ""
+
+
 class TelegramClient:
     def __init__(self, token: str, chat_id: str, emoji: str, chunk_size: int) -> None:
         self.token = token
@@ -2892,7 +3420,30 @@ class TelegramClient:
         self.chat_id = chat_id
         self.emoji = emoji
         self.chunk_size = chunk_size
+        self.flood_cooldown_until = 0.0
+        # In-memory confirmed-prefix for a failed multi-chunk send. Lost on restart.
+        self._answer_chunk_progress: dict[str, int] = {}
+        self._viewer_chunk_progress: dict[str, int] = {}
         self.codex_route_guard_active, self.codex_expected_chat_id = assert_codex_egress_chat(token, chat_id)
+
+    def note_flood_retry_after(self, seconds: float) -> None:
+        # Deadline keeps the full server retry_after (+ caller margin).
+        # Each sleep slice is capped separately; do not truncate this timestamp.
+        wait = max(0.0, float(seconds))
+        self.flood_cooldown_until = max(self.flood_cooldown_until, time.monotonic() + wait)
+
+    def outbound_retry_wait_seconds(self, now: float | None = None) -> float:
+        stamp = time.monotonic() if now is None else now
+        return max(0.0, self.flood_cooldown_until - stamp)
+
+    def clear_flood_cooldown(self) -> None:
+        self.flood_cooldown_until = 0.0
+
+    def _sleep_flood_slice(self, seconds: float) -> None:
+        slice_s = min(max(0.0, float(seconds)), TELEGRAM_FLOOD_WAIT_CAP_SECONDS)
+        if slice_s <= 0:
+            return
+        time.sleep(slice_s)
 
     def assert_outbound_chat(self, chat_id: Any) -> None:
         if self.codex_route_guard_active and chat_id is not None and str(chat_id) != self.codex_expected_chat_id:
@@ -2910,6 +3461,12 @@ class TelegramClient:
         **params: Any,
     ) -> dict[str, Any] | None:
         self.assert_outbound_chat(params.get("chat_id"))
+        if method in OUTBOUND_FLOOD_METHODS:
+            remaining = self.outbound_retry_wait_seconds()
+            if remaining > 0:
+                # New invocation: do not block getUpdates' thread. jsonl sleeps slices.
+                log("TGERR", f"{method} skipped during flood cooldown {remaining:.0f}s")
+                return None
         cutover_payload = mesh_cutover_call(method, params)
         fallback_legacy = bool(
             cutover_payload and cutover_payload.get("_mesh_cutover") == "fallback_legacy"
@@ -2925,6 +3482,13 @@ class TelegramClient:
         attempt = 0
         flood_waits = 0
         while True:
+            if method in OUTBOUND_FLOOD_METHODS:
+                remaining = self.outbound_retry_wait_seconds()
+                if remaining > 0:
+                    slice_s = min(remaining, TELEGRAM_FLOOD_WAIT_CAP_SECONDS)
+                    log("TGERR", f"{method} waiting {slice_s:.0f}s of {remaining:.0f}s flood cooldown")
+                    self._sleep_flood_slice(slice_s)
+                    continue
             try:
                 request = urllib.request.Request(url, data=data)
                 with urllib.request.urlopen(request, timeout=_request_timeout) as response:
@@ -2944,13 +3508,53 @@ class TelegramClient:
                 )
                 return payload if isinstance(payload, dict) else None
             except urllib.error.HTTPError as exc:
-                body = exc.read().decode("utf-8", errors="replace")
-                if exc.code == 429 and flood_waits < flood_budget:
-                    flood_waits += 1
-                    wait = min(telegram_retry_after_seconds(body, exc.headers) + 1.0, TELEGRAM_FLOOD_WAIT_CAP_SECONDS)
-                    log("TGERR", f"{method} 429 flood; waiting {wait:.0f}s ({flood_waits}/{flood_budget})")
-                    time.sleep(wait)
-                    continue
+                with exc:
+                    body = exc.read().decode("utf-8", errors="replace")
+                if method == "editMessageText" and exc.code == 400:
+                    try:
+                        edit_payload = json.loads(body)
+                    except (ValueError, TypeError):
+                        edit_payload = None
+                    edit_error = telegram_edit_error(edit_payload)
+                    if edit_error == "unchanged":
+                        # Telegram already has the requested content; no send occurred.
+                        mesh_ledger_record(method, params.get("chat_id"), params.get("text"),
+                                           result="suppressed", message_id=params.get("message_id"))
+                        return {"ok": True, "result": True}
+                    if edit_error == "missing":
+                        # Retain the explicit outcome so active cards can replace this ID.
+                        mesh_ledger_record(method, params.get("chat_id"), params.get("text"),
+                                           edit_payload, message_id=params.get("message_id"))
+                        return edit_payload
+                if exc.code == 429:
+                    wait = telegram_retry_after_seconds(body, exc.headers) + 1.0
+                    if method in OUTBOUND_FLOOD_METHODS:
+                        self.note_flood_retry_after(wait)
+                        if flood_waits < flood_budget:
+                            flood_waits += 1
+                            remaining = self.outbound_retry_wait_seconds()
+                            log(
+                                "TGERR",
+                                f"{method} 429 flood ({flood_waits}/{flood_budget}); "
+                                f"not-before {remaining:.0f}s",
+                            )
+                            continue
+                    elif flood_waits < flood_budget:
+                        # getUpdates: wait this call's retry_after only.
+                        # Do not set outbound cooldown or skip later polls.
+                        flood_waits += 1
+                        deadline = time.monotonic() + wait
+                        log(
+                            "TGERR",
+                            f"{method} 429 flood ({flood_waits}/{flood_budget}); "
+                            f"inbound wait {wait:.0f}s",
+                        )
+                        while True:
+                            left = deadline - time.monotonic()
+                            if left <= 0:
+                                break
+                            time.sleep(min(left, TELEGRAM_FLOOD_WAIT_CAP_SECONDS))
+                        continue
                 if 400 <= exc.code < 500:
                     # 4xx(flood 예산 소진 포함)는 재시도 무의미 — 즉시 단락.
                     log("TGERR", f"{method} failed: HTTP {exc.code} {body[:200]}")
@@ -3153,6 +3757,7 @@ class TelegramClient:
         raise RuntimeError(f"file download failed after 3 attempts: {last_err}")
 
     def with_emoji_prefix(self, text: str) -> str:
+        text = strip_memory_citation(text)
         original_text = text
         first_line = text.splitlines()[0].strip() if text.splitlines() else ""
         private_chat = is_private_chat_id(self.chat_id)
@@ -3195,6 +3800,14 @@ class TelegramClient:
         "_retry_delay": 0,
     }
 
+    def _send_progress_store(self, *, viewer: bool) -> dict[str, int]:
+        return self._viewer_chunk_progress if viewer else self._answer_chunk_progress
+
+    def _send_progress_key(self, text: str, *, viewer: bool) -> str:
+        kind = "viewer" if viewer else "answer"
+        digest = hashlib.sha256((text or "").encode("utf-8")).hexdigest()
+        return f"{kind}:{digest}"
+
     def send(
         self,
         text: str,
@@ -3202,9 +3815,16 @@ class TelegramClient:
         *,
         viewer: bool = False,
     ) -> bool:
+        text = strip_memory_citation(text)
+        if not text:
+            return True
         ok = True
-        sent_count = 0
         call_budget = dict(self.VIEWER_CALL_BUDGET) if viewer else {}
+        progress = self._send_progress_store(viewer=viewer)
+        progress_key = self._send_progress_key(text or "", viewer=viewer)
+        skip = int(progress.get(progress_key) or 0)
+        sent_count = skip
+        index = 0
         for segment in split_answer_for_code_blocks(text or "(empty response)"):
             body = str(segment.get("body") or "")
             if segment.get("code"):
@@ -3214,6 +3834,9 @@ class TelegramClient:
                 language = ""
                 chunks = self.chunks(body)
             for chunk in chunks:
+                if index < skip:
+                    index += 1
+                    continue
                 params: dict[str, Any] = {"chat_id": self.chat_id, "text": chunk}
                 if segment.get("code"):
                     params["entities"] = pre_entities_json(chunk, language)
@@ -3224,11 +3847,18 @@ class TelegramClient:
                     params["allow_sending_without_reply"] = "true"
                 payload = self.call("sendMessage", **call_budget, **params)
                 chunk_ok = bool(payload and payload.get("ok"))
+                if chunk_ok and isinstance(payload, dict):
+                    result = payload.get("result")
+                    if isinstance(result, dict) and isinstance(result.get("message_id"), int):
+                        log("SEND", f"Telegram sendMessage confirmed mid={result['message_id']}")
                 ok = ok and chunk_ok
-                if viewer and not chunk_ok:
-                    # 뷰어 발신은 첫 실패에서 즉시 포기 — 잔여 chunk 로 스레드를 더 잡지 않는다.
+                if not chunk_ok:
+                    # Keep confirmed prefix for this payload; in-memory only (lost on restart).
                     return False
+                progress[progress_key] = index + 1
                 sent_count += 1
+                index += 1
+        progress.pop(progress_key, None)
         return ok
 
     def send_update_button(self, text: str, callback_data: str) -> None:
@@ -3265,6 +3895,13 @@ class TelegramClient:
         return None
 
     def edit(self, message_id: int, text: str, *, viewer: bool = False) -> bool:
+        return self.edit_message_id(message_id, text, viewer=viewer) is not None
+
+    def edit_message_id(
+        self, message_id: int, text: str, *, viewer: bool = False,
+        replace_missing: bool = False,
+        reserve_replacement: Callable[[], bool] | None = None,
+    ) -> int | None:
         call_budget = dict(self.VIEWER_CALL_BUDGET) if viewer else {}
         payload = self.call(
             "editMessageText",
@@ -3273,7 +3910,13 @@ class TelegramClient:
             message_id=message_id,
             text=self.with_emoji_prefix(text),
         )
-        return bool(payload and payload.get("ok"))
+        if payload and (payload.get("ok") or telegram_edit_error(payload) == "unchanged"):
+            return message_id
+        if replace_missing and telegram_edit_error(payload) == "missing":
+            if reserve_replacement is not None and not reserve_replacement():
+                return None
+            return self.send_message_id(text, viewer=viewer)
+        return None
 
     def send_local_attachment(self, path: Path, max_bytes: int) -> bool:
         try:
@@ -3517,13 +4160,19 @@ class TmuxTransport:
         if not payload:
             return
         self.verify()
+        slash_command = is_codex_slash_command(payload)
+        # A nonempty composer replaces the side footer with typing hints, so
+        # detect the destination before paste-buffer changes that screen.
+        before = self.capture_screen(30) if not slash_command else ""
+        side_input = not slash_command and is_side_screen(before)
+        steer_input = side_input or (not slash_command and screen_has_repl_busy_marker(before))
         self.tmux("load-buffer", "-", input_text=payload)
         self.tmux("paste-buffer", "-p", "-t", self.config.pane_target)
-        # Codex TUI uses Tab as the submit/queue key while a turn is running.
-        # Repeated Enter can leave Telegram-origin text sitting in the composer.
-        slash_command = is_codex_slash_command(payload)
-        key = "Enter" if slash_command else self.config.submit_key
-        count = 1 if slash_command else self.config.enter_count if key == "Enter" else 1
+        # Enter steers the running turn at its next tool boundary. Tab waits
+        # for the whole turn, which can hide a status question for minutes.
+        # Submit once when steering; idle input keeps its configured key.
+        key = "Enter" if slash_command or steer_input else self.config.submit_key
+        count = 1 if slash_command or steer_input else self.config.enter_count if key == "Enter" else 1
         for _ in range(count):
             self.tmux("send-keys", "-t", self.config.pane_target, key)
             time.sleep(0.3)
@@ -3551,6 +4200,8 @@ class TmuxTransport:
             self._clear_composer_unlocked()
 
     def capture_screen(self, lines: int = 80) -> str:
+        # History + visible. -S -<n> starts n lines above the bottom (scrollback).
+        # Keep this argv for existing consumers; /clear confirmation must not use it.
         out = self.tmux(
             "capture-pane",
             "-p",
@@ -3562,8 +4213,67 @@ class TmuxTransport:
         )
         return out.stdout
 
+    def capture_visible_screen(self) -> str:
+        """Current pane visible area only. Omitting -S drops history/scrollback."""
+        out = self.tmux(
+            "capture-pane",
+            "-p",
+            "-J",
+            "-t",
+            self.config.pane_target,
+        )
+        return out.stdout
+
     # Compatibility aliases for external callers during the transport rename.
     capture_pane = capture_screen
+
+    def prepare_main_for_clear(self) -> str:
+        """Select the parent view without interrupting either conversation."""
+        def busy(screen: str) -> bool:
+            return bool(parse_approval_prompt(screen) or parse_choice_prompt(screen)) or screen_has_repl_busy_marker(screen) or any(
+                re.match(r"^• (?:Queued follow-up inputs|Messages to be submitted\b)", line)
+                or (line.startswith("• ") and "esc to interru" in line.lower())
+                for line in screen.splitlines())
+
+        def main_visible(screen: str) -> bool:
+            if not screen.strip() or is_side_screen(screen):
+                return False
+            tail = "\n".join(screen.rstrip().splitlines()[-8:])
+            return bool(re.search(r"\bMain\s*\[|ctrl\s*\+\s*/\s+for side", tail)
+                        or parse_codex_footer_status(screen))
+
+        def restore_side() -> None:
+            self.tmux("send-keys", "-t", self.config.pane_target, "C-/")
+            for _ in range(20):
+                time.sleep(0.1)
+                if is_side_screen(self.capture_screen(80)):
+                    return
+
+        with self.composer_lock():
+            before = self.capture_screen(80)
+            if not is_side_screen(before):
+                return "unconfirmed"
+            if busy(before):
+                return "busy"
+            self.tmux("send-keys", "-t", self.config.pane_target, "C-/")
+            observed_main = False
+            stable = 0
+            for _ in range(30):
+                time.sleep(0.1)
+                screen = self.capture_screen(80)
+                if not main_visible(screen):
+                    stable = 0
+                    continue
+                observed_main = True
+                if busy(screen):
+                    restore_side()
+                    return "busy"
+                stable += 1
+                if stable >= 2:
+                    return "ready"
+            if observed_main:
+                restore_side()
+            return "unconfirmed"
 
     @contextmanager
     def temporary_window_width(self, columns: int = STATUS_WIDE_CAPTURE_COLUMNS):
@@ -3673,6 +4383,11 @@ class TmuxTransport:
         if path:
             return path
         raise RuntimeError("could not find active Codex TUI session JSONL")
+
+    def session_file_for_reset(self) -> Path | None:
+        # Newest-on-disk is a watch fallback, not proof that this pane reset.
+        pid = self.pane_pid()
+        return session_file_from_descendants(pid)
 
 
 CONPTY_DESCRIPTOR_SCHEMA = 1
@@ -3914,6 +4629,10 @@ class ConPtyTransport:
         screen = response.get("screen", "")
         return screen if isinstance(screen, str) else ""
 
+    def capture_visible_screen(self) -> str:
+        # No tmux pane. /clear confirmation uses the host-bound session_file() path/ino.
+        return ""
+
     def send_key(self, key: str) -> None:
         normalized = key.strip()
         if not normalized:
@@ -3955,13 +4674,23 @@ def proc_ppid(pid: int) -> int | None:
 
 def descendants(root_pid: int) -> set[int]:
     ppids: dict[int, int] = {}
-    for entry in Path("/proc").iterdir():
-        if not entry.name.isdigit():
-            continue
-        pid = int(entry.name)
-        ppid = proc_ppid(pid)
-        if ppid is not None:
-            ppids[pid] = ppid
+    if Path("/proc").exists():
+        for entry in Path("/proc").iterdir():
+            if not entry.name.isdigit():
+                continue
+            pid = int(entry.name)
+            ppid = proc_ppid(pid)
+            if ppid is not None:
+                ppids[pid] = ppid
+    else:
+        proc = subprocess.run(
+            ["ps", "-axo", "pid=,ppid="], capture_output=True, text=True,
+            timeout=5, check=False,
+        )
+        for line in proc.stdout.splitlines():
+            fields = line.split()
+            if len(fields) == 2 and all(field.isdigit() for field in fields):
+                ppids[int(fields[0])] = int(fields[1])
 
     result = {root_pid}
     changed = True
@@ -3975,38 +4704,62 @@ def descendants(root_pid: int) -> set[int]:
 
 
 def session_file_from_descendants(root_pid: int) -> Path | None:
-    if not Path("/proc").exists():
-        return None
     candidates: list[Path] = []
-    for pid in descendants(root_pid):
-        fd_dir = Path(f"/proc/{pid}/fd")
-        try:
-            fds = list(fd_dir.iterdir())
-        except OSError:
-            continue
-        for fd in fds:
-            try:
-                target = os.readlink(fd)
-            except OSError:
-                continue
-            if "/.codex/sessions/" in target and target.endswith(".jsonl"):
-                candidates.append(Path(target))
+    try:
+        pids = descendants(root_pid)
+        if not Path("/proc").exists():
+            proc = subprocess.run(
+                ["lsof", "-a", "-p", ",".join(map(str, sorted(pids))), "-Fn"],
+                capture_output=True, text=True, timeout=5, check=False,
+            )
+            candidates.extend(
+                Path(line[1:]) for line in proc.stdout.splitlines()
+                if line.startswith("n") and "/.codex/sessions/" in line
+                and line.endswith(".jsonl")
+            )
+        else:
+            for pid in pids:
+                fd_dir = Path(f"/proc/{pid}/fd")
+                try:
+                    fds = list(fd_dir.iterdir())
+                except OSError:
+                    continue
+                for fd in fds:
+                    try:
+                        target = os.readlink(fd)
+                    except OSError:
+                        continue
+                    if "/.codex/sessions/" in target and target.endswith(".jsonl"):
+                        candidates.append(Path(target))
+    except (OSError, subprocess.SubprocessError):
+        return None
+    candidates = [path for path in candidates if is_root_codex_tui_session(path)]
     if not candidates:
         return None
     return max(candidates, key=lambda p: p.stat().st_mtime if p.exists() else 0)
 
 
+def is_root_codex_tui_session(path: Path) -> bool:
+    """Subagents share the TUI originator but must never own its Telegram mirror."""
+    try:
+        with path.open(encoding="utf-8") as handle:
+            record = json.loads(handle.readline())
+    except (OSError, json.JSONDecodeError):
+        return False
+    payload = record.get("payload") if isinstance(record.get("payload"), dict) else {}
+    source = payload.get("source")
+    return (
+        payload.get("originator") == "codex-tui"
+        and not (isinstance(source, dict) and "subagent" in source)
+        and payload.get("agent_path") in (None, "", "/root")
+    )
+
+
 def newest_codex_tui_session() -> Path | None:
     pattern = str(HOME / ".codex" / "sessions" / "*" / "*" / "*" / "rollout-*.jsonl")
     candidates = sorted((Path(p) for p in glob.glob(pattern)), key=lambda p: p.stat().st_mtime, reverse=True)
-    for path in candidates[:20]:
-        try:
-            first = path.open(encoding="utf-8").readline()
-            record = json.loads(first)
-        except (OSError, json.JSONDecodeError):
-            continue
-        payload = record.get("payload") if isinstance(record.get("payload"), dict) else {}
-        if payload.get("originator") == "codex-tui":
+    for path in candidates:
+        if is_root_codex_tui_session(path):
             return path
     return None
 
@@ -4393,6 +5146,17 @@ def repl_pane_activity_from_screen(screen: str, max_lines: int) -> str:
     lines = [
         line.strip() for line in clean_pane_lines(screen or "") if line.strip()
     ][-max_lines:]
+    update_picker_markers = (
+        "Update available!",
+        "Update now",
+        "Skip until next version",
+    )
+    if any(
+        marker.casefold() in cleaned.casefold()
+        for cleaned in lines
+        for marker in update_picker_markers
+    ):
+        return "interstitial"
     for cleaned in lines:
         if any(marker in cleaned for marker in CODEX_INTERRUPT_MARKERS):
             state = "interrupt"
@@ -4407,7 +5171,7 @@ def repl_pane_activity_from_screen(screen: str, max_lines: int) -> str:
             state = "alive"
             active_turn = True
         elif REPL_PROMPT_READY_RE.search(cleaned):
-            if not active_turn:
+            if not active_turn and state != "interrupt":
                 state = "idle"
         elif "clear to save" not in cleaned.lower() and REPL_BUSY_RE.search(cleaned):
             state = "alive"
@@ -4427,8 +5191,12 @@ def update_typing_watch_hits(
     marker_hits: int,
     capture_error_hits: int,
 ) -> tuple[bool, int, int]:
+    if signal == "interstitial":
+        return False, 0, 0
     if signal == "idle":
-        return True, 0, 0
+        # TUI becomes ready before the final JSONL record is flushed. Let that
+        # record finish the turn; idle is neither an interrupt nor a lost turn.
+        return False, 0, 0
     if signal == "interrupt":
         marker_hits += 1
         return marker_hits >= 2, marker_hits, 0
@@ -4809,12 +5577,43 @@ def extract_reasoning_summary(payload: dict[str, Any]) -> str:
     return "\n".join(parts).strip()
 
 
+def extract_response_user_message(payload: dict[str, Any]) -> str | None:
+    content = payload.get("content")
+    if not isinstance(content, list):
+        return None
+    metadata = payload.get("internal_chat_message_metadata_passthrough")
+    kinds = metadata.get("content_item_kinds") if isinstance(metadata, dict) else None
+    if isinstance(kinds, list) and kinds:
+        # Context injections also use role=user; only actual user input starts a turn.
+        is_user = [isinstance(kind, str) and kind.startswith("user.") for kind in kinds]
+        if len(kinds) == len(content):
+            content = [item for item, keep in zip(content, is_user) if keep]
+        elif not all(is_user):
+            return None
+    parts: list[str] = []
+    has_input = False
+    for item in content:
+        if not isinstance(item, dict):
+            continue
+        if item.get("type") == "input_text" and isinstance(item.get("text"), str):
+            parts.append(item["text"])
+            has_input = True
+        elif item.get("type") == "input_image":
+            has_input = True
+    return "\n".join(parts) if has_input else None
+
+
 def extract_event(record: dict[str, Any]) -> tuple[str, str] | None:
     kind = record.get("type")
     payload = record.get("payload") if isinstance(record.get("payload"), dict) else {}
 
     if kind == "event_msg":
         payload_type = payload.get("type")
+        if payload_type == "task_complete":
+            message = payload.get("last_agent_message")
+            if isinstance(message, str) and message.strip():
+                return "completion", message
+            return None
         if payload_type == "user_message":
             return "user", str(payload.get("message") or "")
         if payload_type == "agent_message":
@@ -4833,10 +5632,20 @@ def extract_event(record: dict[str, Any]) -> tuple[str, str] | None:
                 # the flow card shows ONE LINE PER TOOL CALL. (T-260628-43)
                 if is_copy_payload_message(message):
                     return "copy_payload", message
+                if message.strip():
+                    return "progress", message
                 return None
 
     if kind == "response_item":
         payload_type = payload.get("type")
+        if payload_type == "message" and payload.get("role") == "user":
+            text = extract_response_user_message(payload)
+            if text is None:
+                return None
+            # Older sessions lack typed metadata for injected context.
+            if text.strip().startswith(("<environment_context>", "# AGENTS.md instructions", "<turn_aborted>")):
+                return None
+            return "user", text.strip()
         if payload_type == "function_call":
             summary = function_call_flow_summary(payload)
             if summary:
@@ -4856,6 +5665,8 @@ def extract_event(record: dict[str, Any]) -> tuple[str, str] | None:
             if phase == "commentary":
                 if is_copy_payload_message(content):
                     return "copy_payload", content
+                if content.strip():
+                    return "progress", content
                 return None
     return None
 
@@ -4891,6 +5702,32 @@ class TelegramPrompt:
     message_id: int = 0
 
 
+def load_telegram_inbox(raw: Any) -> list[tuple[str, int]]:
+    items: list[tuple[str, int]] = []
+    if not isinstance(raw, list):
+        return items
+    for item in raw:
+        text = ""
+        mid = 0
+        if isinstance(item, dict):
+            text = normalize_prompt(str(item.get("text") or ""))
+            try:
+                mid = int(item.get("message_id") or 0)
+            except (TypeError, ValueError):
+                mid = 0
+        elif isinstance(item, (list, tuple)) and len(item) >= 2:
+            text = normalize_prompt(str(item[0] or ""))
+            try:
+                mid = int(item[1] or 0)
+            except (TypeError, ValueError):
+                mid = 0
+        elif isinstance(item, str):
+            text = normalize_prompt(item)
+        if text:
+            items.append((text, mid))
+    return items[-20:]
+
+
 # C3 (T-260705-72): 발송 실패한 승인/선택 카드 재발송 간격. approval_loop 은 1s tick 이라
 # 매 tick 재발송하면 flood 를 악화시킨다 — 실패 카드만 이 간격으로 재시도.
 PROMPT_CARD_RESEND_SECONDS = 15.0
@@ -4920,7 +5757,8 @@ class Bridge:
         self.config = config
         self.telegram = telegram
         self.repl = repl
-        self.lock = threading.Lock()
+        self.lock = threading.RLock()
+        self.flow_lock = threading.RLock()
         self.exec_lock = threading.Lock()
         self.typing_lock = threading.Lock()
         self.long_running_progress_lock = threading.Lock()
@@ -4931,11 +5769,24 @@ class Bridge:
         self.choice_lock = threading.Lock()
         self.repl_typing_stop: threading.Event | None = None
         self.long_running_progress_stop: threading.Event | None = None
+        # A persisted active prompt may survive a hard bridge restart. Progress
+        # is armed only by a Telegram prompt observed in this process, so
+        # liveness recovery cannot resurrect a pre-restart reporting loop.
+        self.long_running_progress_armed = False
         self.telegram_fallback_stop: threading.Event | None = None
         self.native_recovery_pending = False
         self.native_recovery_retry_at = 0.0
         self.last_poll_heartbeat_at = 0.0
-        self.pending_telegram: list[str] = []
+        self.pending_telegram: list[tuple[str, int]] = []
+        self.last_user_event: tuple[Any, ...] | None = None
+        self.last_user_pair_sources: set[str] = set()
+        # In-flight turn keeps its originating Telegram message_id. Later
+        # inbound while that turn is open is queued and bound only when its
+        # JSONL user event starts. Overwriting the slot attaches the old
+        # final to the new question (T-260908-048). Each inbound keeps its
+        # own message_id even when the text is identical.
+        self.queued_telegram: list[tuple[str, int]] = []
+        self.followup_reply_message_id = 0
         self.pending_approval: ApprovalPrompt | None = None
         self.pending_approval_message_id: int | None = None
         self.pending_approval_send_attempt_at = 0.0
@@ -4949,12 +5800,30 @@ class Bridge:
         self.current_flow_scope = ""
         self.last_repl_activity_at = 0.0
         self.suppress_until_user = False
+        self.last_midreport_progress = ""
+        self.last_midreport_slot = ""
+        self.pending_midreport_slot = ""
+        self.last_midreport_note = ""
+        self.last_midreport_note_at = 0.0
+        self.midreport_prompt = ""
+        # A stale startup prompt is not live work by itself. Keep its identity
+        # only in memory so a fresh public event from that exact session can
+        # reconnect the timer without making the old state durable again.
+        self.midreport_recovery_prompt = ""
+        self.midreport_recovery_message_id = 0
+        self.midreport_recovery_session: tuple[str, int, int] | None = None
+        self.midreport_lock = threading.Lock()
+        self.now_fn = time.time
         self.needs_composer_clear = False
+        self.pending_interrupt_notice: dict[str, Any] | None = None
         self.pending_reasoning_mirror: tuple[str, str] | None = None
         self.active_telegram_prompt = ""
         self.active_telegram_prompt_started_at = 0.0
         self.active_telegram_message_id = 0
         self.flow_message_id = 0
+        self.flow_generation = 0
+        self.flow_closing = False
+        self.flow_replacement_attempted_for = 0
         self.flow_body = ""
         self.flow_scope = ""
         self.flow_screen_snapshot: list[str] = []
@@ -4970,19 +5839,32 @@ class Bridge:
         # 찍히지 않는다(<=0 이면 예산 대기를 건너뛰는 계약). 여기에 하트비트 기준을 얹으면
         # 그 계약을 건드리게 되므로 별도 필드를 둔다. reset_flow_card 가 함께 비운다.
         self.flow_last_render_at = 0.0
+        self.flow_started_at = 0.0
+        self.flow_verify_line = ""
         self.flow_heartbeat_ticks = 0
         self.flow_heartbeat_failures = 0
         self.last_public_progress: str = ""
         self.telegram_fallback_sent = False
         self.session_path: Path | None = None
         self.session_identity: SessionIdentity | None = None
+        self.pending_clear_watch: dict[str, Any] | None = None
+        self._completed_clear_key: tuple[str, int, int] | None = None
+        self._clear_complete_claimed = False
         self.bridge_state: dict[str, Any] | None = None
         self.session_pos = 0
         self.pid_handle = None
         self.pid_lock_acquired = False
+        self.fast_mode_state: str | None = None
+        self.fast_mode_identity = ""
+        self._fast_observe_pending: tuple[str, str] | None = None
+        self._fast_observe_pending_count = 0
+        self.fast_mode_lock = threading.Lock()
         # ⚙️ A2 받은-지시 신호 tail 오프셋 (T-260630-22). None=미초기화 → 첫 poll 에서
         # 파일 END 로 seek(기존 엔트리 skip, 새 append 만 카드화).
         self.directive_signal_pos: int | None = None
+        self.side_reply_mirror: SideReplyMirror | None = None
+        self.side_reply_lock = threading.RLock()
+        self.last_side_poll_at = 0.0
 
     def acquire_lock(self) -> None:
         # flock 기반 락 — 프로세스 사망 시 커널이 자동 해제하고 PID 재사용에 면역.
@@ -5026,19 +5908,119 @@ class Bridge:
             self.pid_handle = None
         self.pid_lock_acquired = False
 
-    def add_pending_telegram(self, prompt: str) -> None:
+    def add_pending_telegram(self, prompt: str, message_id: int | None = None) -> None:
+        text = normalize_prompt(prompt)
+        if not text:
+            return
+        mid = int(message_id or 0)
         with self.lock:
-            self.pending_telegram.append(normalize_prompt(prompt))
+            self.pending_telegram.append((text, mid))
             self.pending_telegram = self.pending_telegram[-20:]
+        self.persist_telegram_inbox()
 
-    def consume_pending_match(self, prompt: str) -> bool:
+    def consume_pending_match(self, prompt: str) -> int | None:
         normalized = normalize_prompt(prompt)
+        if not normalized:
+            return None
         with self.lock:
-            for index, item in enumerate(self.pending_telegram):
-                if item == normalized:
-                    del self.pending_telegram[index]
-                    return True
-        return False
+            if not self.pending_telegram:
+                return None
+            text, message_id = self.pending_telegram[0]
+            if text != normalized:
+                return None
+            del self.pending_telegram[0]
+            matched = int(message_id or 0)
+        self.persist_telegram_inbox()
+        return matched
+
+    def telegram_turn_inflight(self) -> bool:
+        with self.lock:
+            return (
+                self.current_origin == "telegram"
+                and self.active_telegram_message_id > 0
+                and not self.suppress_until_user
+                and bool(self.active_telegram_prompt)
+            )
+
+    def should_queue_telegram_inbound(self) -> bool:
+        with self.lock:
+            queued = bool(self.queued_telegram)
+        return self.telegram_turn_inflight() or queued
+
+    def queue_telegram_prompt(self, prompt: str, message_id: int | None = None) -> None:
+        text = normalize_prompt(prompt)
+        if not text:
+            return
+        mid = int(message_id or 0)
+        with self.lock:
+            self.queued_telegram.append((text, mid))
+            self.queued_telegram = self.queued_telegram[-20:]
+        self.persist_telegram_inbox()
+        log("TG", f"queued telegram prompt while turn inflight mid={mid}")
+
+    def unqueue_telegram_prompt(self, prompt: str, message_id: int | None = None) -> bool:
+        text = normalize_prompt(prompt)
+        mid = int(message_id or 0)
+        with self.lock:
+            for index in range(len(self.queued_telegram) - 1, -1, -1):
+                item_text, item_mid = self.queued_telegram[index]
+                if item_text == text and int(item_mid or 0) == mid:
+                    del self.queued_telegram[index]
+                    removed = True
+                    break
+            else:
+                removed = False
+        if removed:
+            self.persist_telegram_inbox()
+        return removed
+
+    def consume_queued_telegram(self, prompt: str) -> int | None:
+        # Prefer FIFO for identical inputs. A unique confirmed echo may pass
+        # stale, different-text entries; never guess between later duplicates.
+        normalized = normalize_prompt(prompt)
+        if not normalized:
+            return None
+        with self.lock:
+            if not self.queued_telegram:
+                return None
+            index = 0
+            if self.queued_telegram[0][0] != normalized:
+                matches = [i for i, (text, _mid) in enumerate(self.queued_telegram) if text == normalized]
+                if len(matches) != 1:
+                    return None
+                index = matches[0]
+            _text, message_id = self.queued_telegram.pop(index)
+            matched = int(message_id or 0)
+        self.persist_telegram_inbox()
+        return matched
+
+    def consume_queued_skip_stale_prefix(self, prompt: str) -> int | None:
+        """Attach-only: consume a UNIQUE queued text match, skipping other texts.
+
+        Stale different-text heads must not block the current injected request.
+        Two or more same-body copies cannot identify which mid produced the
+        latest user event, so every matching ID stays untouched
+        (T-260911-002 r26). Exact pending/active mids are bound separately.
+        """
+        normalized = normalize_prompt(prompt)
+        if not normalized:
+            return None
+        with self.lock:
+            if not self.queued_telegram:
+                return None
+            matches = [
+                index
+                for index, (text, _message_id) in enumerate(self.queued_telegram)
+                if text == normalized
+            ]
+            if len(matches) != 1:
+                return None
+            index = matches[0]
+            _text, message_id = self.queued_telegram[index]
+            del self.queued_telegram[index]
+            matched = int(message_id or 0)
+        self.persist_telegram_inbox()
+        return matched
 
     def active_telegram_prompt_matches(self, prompt: str) -> bool:
         normalized = normalize_prompt(prompt)
@@ -5112,27 +6094,52 @@ class Bridge:
         return emitted
 
     def handle_user_event(self, text: str) -> None:
+        self.clear_midreport_recovery_candidate()
         self.mark_repl_activity()
         self.suppress_until_user = False
+        self.pending_interrupt_notice = None
         self.pending_reasoning_mirror = None
-        self.reset_flow_card()
+        self.close_flow_card("context_changed")
         self.current_flow_scope = normalize_prompt(text)
         self.prime_flow_screen_snapshot()
-        if self.consume_pending_match(text):
+        pending_mid = self.consume_pending_match(text)
+        if pending_mid is not None:
             self.current_origin = "telegram"
+            if pending_mid > 0 and self.active_telegram_message_id <= 0:
+                self.set_active_telegram_prompt(text, time.time(), pending_mid)
             log("JSONL", "matched Telegram-origin prompt")
             self.begin_repl_typing()
-        elif self.active_telegram_prompt_matches(text):
+            return
+        queued_mid = self.consume_queued_telegram(text)
+        if queued_mid is not None:
+            log("JSONL", f"matched queued Telegram-origin prompt mid={queued_mid}")
+            self.begin_telegram_prompt_tracking(
+                text,
+                message_id=queued_mid,
+                expect_jsonl_echo=False,
+            )
+            self.begin_repl_typing()
+            return
+        if self.active_telegram_message_id > 0 and self.active_telegram_prompt_matches(text):
             self.current_origin = "telegram"
             log("JSONL", "matched active Telegram-origin prompt")
             self.emit_received_telegram_directive_card(text)
             self.begin_repl_typing()
-        else:
-            self.current_origin = "terminal"
-            self.stop_telegram_fallback()
-            self.emit_sent_directive_card(text)
-            log("JSONL", "terminal-origin prompt")
-            self.begin_repl_typing()
+            return
+        self.current_origin = "terminal"
+        self.stop_telegram_fallback()
+        self.clear_active_telegram_prompt()
+        self.emit_sent_directive_card(text)
+        log("JSONL", "terminal-origin prompt")
+        self.begin_repl_typing()
+        with self.midreport_lock:
+            with self.lock:
+                self.long_running_progress_armed = True
+                self.last_midreport_note = ""
+                self.last_midreport_progress = ""
+                self.pending_midreport_slot = ""
+                self.midreport_prompt = normalize_prompt(text)
+        self.start_long_running_progress(text)
 
     def emit_sent_directive_card(self, text: str) -> None:
         if self.config.bridge_kill:
@@ -5177,6 +6184,7 @@ class Bridge:
         self.pending_reasoning_mirror = (message, key)
 
     def handle_flow_event(self, text: str, key: str, source: str = "jsonl") -> None:
+        generation = self.flow_generation
         if is_copy_payload_message(text):
             self.handle_copy_payload_event(text)
             return
@@ -5200,15 +6208,22 @@ class Bridge:
         # Collapse each flow event to a single short line (claude parity).
         # Full narration was overflowing FLOW_MIRROR_LIMIT after 1-2 steps and
         # spilling into multiple long messages instead of one growing card.
-        summary = flow_step_summary(text)
+        summary = user_visible_flow_line(flow_step_summary(text))
         if not summary:
             return
         if self.config.bridge_kill:
             log("SEND", "flow mirror blocked by CRB_KILL=1")
             return
 
+        with self.flow_lock:
+            if self.flow_generation != generation or self.flow_closing:
+                return
+            self._update_flow_card(scope, summary, dedup_key)
+
+    def _update_flow_card(self, scope: str, summary: str, dedup_key: str) -> None:
+        """Called with flow_lock held, including any replacement send and ID save."""
         if self.flow_scope != scope:
-            self.reset_flow_card()
+            self.close_flow_card("context_changed")
             self.flow_scope = scope
 
         # Sliding window: keep only the last FLOW_MIRROR_WINDOW step lines in ONE
@@ -5216,37 +6231,45 @@ class Bridge:
         # message — old steps scroll off instead of spawning multiple long cards.
         prior_lines = self.flow_body.split("\n") if self.flow_body else []
         candidate = "\n".join((prior_lines + [summary])[-FLOW_MIRROR_WINDOW:])
+        generation = self.flow_generation
+        previous_id = self.flow_message_id
         if not self.flow_message_id:
             message_id = self.telegram.send_message_id(
-                format_flow_mirror(
-                    candidate,
-                    node=str(getattr(self.config, "node", "")),
-                    emoji=str(getattr(self.config, "emoji", "")),
-                    context=scope,
-                ),
+                self.render_flow_card(candidate),
                 viewer=True,
             )
             if not message_id:
                 log("SEND", "flow mirror failed")
                 return
+            if self.flow_generation != generation:
+                return
             self.flow_body = candidate
             self.flow_message_id = message_id
-            self.flow_last_render_at = time.monotonic()  # T-260727-104 하트비트 기준점
+            now_mono = time.monotonic()
+            self.flow_last_render_at = now_mono  # T-260727-104 하트비트 기준점
+            if self.flow_started_at <= 0:
+                self.flow_started_at = now_mono
             log("SEND", f"sent flow mirror mid={message_id}")
         else:
             self.wait_for_flow_edit_budget()
-            if not self.telegram.edit(
-                self.flow_message_id,
-                format_flow_mirror(
-                    candidate,
-                    node=str(getattr(self.config, "node", "")),
-                    emoji=str(getattr(self.config, "emoji", "")),
-                    context=scope,
-                ),
+            if self.flow_generation != generation or self.flow_message_id != previous_id:
+                return
+            rendered = self.render_flow_card(candidate)
+            if self.flow_generation != generation or self.flow_message_id != previous_id:
+                return
+            message_id = self.telegram.edit_message_id(
+                previous_id,
+                rendered,
                 viewer=True,
-            ):
+                replace_missing=True,
+                reserve_replacement=lambda: self._reserve_flow_replacement(previous_id, generation),
+            )
+            if self.flow_generation != generation or self.flow_message_id != previous_id:
+                return
+            if not message_id:
                 log("SEND", "flow mirror edit failed")
                 return
+            self.flow_message_id = message_id
             self.flow_body = candidate
             self.flow_last_edit_at = time.monotonic()
             self.flow_last_render_at = self.flow_last_edit_at  # T-260727-104 하트비트 기준점
@@ -5258,26 +6281,164 @@ class Bridge:
         self.handle_flow_event(text, dedup_key)
         return True
 
+    def handle_public_progress(self, text: str) -> None:
+        summary = format_progress_summary(text, 220)
+        if not summary:
+            return
+        resumed_prompt = ""
+        with self.midreport_lock:
+            with self.lock:
+                identity = self.session_identity
+                recovery_session = self.midreport_recovery_session
+                if (
+                    identity is not None
+                    and recovery_session
+                    == (identity.path, int(identity.dev), int(identity.ino))
+                    and self.midreport_recovery_prompt
+                    and not self.active_telegram_prompt
+                ):
+                    resumed_prompt = self.midreport_recovery_prompt
+                    self.active_telegram_prompt = resumed_prompt
+                    self.active_telegram_prompt_started_at = time.time()
+                    self.active_telegram_message_id = self.midreport_recovery_message_id
+                    if self.bridge_state is not None:
+                        self.bridge_state["active_telegram_prompt"] = resumed_prompt
+                        self.bridge_state["active_telegram_prompt_started_at"] = (
+                            self.active_telegram_prompt_started_at
+                        )
+                        if self.active_telegram_message_id > 0:
+                            self.bridge_state["active_telegram_message_id"] = (
+                                self.active_telegram_message_id
+                            )
+                    self.current_origin = "telegram"
+                    self.midreport_prompt = resumed_prompt
+                    self.long_running_progress_armed = True
+                self.midreport_recovery_prompt = ""
+                self.midreport_recovery_message_id = 0
+                self.midreport_recovery_session = None
+                self.last_midreport_note = summary
+                self.last_midreport_note_at = float(self.now_fn())
+                self.last_public_progress = summary
+        if resumed_prompt:
+            self.start_long_running_progress(resumed_prompt)
+
+    def render_flow_card(
+        self,
+        body: str,
+        *,
+        done_label: str = "",
+        elapsed_text: str = "",
+        now: datetime | None = None,
+    ) -> str:
+        return format_flow_mirror(
+            body,
+            node=str(getattr(self.config, "node", "")),
+            emoji=str(getattr(self.config, "emoji", "")),
+            context=self.flow_scope or self.active_telegram_prompt,
+            now=now,
+            done_label=done_label,
+            elapsed_text=elapsed_text,
+            verify_line=getattr(self, "flow_verify_line", "") or "",
+        )
+
+    def close_flow_card(self, status: str) -> None:
+        """Stamp turn-end footer on the live card, then drop it. Does not claim the user goal is done."""
+        with self.flow_lock:
+            self._finish_flow_card(status)
+
+    def _finish_flow_card(self, status: str) -> None:
+        mid = self.flow_message_id
+        body = self.flow_body
+        started = self.flow_started_at
+        if not mid or not body:
+            self.reset_flow_card()
+            return
+        self.flow_closing = True
+        self.flow_generation += 1
+        try:
+            elapsed = format_flow_elapsed(time.monotonic() - started) if started > 0 else ""
+            rendered = self.render_flow_card(
+                body,
+                done_label=flow_done_label(status),
+                elapsed_text=elapsed,
+            )
+            if rendered:
+                edited = self.telegram.edit(mid, rendered, viewer=True)
+                log("FLOW", f"close mid={mid} status={status} edited={bool(edited)}")
+        except Exception as exc:  # noqa: BLE001
+            log("SEND", f"flow close edit failed (non-fatal): {exc}")
+        finally:
+            self.reset_flow_card()
+
     def reset_flow_card(self) -> None:
+        with self.flow_lock:
+            self._clear_flow_card_state()
+
+    def _clear_flow_card_state(self) -> None:
+        self.flow_generation += 1
+        self.flow_closing = False
         self.flow_message_id = 0
+        self.flow_replacement_attempted_for = 0
         self.flow_body = ""
         self.flow_scope = ""
         self.flow_last_edit_at = 0.0
         # T-260727-104: 하트비트 정지 지점. 이 메서드는 턴 종료(:최종답 발송)·새 user 이벤트·
         # scope 전환에서 불리므로, 여기서 비우면 하트비트가 턴보다 오래 살 수 없다.
         self.flow_last_render_at = 0.0
+        self.flow_started_at = 0.0
+        self.flow_verify_line = ""
         self.flow_heartbeat_ticks = 0
         self.flow_heartbeat_failures = 0
         # persisted across restart (anti-fragmentation): clear the saved card id too, so a
         # restart right after reset starts a fresh card instead of resuming a stale one.
         self.persist_state()
 
+    def maybe_send_followup_reply(self, text: str) -> bool:
+        """Deliver the first public answer to a confirmed follow-up, keeping work open."""
+        with self.lock:
+            message_id = self.followup_reply_message_id
+            if not message_id or message_id != self.active_telegram_message_id:
+                return True
+        if not text.strip() or self.config.bridge_kill:
+            return True
+        try:
+            if not self.telegram.send(text.strip(), reply_to_message_id=message_id):
+                return False
+        except Exception as exc:  # noqa: BLE001
+            log("SEND", f"follow-up reply failed mid={message_id}: {exc}")
+            return False
+        with self.lock:
+            if self.followup_reply_message_id == message_id:
+                self.followup_reply_message_id = 0
+        self.persist_state()
+        log("SEND", f"public follow-up reply sent mid={message_id}")
+        return True
+
+    def _reserve_flow_replacement(self, message_id: int, generation: int) -> bool:
+        with self.flow_lock:
+            if (
+                self.flow_closing
+                or self.flow_generation != generation
+                or self.flow_message_id != message_id
+                or self.flow_replacement_attempted_for == message_id
+            ):
+                return False
+            # A timed-out send may already have arrived. Save the attempt before
+            # sending so the next event, heartbeat or restart cannot duplicate it.
+            self.flow_replacement_attempted_for = message_id
+            self.persist_state()
+            return True
+
     def maybe_heartbeat_flow_card(self, now: float | None = None) -> bool:
+        with self.flow_lock:
+            return self._heartbeat_flow_card(now)
+
+    def _heartbeat_flow_card(self, now: float | None = None) -> bool:
         """침묵 구간에서 ⚙️ 카드를 주기 재렌더해 '갱신' 시각을 전진시킨다 (T-260727-104).
 
         claude 브릿지 T-260727-076 의 쌍둥이. 정지 보장 방식만 다르다 —
         claude 는 ActiveTurn.flow_closed 를 보고, 여기서는 **카드의 존재 자체**를 본다:
-        codex 는 턴 종료에 완료 라벨을 덧씌우지 않고 reset_flow_card() 로 카드를 놓아버리므로
+        턴 종료는 close_flow_card() 가 footer 를 찍은 뒤 reset_flow_card() 로 카드를 놓는다.
         `flow_message_id != 0` 이 곧 '턴 진행중' 이다. reset 이 그 값을 0 으로 만드는 순간
         하트비트도 멎으므로, 독립 타이머 없이 구조적으로 턴보다 오래 살 수 없다.
 
@@ -5291,7 +6452,7 @@ class Bridge:
         if getattr(self.config, "bridge_kill", False):
             return False
         # 정지 조건 — 카드 없음(= 턴 없음/미러 OFF/이벤트 0) 이면 그 자리에서 끝.
-        if not self.flow_message_id or not self.flow_body:
+        if self.flow_closing or not self.flow_message_id or not self.flow_body:
             return False
         if self.flow_heartbeat_failures >= FLOW_HEARTBEAT_MAX_FAILURES:
             return False
@@ -5303,22 +6464,24 @@ class Bridge:
         if last <= 0 or (now - last) < FLOW_HEARTBEAT_SECONDS:
             return False
         mid = self.flow_message_id
+        generation = self.flow_generation
         try:
-            body = format_flow_mirror(
-                self.flow_body,
-                node=str(getattr(self.config, "node", "")),
-                emoji=str(getattr(self.config, "emoji", "")),
-                context=self.flow_scope,
-            )
+            body = self.render_flow_card(self.flow_body)
             if not body:
                 return False
             # edit 직전 재확인 — 렌더 준비 중 턴이 끝나 카드가 리셋됐을 수 있다.
-            if self.flow_message_id != mid:
+            if self.flow_generation != generation or self.flow_message_id != mid:
                 return False
-            ok = self.telegram.edit(mid, body, viewer=True)
+            edited_id = self.telegram.edit_message_id(
+                mid, body, viewer=True, replace_missing=True,
+                reserve_replacement=lambda: self._reserve_flow_replacement(mid, generation),
+            )
+            ok = edited_id is not None
         except Exception as exc:  # noqa: BLE001
             ok = False
             log("SEND", f"flow heartbeat edit raised (non-fatal): {exc}")
+        if self.flow_generation != generation or self.flow_message_id != mid:
+            return False
         if not ok:
             self.flow_heartbeat_failures += 1
             # 실패해도 기준점을 전진시킨다 — 안 그러면 0.5초 tick 마다 재시도해 429 를 키운다.
@@ -5332,9 +6495,12 @@ class Bridge:
         self.flow_heartbeat_failures = 0
         self.flow_heartbeat_ticks += 1
         self.flow_last_render_at = now
+        if edited_id != mid:
+            self.flow_message_id = edited_id
+            self.persist_state()
         log(
             "SEND",
-            f"flow heartbeat mid={mid} tick={self.flow_heartbeat_ticks}/{FLOW_HEARTBEAT_MAX_TICKS}",
+            f"flow heartbeat mid={self.flow_message_id} tick={self.flow_heartbeat_ticks}/{FLOW_HEARTBEAT_MAX_TICKS}",
         )
         return True
 
@@ -5398,7 +6564,7 @@ class Bridge:
         if not answer:
             return True
         origin = self.current_origin or "terminal"
-        log("SEND", f"Telegram mirror from {origin}")
+        log("SEND", f"Telegram mirror attempt from {origin}")
         if is_copy_payload_message(answer):
             self.pending_reasoning_mirror = None
             if not self.handle_copy_payload_event(answer):
@@ -5409,19 +6575,25 @@ class Bridge:
             # 런타임이 준 공개 reasoning summary 만 전송 — send_pending_reasoning_mirror
             # 이 reasoning_mirror 토글·dedup·non-fatal 을 그대로 적용. (T-260628-38)
             if not self.send_answer(answer):
+                log("SEND", f"Telegram mirror failed from {origin}; retaining JSONL cursor")
                 return False
             self.send_pending_reasoning_mirror()
+        # Transport may intentionally suppress a mesh delivery. Actual Telegram
+        # receipts are logged by TelegramClient.send, not inferred from this bool.
+        log("SEND", f"Telegram mirror handled from {origin}")
         self.resolve_midreport_obligation("complete", "final answer sent")
         if self.request_incomplete_copy_payload_pair_repair_if_needed():
             return True
         self.warn_incomplete_copy_payload_pair_if_needed()
         self.clear_active_telegram_prompt()
-        self.reset_flow_card()
+        self.close_flow_card("sent")
         self.mark_repl_turn_finished()
         return True
 
     def mark_repl_turn_finished(self) -> None:
         with self.lock:
+            self.last_user_event = None
+            self.last_user_pair_sources = set()
             self.current_origin = None
             self.current_flow_scope = ""
             self.flow_screen_snapshot = []
@@ -5440,10 +6612,13 @@ class Bridge:
 
     def finish_duplicate_final_turn(self) -> None:
         self.clear_active_telegram_prompt()
-        self.reset_flow_card()
+        self.close_flow_card("sent")
         self.mark_repl_turn_finished()
 
     def send_answer(self, answer: str) -> bool:
+        answer = strip_memory_citation(answer)
+        if not answer:
+            return True
         if self.config.bridge_kill:
             log("SEND", "blocked by CRB_KILL=1")
             mesh_ledger_record("sendMessage", self.config.chat_id, answer, result="suppressed")
@@ -5560,6 +6735,11 @@ class Bridge:
                 )
         return True
 
+    def persist_telegram_inbox(self) -> None:
+        if self.session_identity is None:
+            return
+        self.persist_state()
+
     def persist_state(self, offset: int | None = None, event_key: str | None = None) -> None:
         identity = self.session_identity
         if identity is None:
@@ -5571,10 +6751,50 @@ class Bridge:
         # persisted across restart (anti-fragmentation): keep the ⚙️ flow card identity
         # so a daemon restart resumes edit-in-place instead of spawning a new card per step.
         state["flow_message_id"] = self.flow_message_id
+        state["flow_replacement_attempted_for"] = self.flow_replacement_attempted_for
         state["flow_body"] = self.flow_body
         state["flow_scope"] = self.flow_scope
-        if self.active_telegram_message_id > 0:
-            state["active_telegram_message_id"] = self.active_telegram_message_id
+        with self.lock:
+            queued = list(self.queued_telegram)
+            pending = list(self.pending_telegram)
+            active_mid = self.active_telegram_message_id
+            state["followup_reply_message_id"] = self.followup_reply_message_id
+        state["queued_telegram"] = [
+            {"text": text, "message_id": int(message_id)} for text, message_id in queued
+        ]
+        state["pending_telegram"] = [
+            {"text": text, "message_id": int(message_id)} for text, message_id in pending
+        ]
+        if active_mid > 0:
+            state["active_telegram_message_id"] = active_mid
+        else:
+            state.pop("active_telegram_message_id", None)
+        if self.fast_mode_state in FAST_MODE_NOTICE and identity is not None:
+            state["fast_mode"] = {
+                "state": self.fast_mode_state,
+                "model_identity": self.fast_mode_identity,
+                "session_path": identity.path,
+                "dev": identity.dev,
+                "ino": identity.ino,
+            }
+        else:
+            state.pop("fast_mode", None)
+        if self.pending_clear_watch:
+            state["pending_clear_watch"] = dict(self.pending_clear_watch)
+        else:
+            state.pop("pending_clear_watch", None)
+        state["midreport"] = {
+            "slot": self.last_midreport_slot,
+            "pending_slot": self.pending_midreport_slot,
+            "note": self.last_midreport_note,
+            "note_at": self.last_midreport_note_at,
+            "prompt": self.midreport_prompt,
+            "origin": str(self.current_origin or ""),
+            "armed": bool(self.long_running_progress_armed),
+            "session_path": identity.path,
+            "dev": identity.dev,
+            "ino": identity.ino,
+        }
         if offset is not None:
             state["offset"] = offset
         if event_key:
@@ -5704,6 +6924,13 @@ class Bridge:
             record = json.loads(line)
         except json.JSONDecodeError:
             return True
+        payload = record.get("payload") if isinstance(record.get("payload"), dict) else {}
+        if record.get("type") == "event_msg" and payload.get("type") == "task_started":
+            if self.bridge_state is not None:
+                self.bridge_state["active_turn"] = {
+                    "id": str(payload.get("turn_id") or ""),
+                    "session_path": str(self.session_path or ""),
+                }
         event = extract_event(record)
         if not event:
             if line_end is not None:
@@ -5711,6 +6938,29 @@ class Bridge:
             return True
         kind, text = event
         if kind == "user":
+            # Some CLI versions emit both representations of the same input.
+            # Do not reset the flow card or consume the Telegram match twice.
+            source = str(record.get("type") or "")
+            timestamp = parse_event_timestamp(record)
+            record_id = jsonl_user_record_id(record)
+            previous = getattr(self, "last_user_event", None)
+            pair_sources = getattr(self, "last_user_pair_sources", set())
+            duplicate = jsonl_user_pair_duplicate(
+                previous,
+                pair_sources,
+                text,
+                source,
+                timestamp,
+                record_id,
+            )
+            self.last_user_event = (text, source, timestamp, record_id)
+            if duplicate:
+                pair_sources.add(source)
+                self.last_user_pair_sources = pair_sources
+                if line_end is not None:
+                    self.persist_state(line_end)
+                return True
+            self.last_user_pair_sources = {source} if source else set()
             self.handle_user_event(text)
             if line_end is not None:
                 self.persist_state(line_end)
@@ -5718,6 +6968,13 @@ class Bridge:
         elif kind == "reasoning":
             key = event_dedup_key(record, kind, text)
             self.handle_reasoning_event(text, key)
+            if line_end is not None:
+                self.persist_state(line_end)
+            return True
+        elif kind == "progress":
+            self.handle_public_progress(text)
+            if not self.maybe_send_followup_reply(text):
+                return False
             if line_end is not None:
                 self.persist_state(line_end)
             return True
@@ -5739,7 +6996,23 @@ class Bridge:
             if line_end is not None:
                 self.persist_state(line_end, key)
             return True
-        elif kind == "assistant":
+        elif kind in {"assistant", "completion"}:
+            active_turn = (self.bridge_state or {}).get("active_turn") or {}
+            turn_id = ""
+            if active_turn.get("session_path") == str(self.session_path or ""):
+                turn_id = str(active_turn.get("id") or "")
+            if kind == "completion":
+                completed_id = str(payload.get("turn_id") or "")
+                if turn_id and completed_id and completed_id != turn_id:
+                    if line_end is not None:
+                        self.persist_state(line_end)
+                    return True
+                turn_id = completed_id or turn_id
+            delivery_key = final_delivery_key(str(self.session_path or ""), turn_id, text)
+            if delivery_key and self.bridge_state and ring_contains(self.bridge_state, delivery_key):
+                if line_end is not None:
+                    self.persist_state(line_end)
+                return True
             key = event_dedup_key(record, kind, text)
             copy_key = self.copy_payload_dedup_key_for_turn(text) if is_copy_payload_message(text) else ""
             if copy_key and self.bridge_state and ring_contains(self.bridge_state, copy_key):
@@ -5772,6 +7045,8 @@ class Bridge:
                 return True
             if not self.handle_assistant_event(text):
                 return False
+            if delivery_key:
+                self.persist_state(event_key=delivery_key)
             if copy_key:
                 self.persist_state(event_key=copy_key)
             if line_end is not None:
@@ -5782,6 +7057,15 @@ class Bridge:
         return True
 
     def ensure_session_file(self) -> Path:
+        try:
+            return self._ensure_session_file_bound()
+        finally:
+            try:
+                self.maybe_confirm_pending_clear()
+            except Exception as exc:  # noqa: BLE001
+                log("JSONL", f"clear watch confirm failed: {type(exc).__name__}")
+
+    def _ensure_session_file_bound(self) -> Path:
         path = self.repl.session_file()
         if self.session_path != path:
             identity = session_identity(path)
@@ -5789,19 +7073,70 @@ class Bridge:
             cursor = cursor_offset_for_state(state, identity)
             self.session_path = path
             self.session_identity = identity
+            self.clear_midreport_recovery_candidate()
             if state:
                 state["coord_ring"] = ring_values(state)
             self.bridge_state = state or bridge_state_default(identity)
+            state_matches_session = self._state_matches_session(self.bridge_state, identity)
             with self.lock:
-                self.active_telegram_prompt = str(
-                    self.bridge_state.get("active_telegram_prompt") or ""
+                live_queued = list(self.queued_telegram)
+                live_pending = list(self.pending_telegram)
+                self.active_telegram_prompt = (
+                    str(self.bridge_state.get("active_telegram_prompt") or "")
+                    if state_matches_session
+                    else ""
                 )
-                self.active_telegram_message_id = int(self.bridge_state.get("active_telegram_message_id") or 0)
+                self.active_telegram_message_id = (
+                    int(self.bridge_state.get("active_telegram_message_id") or 0)
+                    if state_matches_session
+                    else 0
+                )
+                followup_id = int(self.bridge_state.get("followup_reply_message_id") or 0)
+                self.followup_reply_message_id = (
+                    followup_id if followup_id == self.active_telegram_message_id else 0
+                )
+                if self.active_telegram_prompt and state_matches_session:
+                    self.midreport_recovery_prompt = self.active_telegram_prompt
+                    self.midreport_recovery_message_id = self.active_telegram_message_id
+                    self.midreport_recovery_session = (
+                        identity.path,
+                        int(identity.dev),
+                        int(identity.ino),
+                    )
+                loaded_queued = load_telegram_inbox(self.bridge_state.get("queued_telegram"))
+                loaded_pending = load_telegram_inbox(self.bridge_state.get("pending_telegram"))
+                # Same-process /clear attach must not clobber a just-queued
+                # current mid if persist has not flushed yet.
+                self.queued_telegram = live_queued if live_queued else loaded_queued
+                self.pending_telegram = live_pending if live_pending else loaded_pending
+                disk_watch = self.bridge_state.get("pending_clear_watch")
+                if not isinstance(self.pending_clear_watch, dict):
+                    if (
+                        isinstance(disk_watch, dict)
+                        and self._clear_watch_key(disk_watch) == self._completed_clear_key
+                    ):
+                        self.pending_clear_watch = None
+                    else:
+                        self.pending_clear_watch = (
+                            dict(disk_watch) if isinstance(disk_watch, dict) else None
+                        )
+                        if isinstance(self.pending_clear_watch, dict) and not self.pending_clear_watch.get("started_at"):
+                            self.pending_clear_watch["started_at"] = float(self.now_fn())
+                if self.active_telegram_message_id > 0 and self.active_telegram_prompt:
+                    self.current_origin = "telegram"
+                    self.suppress_until_user = False
             # persisted across restart (anti-fragmentation): resume the ⚙️ flow card so the
             # next tool step edits the existing card instead of sending a fresh one.
             self.flow_message_id = int(self.bridge_state.get("flow_message_id") or 0)
+            self.flow_replacement_attempted_for = int(self.bridge_state.get("flow_replacement_attempted_for") or 0)
             self.flow_body = str(self.bridge_state.get("flow_body") or "")
             self.flow_scope = str(self.bridge_state.get("flow_scope") or "")
+            self.fast_mode_state = None
+            self.fast_mode_identity = ""
+            self._fast_observe_pending = None
+            self._fast_observe_pending_count = 0
+            self._restore_fast_mode_from_state()
+            self._restore_midreport_from_state()
             if cursor is not None:
                 self.session_pos = cursor
                 log("REPL", f"watching {path} from cursor {cursor}")
@@ -5810,8 +7145,97 @@ class Bridge:
                 log("REPL", f"watching {path}")
                 if self.config.start_at_end:
                     self.backfill_cursorless_session(path, identity)
+                    self.bind_preexisting_session_user(path)
                 self.persist_state(self.session_pos)
+        # Run on every existing JSONL poll: a failed Telegram send must retry
+        # even when the new session's path no longer changes.
+        self.maybe_confirm_pending_clear()
         return path
+
+    def _latest_tail_user(self, events: list[JsonlEvent]) -> tuple[JsonlEvent | None, int]:
+        latest = None
+        latest_index = None
+        for index, event in enumerate(events):
+            if event.kind == "user" and (event.text or "").strip():
+                latest = event
+                latest_index = index
+        if latest is None or latest_index is None:
+            return None, 0
+        later_assistants = 0
+        for event in events[latest_index + 1 :]:
+            if event.kind == "assistant" and (event.text or "").strip():
+                later_assistants += 1
+        return latest, later_assistants
+
+    def _bind_unfinished_preexisting_user(self, latest: JsonlEvent) -> bool:
+        text = latest.text
+        pending_mid = self.consume_pending_match(text)
+        queued_mid = None if pending_mid is not None else self.consume_queued_skip_stale_prefix(text)
+        active_match = (
+            pending_mid is None
+            and queued_mid is None
+            and self.active_telegram_message_id > 0
+            and self.active_telegram_prompt_matches(text)
+        )
+        matched_mid = pending_mid if pending_mid is not None else queued_mid
+        if matched_mid is None and not active_match:
+            # Unique queued text is required to consume a mid. Ambiguous
+            # same-body copies stay queued; unfinished attach still clears
+            # leftover suppress without guessing identity.
+            with self.lock:
+                self.suppress_until_user = False
+                self.last_user_event = (text, "attach", float(latest.timestamp or 0), "")
+                self.last_user_pair_sources = set()
+            self.current_origin = "terminal"
+            log("JSONL", "session attach bound terminal-origin unfinished user")
+            return True
+        with self.lock:
+            self.suppress_until_user = False
+            self.last_user_event = (text, "attach", float(latest.timestamp or 0), "")
+            self.last_user_pair_sources = set()
+        if pending_mid is not None:
+            self.current_origin = "telegram"
+            if pending_mid > 0 and self.active_telegram_message_id <= 0:
+                self.set_active_telegram_prompt(text, time.time(), pending_mid)
+            log("JSONL", f"session attach bound telegram-origin pending mid={pending_mid}")
+            self.begin_repl_typing()
+            return True
+        if queued_mid is not None:
+            log("JSONL", f"session attach bound queued telegram-origin mid={queued_mid}")
+            self.begin_telegram_prompt_tracking(
+                text,
+                message_id=queued_mid,
+                expect_jsonl_echo=False,
+            )
+            self.begin_repl_typing()
+            return True
+        self.current_origin = "telegram"
+        log("JSONL", "session attach bound active telegram-origin")
+        self.begin_repl_typing()
+        return True
+
+    def bind_preexisting_session_user(self, path: Path) -> None:
+        """Bind origin for an unfinished user already in a new jsonl at EOF attach.
+
+        After /clear the watcher attaches at EOF. The injected prompt is already
+        on disk, so handle_user_event never runs and suppress_until_user from the
+        previous turn would swallow the later final_answer (T-260911-002 r25).
+        Closed historical turns keep suppression and the active prompt.
+        Do not emit a second directive card; the prompt was already injected.
+        """
+        try:
+            events = read_tail_jsonl_events(path, self.config.tail_scan_bytes)
+        except OSError as exc:
+            log("JSONL", f"session attach user bind failed: {exc}")
+            return
+        latest, later_assistants = self._latest_tail_user(events)
+        if latest is None:
+            log("JSONL", "session attach: no preexisting user to bind")
+            return
+        if later_assistants > 0:
+            log("JSONL", "session attach: latest user already completed; leave suppress/origin")
+            return
+        self._bind_unfinished_preexisting_user(latest)
 
     def backfill_cursorless_session(self, path: Path, identity: SessionIdentity) -> None:
         if not self.config.backfill_enabled:
@@ -5848,11 +7272,15 @@ class Bridge:
             if copy_key:
                 ring_push(state, copy_key, self.config.state_ring_cap)
             ring_push(state, event.key, self.config.state_ring_cap)
+            delivery_key = final_delivery_key(identity.path, event.turn_id, event.text)
+            if delivery_key:
+                ring_push(state, delivery_key, self.config.state_ring_cap)
         self.bridge_state = state
         self.session_pos = identity.size
 
     def jsonl_loop(self) -> None:
         while not self.stop_event.is_set():
+            send_failed = False
             try:
                 path = self.ensure_session_file()
                 with path.open("r", encoding="utf-8", errors="replace") as f:
@@ -5865,6 +7293,7 @@ class Bridge:
                         line_end = f.tell()
                         if not self.process_line(line, line_start, line_end):
                             self.session_pos = line_start
+                            send_failed = True
                             break
                         self.session_pos = line_end
             except Exception as exc:  # noqa: BLE001
@@ -5873,11 +7302,92 @@ class Bridge:
                     and "session_unbound" in str(exc)
                 ):
                     log("JSONL", f"watch error: {exc}")
+            try:
+                self.poll_side_replies()
+            except Exception as exc:  # side support cannot stop the main mirror
+                log("SIDE", f"reply monitor failed: {type(exc).__name__}")
             self.poll_directive_signals()
             # ⚙️ T-260727-104 — 여기가 침묵 구간이다(새 줄 없이 한 바퀴 돌았다).
             # 자체 시간 상한을 들고 있어 0.5초 tick 마다 불려도 실제 edit 은 45초에 1회다.
             self.maybe_heartbeat_flow_card()
-            time.sleep(0.5)
+            self.finish_pending_interrupt()
+            time.sleep(jsonl_retry_sleep_seconds(self.telegram, send_failed=send_failed))
+
+    def get_side_reply_mirror(self) -> SideReplyMirror:
+        # Call under side_reply_lock; never hold the main turn lock for a send.
+        if self.side_reply_mirror is None:
+            path = self.config.state_path.with_name(self.config.state_path.stem + ".side.json")
+            self.side_reply_mirror = SideReplyMirror(path, self.send_side_answer)
+        return self.side_reply_mirror
+
+    def send_side_answer(self, text: str, message_id: int) -> bool:
+        if self.config.bridge_kill:
+            return False
+        # Do not borrow the main turn's origin, timers, attachment auto-scan,
+        # flow card, or reply anchor. They may belong to an ongoing main turn.
+        ok = bool(self.telegram.send(text, reply_to_message_id=message_id or None))
+        log("SIDE", f"final reply {'sent' if ok else 'retry pending'} mid={message_id}")
+        return ok
+
+    def poll_side_replies(self) -> None:
+        if not getattr(self.repl, "supports_pane_features", False):
+            return
+        now = time.monotonic()
+        if now - self.last_side_poll_at < 1.0:
+            return
+        self.last_side_poll_at = now
+        screen = self.repl.capture_screen(2000)
+        if not is_side_screen(screen):
+            return
+        with self.side_reply_lock:
+            mirror = self.get_side_reply_mirror()
+            reply = latest_completed_side_reply(screen)
+            if reply:
+                # Recover only the visible answer's matching old inbox entry.
+                # Never replay or discard the rest of the pre-upgrade queue.
+                with self.lock:
+                    candidates = list(self.pending_telegram) + list(self.queued_telegram)
+                    if self.active_telegram_prompt and self.active_telegram_message_id:
+                        candidates.append((self.active_telegram_prompt, self.active_telegram_message_id))
+                matching = [(text, mid) for text, mid in candidates
+                            if prompt_key(text) == prompt_key(reply.prompt)]
+                if matching:
+                    text, mid = matching[-1]
+                    mirror.register(text, mid)
+            delivered = mirror.poll(screen, str(self.session_path or ""))
+        if delivered:
+            with self.lock:
+                self.queued_telegram = [(text, mid) for text, mid in self.queued_telegram if mid != delivered]
+                self.pending_telegram = [(text, mid) for text, mid in self.pending_telegram if mid != delivered]
+                self.persist_telegram_inbox()
+
+    def handle_side_telegram_prompt(self, prompt: TelegramPrompt) -> bool:
+        if not getattr(self.repl, "supports_pane_features", False):
+            return False
+        try:
+            screen = self.repl.capture_screen(2000)
+        except Exception as exc:
+            log("SIDE", f"inbound pane check unavailable: {type(exc).__name__}")
+            return False
+        side_command = bool(re.match(r"^/(?:btw|side)(?:\s|$)", prompt.text.strip(), re.I))
+        if not side_command and not is_side_screen(screen):
+            return False
+        # Other slash commands retain their existing command handlers.
+        if is_codex_slash_command(prompt.text) and not side_command:
+            return False
+        with self.side_reply_lock:
+            mirror = self.get_side_reply_mirror()
+            mirror.register(prompt.text, int(prompt.message_id or 0), screen)
+        try:
+            self.clear_and_paste_prompt(prompt.text, "telegram side prompt")
+            log("SIDE", f"prompt submitted mid={prompt.message_id}")
+        except Exception as exc:
+            with self.side_reply_lock:
+                mirror.cancel(int(prompt.message_id or 0))
+            log("SIDE", f"paste failed: {type(exc).__name__}")
+            self.telegram.send("보조 대화에 메시지를 전달하지 못했어. 다시 보내줘.",
+                               reply_to_message_id=prompt.message_id)
+        return True
 
     def poll_directive_signals(self) -> None:
         # ⚙️ A2 (T-260630-22) — 수신노드 신호파일을 tail 해 '📥 받은 지시' 카드 렌더.
@@ -5928,7 +7438,7 @@ class Bridge:
         )
         if not body:
             return
-        self.reset_flow_card()
+        self.close_flow_card("context_changed")
         try:
             message_id = self.telegram.send_message_id(body, viewer=True)
             if message_id:
@@ -5966,8 +7476,8 @@ class Bridge:
             return "capture_error"
         return repl_typing_stop_signal_from_screen(screen)
 
-    def abort_typing_on_interrupt(self, owner: threading.Event) -> None:
-        """Stop the REPL typing loop + clear zombie turn state on codex interrupt.
+    def abort_typing_on_interrupt(self, owner: threading.Event, signal: str = "interrupt") -> None:
+        """Stop screen activity, leaving the JSONL consumer time to deliver a final.
 
         Guarded by a turn token (the loop's own stop_event): if a newer turn has
         already taken over typing, do nothing — never wipe a live turn's state.
@@ -5976,8 +7486,48 @@ class Bridge:
             if self.repl_typing_stop is not owner:
                 return
             self.repl_typing_stop = None
+        self.stop_long_running_progress(disarm=signal != "capture_error")
+        self.stop_telegram_fallback()
+        if signal == "capture_error":
+            log("TYPE", "pane unavailable -> typing stopped; JSONL delivery retained")
+            return
+        lost_prompt = self.active_prompt_for_recovery()
+        self.pending_interrupt_notice = {
+            "prompt": lost_prompt,
+            "started_at": self.active_prompt_started_at_for_recovery(),
+            "session_path": str(self.session_path or ""),
+            "after": time.monotonic() + 10.0,
+        } if lost_prompt else None
+        log("TYPE", "interrupt marker -> typing stopped; awaiting final records")
+
+    def finish_pending_interrupt(self) -> None:
+        """Run after the JSONL drain so a late final wins over an error notice."""
+        pending = self.pending_interrupt_notice
+        if not pending:
+            return
+        if (
+            pending["session_path"] != str(self.session_path or "")
+            or pending["prompt"] != self.active_prompt_for_recovery()
+            or pending["started_at"] != self.active_prompt_started_at_for_recovery()
+            or self.has_repl_typing()
+            or self.repl_is_working()
+        ):
+            self.pending_interrupt_notice = None
+            return
+        if time.monotonic() < pending["after"]:
+            return
+        try:
+            if self.session_path and self.session_path.stat().st_size > self.session_pos:
+                return
+        except OSError:
+            return
+        self.pending_interrupt_notice = None
+        self.resolve_midreport_obligation("blocked", "codex turn ended without a final answer")
+        self.close_flow_card("interrupt")
         self.clear_active_telegram_prompt()
-        log("TYPE", "codex interrupted/dead -> typing stopped + turn state cleared")
+        self.telegram.send("코덱스 응답이 중단됐고, 완료된 답변 기록이 없습니다.")
+        log("TYPE", "interrupt confirmed after JSONL drain; no completed answer")
+
 
     def start_typing_loop(
         self, max_seconds: int | None = None, watch_interrupt: bool = False
@@ -6000,13 +7550,14 @@ class Bridge:
                 # Every other pulse (~8s), check whether codex aborted the turn.
                 # Require consecutive hits for interrupt/capture failures to ignore transients.
                 if watch_interrupt and pulse_count >= 1 and pulse_count % 2 == 0:
+                    signal = self.repl_typing_stop_signal()
                     abort, interrupt_hits, capture_error_hits = update_typing_watch_hits(
-                        self.repl_typing_stop_signal(),
+                        signal,
                         interrupt_hits,
                         capture_error_hits,
                     )
                     if abort:
-                        self.abort_typing_on_interrupt(stop_event)
+                        self.abort_typing_on_interrupt(stop_event, signal)
                         break
                 pulse_count += 1
                 try:
@@ -6083,6 +7634,10 @@ class Bridge:
     ) -> None:
         prompt = normalize_prompt(prompt)
         with self.lock:
+            if prompt != self.active_telegram_prompt or (
+                message_id is not None and message_id != self.active_telegram_message_id
+            ):
+                self.followup_reply_message_id = 0
             self.active_telegram_prompt = prompt
             if started_at is not None:
                 self.active_telegram_prompt_started_at = started_at if prompt else 0.0
@@ -6103,7 +7658,26 @@ class Bridge:
                     self.bridge_state.pop("active_telegram_message_id", None)
         self.persist_state()
 
-    def clear_active_telegram_prompt(self) -> None:
+    def clear_midreport_recovery_candidate(self) -> None:
+        with self.lock:
+            self.midreport_recovery_prompt = ""
+            self.midreport_recovery_message_id = 0
+            self.midreport_recovery_session = None
+
+    @staticmethod
+    def _state_matches_session(state: dict[str, Any], identity: SessionIdentity) -> bool:
+        try:
+            return (
+                str(state.get("session_path") or "") == identity.path
+                and int(state.get("dev")) == int(identity.dev)
+                and int(state.get("ino")) == int(identity.ino)
+            )
+        except (TypeError, ValueError):
+            return False
+
+    def clear_active_telegram_prompt(self, *, preserve_midreport_recovery: bool = False) -> None:
+        if not preserve_midreport_recovery:
+            self.clear_midreport_recovery_candidate()
         self.set_active_telegram_prompt("", 0.0, 0)
 
     def active_prompt_for_recovery(self) -> str:
@@ -6135,16 +7709,33 @@ class Bridge:
     def copy_payload_dedup_key_for_turn(self, text: str) -> str:
         return copy_payload_dedup_key(text, self.active_prompt_for_recovery())
 
-    def begin_telegram_prompt_tracking(self, prompt: str, message_id: int | None = None) -> None:
-        self.add_pending_telegram(prompt)
+    def begin_telegram_prompt_tracking(
+        self,
+        prompt: str,
+        message_id: int | None = None,
+        *,
+        expect_jsonl_echo: bool = True,
+    ) -> None:
+        if expect_jsonl_echo:
+            self.add_pending_telegram(prompt, message_id)
         started_at = time.time()
-        with self.lock:
-            self.current_origin = "telegram"
-            self.suppress_until_user = False
-            self.last_public_progress = ""
-            self.telegram_fallback_sent = False
-            self.reset_flow_card()
+        with self.midreport_lock:
+            with self.lock:
+                self.current_origin = "telegram"
+                self.suppress_until_user = False
+                self.last_public_progress = ""
+                self.last_midreport_progress = ""
+                self.last_midreport_note = ""
+                self.pending_midreport_slot = ""
+                self.midreport_prompt = normalize_prompt(prompt)
+                self.long_running_progress_armed = True
+                self.telegram_fallback_sent = False
+            self.close_flow_card("context_changed")
         self.set_active_telegram_prompt(prompt, started_at, message_id or 0)
+        if not expect_jsonl_echo:
+            with self.lock:
+                self.followup_reply_message_id = int(message_id or 0)
+            self.persist_state()
         self.prime_flow_screen_snapshot()
         self.set_copy_payload_pair_contract(prompt)
         self.start_telegram_fallback(prompt)
@@ -6154,28 +7745,172 @@ class Bridge:
         self.begin_telegram_prompt_tracking(prompt, message_id=message_id)
 
     def start_long_running_progress(self, prompt: str) -> None:
-        self.stop_long_running_progress()
+        # Replacing a live timer is not a turn close; keep the in-process arm.
+        self.stop_long_running_progress(disarm=False)
         interval = int(getattr(self.config, "long_running_progress_seconds", 0) or 0)
         if interval <= 0:
             return
         stop_event = threading.Event()
         started = time.monotonic()
+        expected = normalize_prompt(prompt)
+        with self.lock:
+            self.midreport_prompt = expected
 
         def loop() -> None:
-            while not stop_event.wait(interval):
+            retry_wait = 5.0
+            while not stop_event.is_set():
                 elapsed = time.monotonic() - started
                 if self.abort_lost_native_turn(prompt, elapsed):
                     return
-                log("PROG", f"send long-running update after {int(elapsed)}s")
-                message = self.long_running_progress_message(prompt, elapsed)
-                if self.telegram.send(message):
-                    self.record_midreport_obligation(prompt, elapsed, message)
-                else:
-                    log("PROG", "send failed")
+                result, wait = self.run_midreport_timer_tick(prompt, elapsed)
+                if result == "inactive":
+                    log("PROG", "active prompt gone -> long-running progress self-stop")
+                    return
+                if result == "sent":
+                    retry_wait = 5.0
+                elif result == "send_failed":
+                    retry_wait = 5.0
+                    if stop_event.wait(min(15.0, retry_wait)):
+                        return
+                    continue
+                if stop_event.wait(min(max(wait, 0.05), retry_wait)):
+                    return
 
         with self.long_running_progress_lock:
             self.long_running_progress_stop = stop_event
         threading.Thread(target=loop, daemon=True, name="crb-long-progress").start()
+
+    def midreport_turn_active(self, expected: str) -> bool:
+        expected = normalize_prompt(expected)
+        if not expected:
+            return False
+        if self.active_prompt_for_recovery() == expected:
+            return True
+        with self.lock:
+            origin = self.current_origin
+            scope = normalize_prompt(self.current_flow_scope or self.midreport_prompt)
+            armed = self.long_running_progress_armed
+        return bool(armed and origin == "terminal" and scope == expected)
+
+    def run_midreport_timer_tick(self, prompt: str, elapsed_seconds: float) -> tuple[str, float]:
+        expected = normalize_prompt(prompt)
+        if not self.midreport_turn_active(expected):
+            return "inactive", 1.0
+        now = float(self.now_fn())
+        with self.lock:
+            last_slot = self.last_midreport_slot
+            pending = self.pending_midreport_slot
+        due, slot_id, wait = kst_midreport_due(now, last_slot, pending)
+        if not due:
+            return "wait", wait
+        return self.send_kst_midreport(prompt, elapsed_seconds, slot_id), wait
+
+    def send_kst_midreport(self, prompt: str, elapsed_seconds: float, slot_id: str) -> str:
+        expected = normalize_prompt(prompt)
+        with self.midreport_lock:
+            if not self.midreport_turn_active(expected):
+                return "inactive"
+            if slot_id and slot_id == self.last_midreport_slot:
+                return "unchanged"
+            if self._midreport_prompt_candidate() not in ("", expected):
+                return "inactive"
+            message, progress = self.long_running_progress_update(
+                prompt, elapsed_seconds, public_only=True
+            )
+            if not message:
+                return "empty"
+            if not self.midreport_turn_active(expected) or self._midreport_prompt_candidate() not in (
+                "",
+                expected,
+            ):
+                return "inactive"
+            unchanged = bool(progress) and progress == self.last_midreport_progress
+            log("PROG", f"send kst midreport slot={slot_id} unchanged={unchanged}")
+            try:
+                ok = self.telegram.send(message)
+            except Exception as exc:  # noqa: BLE001
+                log("PROG", f"send exception: {exc}")
+                self.pending_midreport_slot = slot_id
+                self.persist_state()
+                return "send_failed"
+            if not ok:
+                log("PROG", "send failed")
+                self.pending_midreport_slot = slot_id
+                self.persist_state()
+                return "send_failed"
+            self.mark_long_running_progress_sent(progress)
+            self.last_midreport_slot = slot_id
+            self.pending_midreport_slot = ""
+            self.persist_state()
+            self.record_midreport_obligation(prompt, elapsed_seconds, message)
+            return "sent"
+
+    def _midreport_session_matches(self, blob: dict[str, Any]) -> bool:
+        identity = self.session_identity
+        if identity is None:
+            return False
+        try:
+            return (
+                str(blob.get("session_path") or "") == str(identity.path)
+                and int(blob.get("dev")) == int(identity.dev)
+                and int(blob.get("ino")) == int(identity.ino)
+            )
+        except (TypeError, ValueError):
+            return False
+
+    def _midreport_prompt_candidate(self) -> str:
+        return (
+            self.active_prompt_for_recovery()
+            or normalize_prompt(self.current_flow_scope)
+            or normalize_prompt(self.flow_scope)
+        )
+
+    def _midreport_live_turn_evidence(self) -> bool:
+        if self.last_midreport_note:
+            return True
+        prompt = self._midreport_prompt_candidate()
+        if not prompt:
+            return False
+        if self.repl_is_working():
+            return True
+        return bool(self.has_repl_typing())
+
+    def _arm_midreport_from_live_turn_if_needed(self) -> None:
+        prompt = self._midreport_prompt_candidate()
+        if not prompt or not self._midreport_live_turn_evidence():
+            return
+        self.midreport_prompt = prompt
+        self.long_running_progress_armed = True
+        if not self.current_origin:
+            self.current_origin = "telegram" if self.active_prompt_for_recovery() else "terminal"
+        if self.current_origin == "terminal" and not self.current_flow_scope:
+            self.current_flow_scope = prompt
+        self.start_long_running_progress(prompt)
+
+    def _restore_midreport_from_state(self) -> None:
+        blob = (self.bridge_state or {}).get("midreport")
+        if not isinstance(blob, dict) or not self._midreport_session_matches(blob):
+            self._arm_midreport_from_live_turn_if_needed()
+            return
+        self.last_midreport_slot = str(blob.get("slot") or "")
+        self.pending_midreport_slot = str(blob.get("pending_slot") or "")
+        self.last_midreport_note = str(blob.get("note") or "")
+        try:
+            self.last_midreport_note_at = float(blob.get("note_at") or 0.0)
+        except (TypeError, ValueError):
+            self.last_midreport_note_at = 0.0
+        self.midreport_prompt = str(blob.get("prompt") or "")
+        origin = str(blob.get("origin") or "")
+        if origin:
+            self.current_origin = origin
+        if origin == "terminal" and self.midreport_prompt and not self.current_flow_scope:
+            self.current_flow_scope = self.midreport_prompt
+        armed = bool(blob.get("armed"))
+        if not armed or not self.midreport_prompt or not self._midreport_live_turn_evidence():
+            self.long_running_progress_armed = False
+            return
+        self.long_running_progress_armed = True
+        self.start_long_running_progress(self.midreport_prompt)
 
     def record_poll_heartbeat(self, *, force: bool = False) -> None:
         """Persist a metadata-only heartbeat for the Windows watchdog."""
@@ -6266,10 +8001,12 @@ class Bridge:
         )
         self.stop_repl_typing()
         self.stop_telegram_fallback()
-        self.resolve_midreport_obligation("failed", f"native turn lost: {reason}")
+        self.resolve_midreport_obligation("blocked", f"native turn lost: {reason}")
         self.finish_duplicate_final_turn()
         with self.long_running_progress_lock:
             self.long_running_progress_stop = None
+        with self.lock:
+            self.long_running_progress_armed = False
         self.recover_native_transport_after_turn_loss(force=True)
         return True
 
@@ -6306,26 +8043,36 @@ class Bridge:
                 or active != prompt
             ):
                 return
-            self.telegram_fallback_sent = True
         if self.config.bridge_kill:
             log("PROG", "telegram fallback blocked by CRB_KILL=1")
             return
+        message, progress = self.long_running_progress_update(prompt, elapsed_seconds)
+        if not message:
+            log("PROG", "skip telegram fallback: no new shareable progress")
+            return
+        with self.lock:
+            active = normalize_prompt(self.active_telegram_prompt)
+            if (
+                self.telegram_fallback_sent
+                or self.suppress_until_user
+                or self.current_origin != "telegram"
+                or not active
+                or active != prompt
+            ):
+                return
+            self.telegram_fallback_sent = True
         log("PROG", f"send telegram fallback after {int(elapsed_seconds)}s")
-        message = self.long_running_progress_message(prompt, elapsed_seconds)
         if self.telegram.send(message):
+            self.mark_long_running_progress_sent(progress)
             self.record_midreport_obligation(prompt, elapsed_seconds, message)
         else:
             log("PROG", "telegram fallback send failed")
 
     def current_task_id(self, prompt: str) -> str:
-        task_id = extract_task_id(prompt)
-        if task_id:
-            return task_id
-        state_task = read_text(self.config.state_dir / "current-task").splitlines()
-        if not state_task:
-            return ""
-        candidate = state_task[0].strip()
-        return candidate if TASK_ID_RE.fullmatch(candidate) else ""
+        # Bind the progress card to this turn's prompt only. A leftover
+        # state_dir/current-task file is another job and mislabels the card
+        # (T-260908-048 17:37 T-260908-053 on an unrelated RCA prompt).
+        return extract_task_id(prompt)
 
     def record_midreport_obligation(
         self,
@@ -6377,20 +8124,49 @@ class Bridge:
             ]
         )
 
-    def long_running_progress_message(self, prompt: str, elapsed_seconds: float) -> str:
+    def long_running_progress_update(
+        self, prompt: str, elapsed_seconds: float, *, public_only: bool = False
+    ) -> tuple[str, str]:
         with self.lock:
-            recent_progress = self.last_public_progress
-        return format_long_running_progress_message(
-            prompt,
-            elapsed_seconds,
-            task_id=self.current_task_id(prompt),
-            recent_progress=recent_progress,
+            recent_progress = self.last_midreport_note
+            if not public_only and not recent_progress:
+                recent_progress = self.last_public_progress
+            last_sent = self.last_midreport_progress
+            note_at = self.last_midreport_note_at
+        unchanged = bool(recent_progress) and recent_progress == last_sent
+        checked = kst_now(float(self.now_fn())).strftime("%H:%M")
+        note_when = kst_now(note_at).strftime("%H:%M") if note_at else ""
+        if not public_only and (not recent_progress or recent_progress == last_sent):
+            return "", ""
+        return (
+            format_long_running_progress_message(
+                prompt,
+                elapsed_seconds,
+                task_id=self.current_task_id(prompt),
+                recent_progress=recent_progress,
+                checked_at=checked,
+                note_at=note_when,
+                unchanged=unchanged or not recent_progress,
+            ),
+            recent_progress,
         )
 
-    def stop_long_running_progress(self) -> None:
+    def long_running_progress_message(self, prompt: str, elapsed_seconds: float) -> str:
+        return self.long_running_progress_update(prompt, elapsed_seconds)[0]
+
+    def mark_long_running_progress_sent(self, progress: str) -> None:
+        with self.lock:
+            self.last_midreport_progress = progress
+
+    def stop_long_running_progress(self, *, disarm: bool = True) -> None:
         with self.long_running_progress_lock:
             stop_event = self.long_running_progress_stop
             self.long_running_progress_stop = None
+        if disarm:
+            with self.midreport_lock:
+                with self.lock:
+                    self.long_running_progress_armed = False
+                self.persist_state()
         if stop_event:
             stop_event.set()
             log("PROG", "stop")
@@ -6406,11 +8182,21 @@ class Bridge:
         if not getattr(self.repl, "supports_pane_features", True):
             return False
         try:
-            screen = self.repl.capture_screen(60)
+            capture_visible = getattr(self.repl, "capture_visible_screen", None)
+            screen = (capture_visible() if callable(capture_visible)
+                      else self.repl.capture_screen(60))
         except Exception as exc:  # noqa: BLE001
             log("LIVE", f"pane capture failed: {exc}")
             return False
-        return screen_has_repl_busy_marker(screen)
+        if not screen_has_repl_busy_marker(screen):
+            return False
+        if self.completed_turn_blocks_liveness_recovery(self.active_prompt_for_recovery()):
+            # Final delivery already settled this turn. Stale queued chrome and
+            # answer text must not block /clear or steer a new idle input.
+            # A new native Working row still wins before its JSONL is consumed.
+            lines = [line.strip() for line in clean_pane_lines(screen) if line.strip()][-20:]
+            return any(REPL_WORKING_STATUS_RE.fullmatch(line) for line in lines)
+        return True
 
     def recover_repl_liveness(self, reason: str = "poll") -> bool:
         repl_working = self.repl_is_working()
@@ -6419,7 +8205,7 @@ class Bridge:
             not repl_working or not self.startup_recovery_has_recent_active_prompt(prompt)
         ):
             log("LIVE", "skip startup stale typing recovery")
-            self.clear_active_telegram_prompt()
+            self.clear_active_telegram_prompt(preserve_midreport_recovery=True)
             return False
         if not repl_working:
             if (
@@ -6440,9 +8226,12 @@ class Bridge:
             self.begin_repl_typing()
             recovered = True
         if prompt and not self.has_long_running_progress():
-            log("LIVE", f"recover progress ({reason})")
-            self.start_long_running_progress(prompt)
-            recovered = True
+            with self.lock:
+                progress_armed = self.long_running_progress_armed
+            if progress_armed:
+                log("LIVE", f"recover progress ({reason})")
+                self.start_long_running_progress(prompt)
+                recovered = True
         return recovered
 
     def liveness_loop(self) -> None:
@@ -6557,6 +8346,84 @@ class Bridge:
         self.needs_composer_clear = False
         log("REPL", f"queued {label} while busy without clearing composer")
 
+    def _fast_mode_session_matches(self, blob: dict[str, Any]) -> bool:
+        identity = self.session_identity
+        if identity is None:
+            return False
+        try:
+            return (
+                str(blob.get("session_path") or "") == str(identity.path)
+                and int(blob.get("dev")) == int(identity.dev)
+                and int(blob.get("ino")) == int(identity.ino)
+            )
+        except (TypeError, ValueError):
+            return False
+
+    def _restore_fast_mode_from_state(self) -> None:
+        blob = (self.bridge_state or {}).get("fast_mode")
+        if not isinstance(blob, dict) or not self._fast_mode_session_matches(blob):
+            return
+        state = blob.get("state")
+        if state in FAST_MODE_NOTICE:
+            self.fast_mode_state = str(state)
+            self.fast_mode_identity = str(blob.get("model_identity") or "")
+
+    def maybe_notify_fast_mode(self, screen: str, *, source: str) -> str:
+        """Notify the existing Telegram room on a confirmed Fast on/off change.
+
+        source is telegram_slash or terminal_observe. Does not reply to a
+        question. First confirmed footer is baseline, never a send.
+        Inspect/send/commit is serialized so observer and slash cannot
+        double-send the same transition.
+        """
+        if not getattr(self.repl, "supports_pane_features", True):
+            return "pane_unsupported"
+        with self.fast_mode_lock:
+            parsed, _evidence, model_id = parse_fast_mode_observation(screen)
+            if parsed is None:
+                if source == "terminal_observe":
+                    self._fast_observe_pending = None
+                    self._fast_observe_pending_count = 0
+                return "unknown"
+
+            pending_key = (parsed, model_id)
+            if source == "terminal_observe":
+                if pending_key == self._fast_observe_pending:
+                    self._fast_observe_pending_count += 1
+                else:
+                    self._fast_observe_pending = pending_key
+                    self._fast_observe_pending_count = 1
+                if self._fast_observe_pending_count < FAST_OBSERVE_CONFIRM_POLLS:
+                    return "pending"
+
+            previous = self.fast_mode_state
+            if previous is None or self.fast_mode_identity != model_id:
+                self.fast_mode_state = parsed
+                self.fast_mode_identity = model_id
+                self._fast_observe_pending = pending_key
+                self._fast_observe_pending_count = FAST_OBSERVE_CONFIRM_POLLS
+                self.persist_state()
+                return "baseline"
+            if previous == parsed:
+                return "unchanged"
+
+            notice = FAST_MODE_NOTICE[parsed]
+            try:
+                ok = self.telegram.send(notice)
+            except Exception as exc:  # noqa: BLE001
+                log("FAST", f"status notify exception state={parsed} source={source}: {exc}")
+                return "send_failed"
+            if not ok:
+                log("FAST", f"status notify failed state={parsed} source={source}")
+                return "send_failed"
+            self.fast_mode_state = parsed
+            self.fast_mode_identity = model_id
+            self._fast_observe_pending = pending_key
+            self._fast_observe_pending_count = FAST_OBSERVE_CONFIRM_POLLS
+            self.persist_state()
+            log("FAST", f"status notified state={parsed} source={source}")
+            return "sent"
+
     def handle_slash_command_result(self, text: str) -> bool:
         command = slash_command_token(text)
         if not command:
@@ -6575,15 +8442,321 @@ class Bridge:
             self.clear_composer_before_telegram_input("slash command error")
             return True
         if is_fast_slash_command(text):
-            notice = extract_fast_mode_notice(screen)
-            if notice:
-                self.telegram.send(notice)
+            self.maybe_notify_fast_mode(screen, source="telegram_slash")
         return False
+
+    def send_clear_notice(self, body: str, ok_log: str, fail_log: str) -> bool:
+        ok = bool(self.telegram.send(body))
+        log("SEND", ok_log if ok else fail_log)
+        return ok
+
+    def _reset_session_file(self) -> Path | None:
+        getter = getattr(self.repl, "session_file_for_reset", None)
+        if callable(getter):
+            try:
+                path = getter()
+            except Exception:
+                return None
+            return path if path else None
+        try:
+            return self.repl.session_file()
+        except Exception:
+            return None
+
+    def session_reset_happened(self, before_path: str, before_ino: int = 0) -> bool:
+        path = self._reset_session_file()
+        if not path:
+            return False
+        current = str(path)
+        if before_path and current != before_path:
+            return True
+        try:
+            after = session_identity(path)
+        except OSError:
+            return False
+        if self.session_path and str(self.session_path) != current:
+            return True
+        return bool(before_ino) and after.ino != int(before_ino)
+
+    def _visible_clear_screen(self) -> str:
+        if not getattr(self.repl, "supports_pane_features", False):
+            return ""
+        getter = getattr(self.repl, "capture_visible_screen", None)
+        try:
+            if callable(getter):
+                return getter() or ""
+            # Do not fall back to capture_screen: TmuxTransport always uses -S (scrollback).
+            return ""
+        except Exception:
+            return ""
+
+    def _screen_confirms_session_reset(self, watch: dict[str, Any] | None = None) -> bool:
+        return visible_screen_confirms_clear_reset(self._visible_clear_screen(), watch)
+
+    def _pending_clear_reset_confirmed(self, watch: dict[str, Any]) -> bool:
+        if str(watch.get("outcome") or "") == "timeout":
+            return False
+        if getattr(self.repl, "supports_pane_features", False):
+            # Tmux pane: native visible resume receipt is required. Path/ino of an
+            # unrelated thread switch is not bound to this /clear command.
+            return self._screen_confirms_session_reset(watch)
+        # ConPTY / pane-less: the host exposes only the bound session_file() this
+        # bridge drives. There is no tmux visible receipt, so that file's path/ino
+        # change remains the authoritative reset signal.
+        before_path = str(watch.get("before_path") or "")
+        before_ino = int(watch.get("before_ino") or 0)
+        return self.session_reset_happened(before_path, before_ino)
+
+    def _clear_watch_timed_out(self, watch: dict[str, Any]) -> bool:
+        raw = watch.get("started_at")
+        try:
+            started = float(raw)
+        except (TypeError, ValueError):
+            started = 0.0
+        if started <= 0:
+            watch["started_at"] = float(self.now_fn())
+            return False
+        return (float(self.now_fn()) - started) >= float(CLEAR_WATCH_TIMEOUT_SEC)
+
+    def _new_clear_watch(
+        self,
+        before_path: str,
+        before_ino: int,
+        prompt: TelegramPrompt,
+        before_visible: str = "",
+    ) -> dict[str, Any]:
+        resume_id = resume_hint_session_id(before_visible)
+        return {
+            "before_path": before_path,
+            "before_ino": before_ino,
+            "text": prompt.text,
+            "message_id": int(prompt.message_id or 0),
+            "started_at": float(self.now_fn()),
+            "flow_message_id": int(self.flow_message_id or 0),
+            "flow_body": str(self.flow_body or ""),
+            "flow_scope": str(self.flow_scope or ""),
+            "before_had_resume_hint": bool(resume_id),
+            "before_resume_id": resume_id,
+            "outcome": "",
+        }
+
+    def _end_clear_slash_turn(self) -> None:
+        self.stop_repl_typing()
+        self.stop_long_running_progress()
+        self.clear_active_telegram_prompt()
+
+    def _settle_clear_owned_flow(self, watch: dict[str, Any], status: str) -> None:
+        mid = int(watch.get("flow_message_id") or 0)
+        if mid <= 0:
+            return
+        done = "클리어 확인됨" if status == "complete" else "클리어 확인 실패"
+        body = format_flow_mirror(
+            str(watch.get("flow_body") or "세션 클리어"),
+            node=str(getattr(self.config, "node", "") or ""),
+            emoji=str(getattr(self.config, "emoji", "") or ""),
+            context=str(watch.get("flow_scope") or watch.get("text") or "/clear"),
+            done_label=done,
+        )
+        if body:
+            try:
+                self.telegram.edit(mid, body, viewer=True)
+            except Exception as exc:  # noqa: BLE001
+                log("SEND", f"clear flow settle edit failed mid={mid}: {exc}")
+        if self.flow_message_id == mid:
+            self.reset_flow_card()
+
+    def _mark_clear_outcome(self, watch: dict[str, Any], outcome: str) -> None:
+        with self.lock:
+            current = self.pending_clear_watch
+            if isinstance(current, dict) and self._clear_watch_key(current) == self._clear_watch_key(watch):
+                current["outcome"] = outcome
+                self.pending_clear_watch = current
+                self.persist_state()
+            elif isinstance(self.pending_clear_watch, dict):
+                pass
+            else:
+                watch["outcome"] = outcome
+
+    def _claim_clear_outcome(self, watch: dict[str, Any]) -> bool:
+        with self.lock:
+            current = self.pending_clear_watch
+            if not isinstance(current, dict):
+                return False
+            if self._clear_watch_key(current) != self._clear_watch_key(watch):
+                return False
+            if self._clear_complete_claimed:
+                return False
+            self._clear_complete_claimed = True
+            return True
+
+    def _unclaim_clear_outcome(self) -> None:
+        with self.lock:
+            self._clear_complete_claimed = False
+
+    @staticmethod
+    def _clear_watch_key(watch: dict[str, Any]) -> tuple[str, int, int]:
+        return (
+            str(watch.get("before_path") or ""),
+            int(watch.get("before_ino") or 0),
+            int(watch.get("message_id") or 0),
+        )
+
+    def _finish_clear_watch(self, watch: dict[str, Any]) -> None:
+        key = self._clear_watch_key(watch)
+        with self.lock:
+            self._completed_clear_key = key
+            current = self.pending_clear_watch
+            if isinstance(current, dict) and self._clear_watch_key(current) != key:
+                self.persist_state()
+                return
+            self.pending_clear_watch = None
+            self.persist_state()
+
+    def _send_pending_clear_complete(self, watch: dict[str, Any]) -> None:
+        if str(watch.get("outcome") or "") == "timeout":
+            return
+        if not self._claim_clear_outcome(watch):
+            return
+        try:
+            self._mark_clear_outcome(watch, "complete")
+            sent = self.send_clear_notice(
+                CLEAR_SLASH_COMPLETE,
+                "slash /clear complete",
+                "slash /clear complete send failed",
+            )
+            if sent:
+                self._finish_clear_watch(watch)
+                self._settle_clear_owned_flow(watch, "complete")
+        finally:
+            self._unclaim_clear_outcome()
+
+    def _send_pending_clear_timeout(self, watch: dict[str, Any]) -> None:
+        if not self._claim_clear_outcome(watch):
+            return
+        try:
+            self._mark_clear_outcome(watch, "timeout")
+            sent = self.send_clear_notice(
+                CLEAR_SLASH_TIMEOUT,
+                "slash /clear timeout unconfirmed",
+                "slash /clear timeout send failed",
+            )
+            if sent:
+                self._finish_clear_watch(watch)
+                self._settle_clear_owned_flow(watch, "timeout")
+        finally:
+            self._unclaim_clear_outcome()
+
+    def maybe_confirm_pending_clear(self) -> None:
+        watch = self.pending_clear_watch
+        if not isinstance(watch, dict):
+            return
+        outcome = str(watch.get("outcome") or "")
+        if outcome == "timeout":
+            self._send_pending_clear_timeout(watch)
+            return
+        if outcome == "complete":
+            self._send_pending_clear_complete(watch)
+            return
+        if self._pending_clear_reset_confirmed(watch):
+            self._send_pending_clear_complete(watch)
+            return
+        if getattr(self.repl, "supports_pane_features", False):
+            screen = self._visible_clear_screen()
+            if (is_side_screen(screen)
+                    and "'/clear' is unavailable in side conversations" in screen
+                    and self.send_clear_notice(CLEAR_SLASH_SIDE_UNAVAILABLE,
+                                               "slash /clear side refusal confirmed",
+                                               "slash /clear side refusal send failed")):
+                self._finish_clear_watch(watch)
+                self._settle_clear_owned_flow(watch, "timeout")
+                return
+        if self._clear_watch_timed_out(watch):
+            self._send_pending_clear_timeout(watch)
+
+    def handle_clear_slash_telegram(self, prompt: TelegramPrompt) -> None:
+        if getattr(self.repl, "supports_pane_features", False):
+            screen = self.repl.capture_screen(80)
+            if is_side_screen(screen):
+                prepare = getattr(self.repl, "prepare_main_for_clear", None)
+                try:
+                    destination = prepare() if callable(prepare) else "unconfirmed"
+                except Exception as exc:
+                    log("REPL", f"clear destination check failed: {type(exc).__name__}")
+                    destination = "unconfirmed"
+                if destination != "ready":
+                    body = CLEAR_SLASH_BUSY if destination == "busy" else CLEAR_SLASH_SWITCH_FAILED
+                    self.send_clear_notice(body, "slash /clear destination refused",
+                                           "slash /clear destination notice send failed")
+                    return
+        if self.repl_is_working():
+            self.send_clear_notice(
+                CLEAR_SLASH_BUSY,
+                "slash /clear busy refused",
+                "slash /clear busy notice send failed",
+            )
+            return
+        session_file = self.repl.session_file()
+        before_path = str(self.session_path or session_file or "")
+        before_ino = int(self.session_identity.ino) if self.session_identity else 0
+        if session_file and Path(session_file).exists():
+            try:
+                before = session_identity(Path(session_file))
+                before_path = before.path
+                before_ino = before.ino
+            except OSError:
+                pass
+        # /clear is not a work turn. Do not arm flow/progress. Persist inbox
+        # before any session-file switch. Keep an existing flow mid so we can
+        # edit that card later; do not reset a newer turn's card.
+        before_visible = self._visible_clear_screen()
+        self.begin_repl_typing()
+        self.persist_state()
+        try:
+            self.clear_and_paste_prompt(prompt.text, "telegram prompt")
+        except Exception as exc:  # noqa: BLE001
+            log("REPL", f"paste failed: {exc}")
+            self._end_clear_slash_turn()
+            self.telegram.send(f"codex REPL delivery failed: {exc}")
+            return
+        time.sleep(0.8)
+        if self.handle_slash_command_result(prompt.text):
+            self._end_clear_slash_turn()
+            return
+        watch = self._new_clear_watch(before_path, before_ino, prompt, before_visible)
+        mid = int(watch.get("flow_message_id") or 0)
+        if mid and self.flow_message_id == mid:
+            self.reset_flow_card()
+        if self._pending_clear_reset_confirmed(watch):
+            self.ensure_session_file()
+            sent = self.send_clear_notice(
+                CLEAR_SLASH_COMPLETE,
+                "slash /clear complete",
+                "slash /clear complete send failed",
+            )
+            if not sent:
+                watch["outcome"] = "complete"
+                self.pending_clear_watch = watch
+                self.persist_state()
+            else:
+                self.pending_clear_watch = watch
+                self._finish_clear_watch(watch)
+                self._settle_clear_owned_flow(watch, "complete")
+            self._end_clear_slash_turn()
+            return
+        self.pending_clear_watch = watch
+        self.persist_state()
+        self.send_clear_notice(
+            CLEAR_SLASH_DELIVERED,
+            "slash /clear delivered pending confirm",
+            "slash /clear delivered notice send failed",
+        )
+        self._end_clear_slash_turn()
 
     def approval_loop(self) -> None:
         while not self.stop_event.is_set():
             try:
                 screen = self.repl.capture_screen()
+                self.maybe_notify_fast_mode(screen, source="terminal_observe")
                 prompt = parse_approval_prompt(screen)
                 choice_prompt = None if prompt else parse_choice_prompt(screen)
                 should_send = False
@@ -7686,17 +9859,51 @@ class Bridge:
             response = self.telegram.call("getUpdates", offset=offset, timeout=self.config.poll_timeout)
             self.record_poll_heartbeat()
             if not response or not response.get("ok"):
+                log("POLL", "getUpdates not-ok")
                 time.sleep(2)
                 continue
-            for update in response.get("result", []):
+            result = response.get("result") or []
+            ids = [
+                int(item["update_id"])
+                for item in result
+                if isinstance(item, dict) and "update_id" in item
+            ]
+            if ids:
+                log("POLL", f"getUpdates ok n={len(ids)} max_update_id={max(ids)}")
+            else:
+                log("POLL", "getUpdates ok n=0")
+            for update in result:
                 if not isinstance(update, dict) or "update_id" not in update:
                     continue
                 update_id = int(update["update_id"])
                 offset = update_id + 1
+                meta = inbound_update_meta(update, self.config.chat_id)
+                log(
+                    "TGIN",
+                    f"update_id={meta.get('update_id')} kind={meta.get('kind')} "
+                    f"chat_match={meta.get('chat_match')}",
+                )
                 if update_id in processed_ids:
                     # Already delivered by a prior run that crashed before the
                     # offset was persisted; ack it now without re-injecting.
                     write_text_atomic(self.config.offset_file, offset)
+                    continue
+                if isinstance(update.get("callback_query"), dict):
+                    # Buttons are acked BEFORE dispatch, unlike messages below.
+                    # A button handler is allowed to replace the process — the
+                    # self-update one runs ``os.execv`` (perform_self_update),
+                    # which never returns, so the ack lines below are unreachable.
+                    # Deliver-first would then leave the press un-acked forever:
+                    # every restart gets the same callback_query redelivered,
+                    # re-runs the updater (pip: already satisfied → rc 0) and
+                    # re-sends "설치 성공" — 2026-08-07 16:54~16:56 작업 노드 챗 5건
+                    # (T-260807-023, same signature as T-260729-006).
+                    # at-least-once buys nothing here: a redelivered press is a
+                    # phantom second press, not a rescued 사용자 발화. clb has
+                    # always acked callbacks first for this reason.
+                    self._remember_processed_update(update_id, processed_ids)
+                    write_text_atomic(self.config.offset_file, offset)
+                    self.process_telegram_update(update)
                     continue
                 # Deliver BEFORE persisting the offset: a hard crash mid-delivery
                 # then leaves this update un-acked, so Telegram redelivers it on
@@ -7745,10 +9952,20 @@ class Bridge:
             return
         if self.handle_status_command(prompt.text):
             return
+        if is_session_reset_slash_command(prompt.text):
+            self.handle_clear_slash_telegram(prompt)
+            return
+        if self.handle_side_telegram_prompt(prompt):
+            return
         log("TG", "prompt -> Codex REPL")
         self.begin_repl_typing()
         slash_command = is_codex_slash_command(prompt.text)
-        self.begin_telegram_prompt_tracking(prompt.text, message_id=prompt.message_id)
+        queued_now = False
+        if self.should_queue_telegram_inbound():
+            self.queue_telegram_prompt(prompt.text, prompt.message_id)
+            queued_now = True
+        else:
+            self.begin_telegram_prompt_tracking(prompt.text, message_id=prompt.message_id)
         try:
             self.clear_and_paste_prompt(prompt.text, "telegram prompt")
             if slash_command:
@@ -7762,8 +9979,12 @@ class Bridge:
             self.stop_repl_typing()
             self.stop_long_running_progress()
             log("REPL", f"paste failed: {exc}")
-            self.resolve_midreport_obligation("blocked", "codex REPL delivery failed")
-            self.clear_active_telegram_prompt()
+            if queued_now:
+                self.unqueue_telegram_prompt(prompt.text, prompt.message_id)
+                log("REPL", "queued inbound paste failed; in-flight telegram anchor kept")
+            else:
+                self.resolve_midreport_obligation("blocked", "codex REPL delivery failed")
+                self.clear_active_telegram_prompt()
             self.telegram.send(f"codex REPL delivery failed: {exc}")
 
     def ensure_signal_fifo(self) -> None:
@@ -7820,6 +10041,7 @@ class Bridge:
                     self.stop_repl_typing()
                     self.stop_long_running_progress()
                     self.clear_active_telegram_prompt()
+                    self.unqueue_telegram_prompt(prompt_text)
         except Exception as exc:  # noqa: BLE001
             self.stop_repl_typing()
             self.stop_long_running_progress()
