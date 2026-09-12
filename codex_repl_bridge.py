@@ -5847,7 +5847,8 @@ class Bridge:
         self.telegram_fallback_sent = False
         self.session_path: Path | None = None
         self.session_identity: SessionIdentity | None = None
-        self.pending_clear_watch: dict[str, Any] | None = None
+        saved_watch = (read_json(self.config.state_path) or {}).get("pending_clear_watch")
+        self.pending_clear_watch: dict[str, Any] | None = dict(saved_watch) if isinstance(saved_watch, dict) else None
         self._completed_clear_key: tuple[str, int, int] | None = None
         self._clear_complete_claimed = False
         self.bridge_state: dict[str, Any] | None = None
@@ -8446,7 +8447,10 @@ class Bridge:
         return False
 
     def send_clear_notice(self, body: str, ok_log: str, fail_log: str) -> bool:
-        ok = bool(self.telegram.send(body))
+        try:
+            ok = bool(self.telegram.send(body))
+        except Exception:
+            ok = False
         log("SEND", ok_log if ok else fail_log)
         return ok
 
@@ -8565,13 +8569,27 @@ class Bridge:
         if self.flow_message_id == mid:
             self.reset_flow_card()
 
+    def _persist_clear_watch(self) -> None:
+        if self.session_identity is not None:
+            self.persist_state()
+            return
+        # Before the first post-restart bind, preserve the stored session and
+        # cursor verbatim. Only this acknowledgement record changes.
+        state = read_json(self.config.state_path) or {}
+        if self.pending_clear_watch is None:
+            state.pop("pending_clear_watch", None)
+        else:
+            state["pending_clear_watch"] = dict(self.pending_clear_watch)
+        write_json_atomic(self.config.state_path, state)
+
+
     def _mark_clear_outcome(self, watch: dict[str, Any], outcome: str) -> None:
         with self.lock:
             current = self.pending_clear_watch
             if isinstance(current, dict) and self._clear_watch_key(current) == self._clear_watch_key(watch):
                 current["outcome"] = outcome
                 self.pending_clear_watch = current
-                self.persist_state()
+                self._persist_clear_watch()
             elif isinstance(self.pending_clear_watch, dict):
                 pass
             else:
@@ -8584,9 +8602,13 @@ class Bridge:
                 return False
             if self._clear_watch_key(current) != self._clear_watch_key(watch):
                 return False
+            if float(self.now_fn()) < float(current.get("next_attempt_at") or 0):
+                return False
             if self._clear_complete_claimed:
                 return False
             self._clear_complete_claimed = True
+            current["next_attempt_at"] = float(self.now_fn()) + 5.0
+            self._persist_clear_watch()
             return True
 
     def _unclaim_clear_outcome(self) -> None:
@@ -8607,10 +8629,10 @@ class Bridge:
             self._completed_clear_key = key
             current = self.pending_clear_watch
             if isinstance(current, dict) and self._clear_watch_key(current) != key:
-                self.persist_state()
+                self._persist_clear_watch()
                 return
             self.pending_clear_watch = None
-            self.persist_state()
+            self._persist_clear_watch()
 
     def _send_pending_clear_complete(self, watch: dict[str, Any]) -> None:
         if str(watch.get("outcome") or "") == "timeout":
@@ -8646,11 +8668,25 @@ class Bridge:
         finally:
             self._unclaim_clear_outcome()
 
+    def _send_pending_clear_rejection(self, watch, outcome, body):
+        if not self._claim_clear_outcome(watch):
+            return
+        try:
+            self._mark_clear_outcome(watch, outcome)
+            if self.send_clear_notice(body, "slash /clear refused", "slash /clear refusal retry pending"):
+                self._finish_clear_watch(watch)
+                self._settle_clear_owned_flow(watch, "timeout")
+        finally:
+            self._unclaim_clear_outcome()
+
     def maybe_confirm_pending_clear(self) -> None:
         watch = self.pending_clear_watch
         if not isinstance(watch, dict):
             return
         outcome = str(watch.get("outcome") or "")
+        if outcome in {"busy", "side_unavailable"}:
+            self._send_pending_clear_rejection(watch, outcome, CLEAR_SLASH_BUSY if outcome == "busy" else CLEAR_SLASH_SIDE_UNAVAILABLE)
+            return
         if outcome == "timeout":
             self._send_pending_clear_timeout(watch)
             return
@@ -8662,18 +8698,21 @@ class Bridge:
             return
         if getattr(self.repl, "supports_pane_features", False):
             screen = self._visible_clear_screen()
-            if (is_side_screen(screen)
-                    and "'/clear' is unavailable in side conversations" in screen
-                    and self.send_clear_notice(CLEAR_SLASH_SIDE_UNAVAILABLE,
-                                               "slash /clear side refusal confirmed",
-                                               "slash /clear side refusal send failed")):
-                self._finish_clear_watch(watch)
-                self._settle_clear_owned_flow(watch, "timeout")
+            if CLEAR_DISABLED_RE.search(screen):
+                self._send_pending_clear_rejection(watch, "busy", CLEAR_SLASH_BUSY)
+                return
+            if "'/clear' is unavailable in side conversations" in screen:
+                self._send_pending_clear_rejection(watch, "side_unavailable", CLEAR_SLASH_SIDE_UNAVAILABLE)
                 return
         if self._clear_watch_timed_out(watch):
             self._send_pending_clear_timeout(watch)
 
     def handle_clear_slash_telegram(self, prompt: TelegramPrompt) -> None:
+        if isinstance(self.pending_clear_watch, dict):
+            self.maybe_confirm_pending_clear()
+            # A repeated request observes the existing reset, never resubmits it.
+            return
+        clear_text = re.sub(r"^/clear@[^\s]+", "/clear", prompt.text, flags=re.I)
         if getattr(self.repl, "supports_pane_features", False):
             screen = self.repl.capture_screen(80)
             if is_side_screen(screen):
@@ -8712,39 +8751,31 @@ class Bridge:
         self.begin_repl_typing()
         self.persist_state()
         try:
-            self.clear_and_paste_prompt(prompt.text, "telegram prompt")
+            self.clear_and_paste_prompt(clear_text, "telegram prompt")
         except Exception as exc:  # noqa: BLE001
             log("REPL", f"paste failed: {exc}")
             self._end_clear_slash_turn()
             self.telegram.send(f"codex REPL delivery failed: {exc}")
             return
         time.sleep(0.8)
-        if self.handle_slash_command_result(prompt.text):
+        if self.handle_slash_command_result(clear_text):
             self._end_clear_slash_turn()
             return
         watch = self._new_clear_watch(before_path, before_ino, prompt, before_visible)
         mid = int(watch.get("flow_message_id") or 0)
         if mid and self.flow_message_id == mid:
             self.reset_flow_card()
+        self.pending_clear_watch = watch
+        self._persist_clear_watch()
         if self._pending_clear_reset_confirmed(watch):
-            self.ensure_session_file()
-            sent = self.send_clear_notice(
-                CLEAR_SLASH_COMPLETE,
-                "slash /clear complete",
-                "slash /clear complete send failed",
-            )
-            if not sent:
-                watch["outcome"] = "complete"
-                self.pending_clear_watch = watch
-                self.persist_state()
-            else:
-                self.pending_clear_watch = watch
-                self._finish_clear_watch(watch)
-                self._settle_clear_owned_flow(watch, "complete")
+            self._send_pending_clear_complete(watch)
             self._end_clear_slash_turn()
             return
-        self.pending_clear_watch = watch
-        self.persist_state()
+        screen = self._visible_clear_screen()
+        if CLEAR_DISABLED_RE.search(screen) or "'/clear' is unavailable in side conversations" in screen:
+            self.maybe_confirm_pending_clear()
+            self._end_clear_slash_turn()
+            return
         self.send_clear_notice(
             CLEAR_SLASH_DELIVERED,
             "slash /clear delivered pending confirm",
