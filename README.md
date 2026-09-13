@@ -1066,3 +1066,14 @@ extra installs local audio transcription dependencies.
 ```bash
 python3 -m unittest discover -s tests
 ```
+
+### Suggested reply display switch
+
+`SUGGESTED_REPLY_BUBBLE=1` (default) separates a final
+`<추천답변>...</추천답변>` into the configured copy-ready suggestion surface.
+Set `SUGGESTED_REPLY_BUBBLE=0` in the bridge service environment and restart
+the bridge to disable that display processing. This is a rendering switch;
+it does not instruct Codex to generate recommendations. Recommendations must
+come from your own agent instructions and may be omitted when no next action
+is useful. Cursor's `CUB_SUGGESTED_TAIL_PROMPT` is a separate product setting
+and has no effect on this Codex package.
