@@ -291,7 +291,7 @@ class ChoiceAcknowledgementTests(unittest.TestCase):
         self.assertIn('✅ 제출 확인', b.telegram.update_choice_prompt.call_args.args[2])
 
     def test_observed_live_answer_envelope(self):
-        fixture = json.loads((SCRIPTS / 'tests/fixtures/codex_async_choice_answer.json').read_text())
+        fixture = json.loads((SCRIPTS / 'tests/fixtures/codex_async_choice_answer.json').read_text(encoding='utf-8'))
         b = self.bridge([SCREEN])
         prompt = m.replace(b.pending_choice, title=fixture['question']['title'])
         option = m.ChoiceOption(value='1', label=fixture['question']['options'][0])

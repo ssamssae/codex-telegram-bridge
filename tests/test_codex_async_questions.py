@@ -1,5 +1,6 @@
 import importlib.util
 import json
+import os
 import sys
 import tempfile
 import threading
@@ -135,6 +136,7 @@ class QuestionsTest(unittest.TestCase):
         self.q.observe(request(name='request_user_input'), SESSION)
         self.assertFalse(self.q.items)
 
+    @unittest.skipIf(os.name == "nt", "POSIX mode bits; Windows uses inherited ACLs")
     def test_state_file_private(self):
         self.open()
         self.assertEqual(self.path.stat().st_mode & 0o777, 0o600)

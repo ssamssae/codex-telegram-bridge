@@ -35,11 +35,14 @@ class AsyncQuestions:
                 out.flush()
                 os.fsync(out.fileno())
             os.replace(name, self.path)
-            directory = os.open(self.path.parent, os.O_RDONLY)
-            try:
-                os.fsync(directory)
-            finally:
-                os.close(directory)
+            # Windows cannot open directories through os.open; file fsync and
+            # atomic replacement still apply. POSIX also persists the rename.
+            if os.name != 'nt':
+                directory = os.open(self.path.parent, os.O_RDONLY)
+                try:
+                    os.fsync(directory)
+                finally:
+                    os.close(directory)
         finally:
             if os.path.exists(name):
                 os.unlink(name)
