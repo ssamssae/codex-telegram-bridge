@@ -1077,3 +1077,26 @@ it does not instruct Codex to generate recommendations. Recommendations must
 come from your own agent instructions and may be omitted when no next action
 is useful. Cursor's `CUB_SUGGESTED_TAIL_PROMPT` is a separate product setting
 and has no effect on this Codex package.
+
+## Suggested replies and confirmation buttons
+
+Set `CRB_SUGGESTED_TAIL_PROMPT=1` in the bridge service environment to request
+a useful follow-up suggestion on ordinary Telegram inputs. Set it to `0` to
+disable the generation instruction. Restart the bridge after environment changes.
+The model may omit suggestions when there is no useful follow-up; existing
+conversation instructions can still influence its output.
+
+Alternatively, create `~/.config/codex-telegram-bridge/suggested-generation.on`
+to enable generation without a restart, or rename/remove that flag to disable it.
+An explicit `CRB_SUGGESTED_TAIL_PROMPT` environment value overrides the file.
+`SUGGESTED_REPLY_BUBBLE=1` controls suggestion display separately.
+
+`CRB_SUGGESTED_CONFIRM=1` (default) adds a confirmation button below a new
+suggestion. Clicking submits that suggestion to the connected Codex terminal;
+it is not a clipboard-only action. Set it to `0` and restart the bridge to keep
+the suggestion text without the button. Existing messages are not retrofitted.
+
+The sent indicator means terminal submission, not task completion. Draft input,
+selection/approval screens, changed sessions, and expired buttons block submission.
+Persisted state prevents repeated clicks from submitting twice, including after
+a restart. Uncertain delivery is marked for review and is not retried automatically.
