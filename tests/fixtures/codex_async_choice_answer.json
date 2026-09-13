@@ -1,0 +1,28 @@
+{
+  "question": {
+    "title": "제출 확인 표시를 보완한 뒤 최종 검증이야. 결과에 남길 문구를 아래 버튼에서 하나 골라줘. 선택은 검증에만 사용하고 추가 작업은 실행하지 않아.",
+    "options": [
+      "제출 확인 완료",
+      "지연 응답 확인"
+    ]
+  },
+  "answer_record": {
+    "type": "response_item",
+    "timestamp": "2026-09-12T12:41:56.873Z",
+    "payload": {
+      "type": "message",
+      "role": "user",
+      "content": [
+        {
+          "type": "input_text",
+          "text": "> 제출 확인 표시를 보완한 뒤 최종 검증이야. 결과에 남길 문구를 아래 버튼에서 하나 골라줘. 선택은 검증에만 사용하고 추가 작업은 실행하지 않아.\n\n제출 확인 완료"
+        }
+      ],
+      "internal_chat_message_metadata_passthrough": {
+        "content_item_kinds": [
+          "user.text"
+        ]
+      }
+    }
+  }
+}

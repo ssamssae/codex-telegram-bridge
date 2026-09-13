@@ -34,7 +34,7 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass, replace
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -45,6 +45,7 @@ if _SCRIPTS_DIR not in sys.path:
     sys.path.insert(0, _SCRIPTS_DIR)
 import bridge_flow_progress as _flow_progress  # noqa: E402
 from bridge_public_text import strip_memory_citation  # noqa: E402
+from codex_async_questions import AsyncQuestions, PREFIX as ASYNC_QUESTION_PREFIX
 from codex_side_reply import SideReplyMirror, latest_completed_side_reply, is_side_screen, prompt_key  # noqa: E402
 
 try:
@@ -516,16 +517,10 @@ def apply_suggested_reply_confirmation(
         log("SEND", "suggested reply confirmation failed (non-fatal)")
 
 
-# T-260730-062 — claude-telegram-bridge.py 와 같은 렌더러의 형제 사본이다. 표시에서
-# 이모지·화살표를 뺀다. 두 브릿지 프레임은 공용 renderer fixture 가 ★동일하도록 강제하므로
-# 한쪽만 바꿀 수 없다.
-# 프레임이 전부 같아지면 editMessageText 가 400(message is not modified)을 내고 회전이
-# 죽으므로, 이모지 대신 텍스트(가운뎃점)로 프레임을 다르게 만든다.
-# 사유·불변식 전문은 claude-telegram-bridge.py 의 같은 상수 주석 참조.
-EYE_ACTIVITY_SUFFIXES = ("", "·", "··", "···")
+# Static activity notice: cosmetic edits waste Telegram API requests.
+EYE_ACTIVITY_SUFFIXES = ("",)
 EYE_ACTIVITY_EDIT_MIN_SECONDS = 3.0
-EYE_ACTIVITY_MAX_EDITS = 40
-
+EYE_ACTIVITY_MAX_EDITS = 0
 
 def eye_activity_frames(label: str, enabled: bool, surface: str) -> list[str]:
     if not enabled or surface != "aniki_dm":
@@ -580,21 +575,8 @@ def start_eye_activity_loop(
             log("ACTIVITY", "eyes start skipped: send failed")
             return
         try:
-            frame_index = 1
-            edits = 0
-            while edits < EYE_ACTIVITY_MAX_EDITS:
-                if stop_event.wait(EYE_ACTIVITY_EDIT_MIN_SECONDS):
-                    break
-                try:
-                    if not edit_activity(message_id, frames[frame_index % len(frames)]):
-                        break
-                except Exception as exc:  # noqa: BLE001
-                    log("ACTIVITY", f"eyes edit skipped: {exc}")
-                    break
-                edits += 1
-                frame_index += 1
-            if not stop_event.is_set():
-                stop_event.wait()
+            # Keep the single notice until the turn ends; never animate it.
+            stop_event.wait()
         finally:
             try:
                 if not delete_activity(message_id):
@@ -1847,7 +1829,29 @@ def strip_internal_prompt_headers(text: str) -> str:
     return "\n".join(lines).strip()
 
 
+def format_mac_report(text: str) -> str | None:
+    """Recognize only a leading mac-report envelope, retaining the full report."""
+    lines = (text or "").strip().splitlines()
+    route = ""
+    if lines and re.fullmatch(r"\[[^\]\n]+(?:→|->)[^\]\n]+\]", lines[0].strip()):
+        route = lines.pop(0).strip()[1:-1].strip()
+    if not lines:
+        return None
+    title = re.fullmatch(r"\[Mac report title:\s*(.+)\]", lines[0].strip())
+    if not title:
+        return None
+    lines.pop(0)
+    if lines and re.fullmatch(r"\[Mac report engine:\s*[^\]]+\]", lines[0].strip()):
+        lines.pop(0)
+    from terminal_turn_mirror import mask_secrets
+    parts = ["📨 받은 보고", route, "제목: " + title.group(1), "\n" + "\n".join(lines).strip()]
+    return mask_secrets("\n".join(part for part in parts if part).strip())
+
+
 def format_sent_directive(text: str, from_alias: str, to_alias: str) -> str:
+    report = format_mac_report(text)
+    if report is not None:
+        return report
     body = strip_internal_prompt_headers(
         strip_inline_node_emoji_header(strip_node_emoji_header(text or ""))
     )
@@ -4361,6 +4365,16 @@ class TmuxTransport:
 
         self.send_key(option.value)
 
+    def focus_pending_question(self) -> None:
+        # Navigation only. Never use send_key here: it also sends Enter.
+        self.tmux("send-keys", "-t", self.config.pane_target, "S-Left")
+
+    def send_choice_text(self, text: str) -> None:
+        # Caller has verified the empty question editor and holds composer_lock.
+        self.tmux("load-buffer", "-", input_text=text)
+        self.tmux("paste-buffer", "-p", "-t", self.config.pane_target)
+        self.tmux("send-keys", "-t", self.config.pane_target, "Enter")
+
     send_approval_key = send_key
 
     def send_choice_option(self, prompt: ChoicePrompt, option: ChoiceOption) -> None:
@@ -5072,6 +5086,8 @@ class ChoicePrompt:
     source_head: str = "codex_repl"
     expires_at: float = 0.0
     cancelled: bool = False
+    instance_id: str = ""
+    session_path: str = ""
 
     @classmethod
     def create(
@@ -5102,7 +5118,7 @@ class ChoicePrompt:
 
     @property
     def short_signature(self) -> str:
-        return self.signature[:16]
+        return self.instance_id or self.signature[:16]
 
     def is_expired(self, now: float | None = None) -> bool:
         if self.expires_at <= 0:
@@ -5226,7 +5242,7 @@ CHOICE_CHROME_CHARS = frozenset("─━═_┌┐└┘┬┴├┤┼╭╮╰�
 CHOICE_BOX_TOP_CHARS = "┌╭"
 CHOICE_HINT_RE = re.compile(
     r"\b("
-    r"press\s+enter|enter\s+to\s+confirm|esc\s+to\s+cancel|escape\s+to\s+cancel|"
+    r"press\s+enter|enter\s+submit|ctrl\s*\+\s*\]\s*skip|enter\s+to\s+confirm|esc\s+to\s+cancel|escape\s+to\s+cancel|"
     r"use\s+(?:the\s+)?(?:arrow|up|down|↑|↓)|select(?:\s+one)?|choose(?:\s+one)?|"
     r"confirm\s+or\s+cancel"
     r")\b",
@@ -5767,6 +5783,12 @@ class Bridge:
         self.poll_heartbeat_lock = threading.Lock()
         self.approval_lock = threading.Lock()
         self.choice_lock = threading.Lock()
+        self.choice_submit_lock = threading.Lock()
+        self.choice_focus_request: dict[str, Any] | None = None
+        self.choice_focus_seen: set[str] = set()
+        self.choice_focus_attempt_at = 0.0
+        self.choice_text_request: dict[str, Any] | None = None
+        self.choice_confirmations: dict[str, dict[str, Any]] = {}
         self.repl_typing_stop: threading.Event | None = None
         self.long_running_progress_stop: threading.Event | None = None
         # A persisted active prompt may survive a hard bridge restart. Progress
@@ -5866,6 +5888,87 @@ class Bridge:
         self.side_reply_mirror: SideReplyMirror | None = None
         self.side_reply_lock = threading.RLock()
         self.last_side_poll_at = 0.0
+        self.async_questions_lock = threading.RLock()
+        self.async_questions = None
+
+    def get_async_questions(self):
+        with self.async_questions_lock:
+            if self.async_questions is None:
+                path = self.config.state_path.with_name(self.config.state_path.stem + ".questions.json")
+                self.async_questions = AsyncQuestions(path, self.telegram, self.submit_async_answer)
+            return self.async_questions
+
+    def submit_async_answer(self, text, message_id):
+        """Submit only inside the matching native question, never the composer."""
+        questions = self.get_async_questions()
+        candidates = []
+        for item in questions.items.values():
+            prefix = '> ' + item['title'].replace('\n', '\n> ') + '\n\n'
+            if item['status'] == 'submitting' and text.startswith(prefix):
+                candidates.append((item, text[len(prefix):]))
+        if len(candidates) != 1 or self.config.bridge_kill:
+            raise RuntimeError('No unique active question')
+        item, answer = candidates[0]
+        normalize = canonical_choice_signature_text
+        with self.repl.composer_lock():
+            if str(self.repl.session_file()) != item['session']:
+                raise RuntimeError('Question session changed')
+            screen = self.repl.capture_visible_screen()
+            if parse_approval_prompt(screen):
+                raise RuntimeError('Approval panel is open')
+            prompt = parse_choice_prompt(screen)
+            if prompt is None:
+                # This live TUI has no shared app-server response connection.
+                # Navigate only when its own pending-question hint is visible.
+                if not re.search(r'shift\s*\+\s*←\s*to answer', screen, re.IGNORECASE):
+                    raise RuntimeError('No pending native question hint')
+                focus = getattr(self.repl, 'focus_pending_question', None)
+                if not callable(focus):
+                    raise RuntimeError('Native question navigation unavailable')
+                focus()
+                for _ in range(10):
+                    time.sleep(0.1)
+                    screen = self.repl.capture_visible_screen()
+                    if parse_approval_prompt(screen):
+                        raise RuntimeError('Approval panel appeared')
+                    prompt = parse_choice_prompt(screen)
+                    if prompt:
+                        break
+            # Full title and all supplied labels must survive wrapping. Never
+            # guess a choice by index on an unrelated or truncated panel.
+            if (prompt is None or normalize(item['title']) not in normalize(screen)
+                    or any(normalize(label) not in normalize(screen) for label in item['options'])):
+                raise RuntimeError('Native question does not match event')
+            matches = [option for option in prompt.options
+                       if normalize(option.label) == normalize(answer)]
+            if len(matches) != 1:
+                raise RuntimeError('Native answer option not verified; no text fallback')
+            selected = prompt.selected_option()
+            if selected is None:
+                raise RuntimeError('Native selected option unavailable')
+            option = matches[0]
+            self.repl.send_choice(TransportChoice(value=option.value, key='',
+                index=option.index, selected_index=selected.index))
+            # A key ACK or an ordinary quoted user message is not completion.
+            clear_reads = 0
+            for _ in range(15):
+                time.sleep(0.15)
+                screen = self.repl.capture_visible_screen()
+                current = parse_choice_prompt(screen)
+                old_panel = current is not None and normalize(item['title']) in normalize(screen)
+                if screen.strip() and not old_panel and not re.search(r'shift\s*\+\s*←\s*to answer', screen, re.IGNORECASE) and (
+                        screen_has_repl_busy_marker(screen) or any(line.lstrip().startswith('›') for line in screen.splitlines())):
+                    clear_reads += 1
+                    if clear_reads >= 2:
+                        item['status'] = 'answered'
+                        questions.save()
+                        log('CHOICE', 'async native question closed after submission')
+                        return True
+                else:
+                    clear_reads = 0
+            item['status'] = 'uncertain'
+            questions.save()
+            raise RuntimeError('Native question completion not confirmed')
 
     def acquire_lock(self) -> None:
         # flock 기반 락 — 프로세스 사망 시 커널이 자동 해제하고 PID 재사용에 면역.
@@ -6094,7 +6197,7 @@ class Bridge:
             emitted = True
         return emitted
 
-    def handle_user_event(self, text: str) -> None:
+    def handle_user_event(self, text: str) -> bool | None:
         self.clear_midreport_recovery_candidate()
         self.mark_repl_activity()
         self.suppress_until_user = False
@@ -6130,7 +6233,8 @@ class Bridge:
         self.current_origin = "terminal"
         self.stop_telegram_fallback()
         self.clear_active_telegram_prompt()
-        self.emit_sent_directive_card(text)
+        if self.emit_sent_directive_card(text) is False and format_mac_report(text) is not None:
+            return False
         log("JSONL", "terminal-origin prompt")
         self.begin_repl_typing()
         with self.midreport_lock:
@@ -6142,7 +6246,7 @@ class Bridge:
                 self.midreport_prompt = normalize_prompt(text)
         self.start_long_running_progress(text)
 
-    def emit_sent_directive_card(self, text: str) -> None:
+    def emit_sent_directive_card(self, text: str) -> bool:
         if self.config.bridge_kill:
             log("SEND", "sent-directive echo blocked by CRB_KILL=1")
             return
@@ -6152,8 +6256,9 @@ class Bridge:
             return
         if not self.telegram.send(message, viewer=True):
             log("SEND", "sent-directive echo failed")
-            return
+            return False
         log("SEND", "sent terminal-origin directive card")
+        return True
 
     def emit_received_telegram_directive_card(self, text: str) -> None:
         if self.config.bridge_kill:
@@ -6393,6 +6498,38 @@ class Bridge:
         # persisted across restart (anti-fragmentation): clear the saved card id too, so a
         # restart right after reset starts a fresh card instead of resuming a stale one.
         self.persist_state()
+
+    def send_public_commentary(self, record: dict[str, Any], text: str) -> bool:
+        """Deliver completed public messages independently of receipt/follow-up flags."""
+        text = strip_memory_citation(text).strip()
+        if not text:
+            return True
+        if self.config.bridge_kill:
+            return False
+        payload = record.get("payload") or {}
+        metadata = payload.get("internal_chat_message_metadata_passthrough") or {}
+        turn_id = str(metadata.get("turn_id") or payload.get("turn_id") or
+                      (self.bridge_state or {}).get("active_turn", {}).get("id") or "")
+        # Paired event_msg/response_item records have different timestamps.
+        # Deduplicate the complete text within the session/turn, not its prefix.
+        scope = turn_id or str(self.active_telegram_message_id or self.current_flow_scope or "")
+        raw = "\0".join(("commentary", str(self.session_path or ""), scope, text))
+        key = hashlib.sha256(raw.encode("utf-8")).hexdigest()
+        if self.bridge_state is not None and ring_contains(self.bridge_state, key):
+            return True
+        try:
+            # Do not attach to the latest input: a newer input may have arrived
+            # while this older answer was being produced.
+            if not self.telegram.send(text):
+                return False
+        except Exception as exc:  # noqa: BLE001
+            log("SEND", f"public commentary failed: {type(exc).__name__}")
+            return False
+        with self.lock:
+            self.followup_reply_message_id = 0
+        self.persist_state(event_key=key)
+        log("SEND", "public commentary delivered")
+        return True
 
     def maybe_send_followup_reply(self, text: str) -> bool:
         """Deliver the first public answer to a confirmed follow-up, keeping work open."""
@@ -6926,12 +7063,16 @@ class Bridge:
         except json.JSONDecodeError:
             return True
         payload = record.get("payload") if isinstance(record.get("payload"), dict) else {}
+        self.observe_choice_request(record)
+        self.confirm_choice_answer(record)
         if record.get("type") == "event_msg" and payload.get("type") == "task_started":
             if self.bridge_state is not None:
                 self.bridge_state["active_turn"] = {
                     "id": str(payload.get("turn_id") or ""),
                     "session_path": str(self.session_path or ""),
                 }
+        if getattr(self, "async_questions_lock", None) is not None and not self.config.bridge_kill:
+            self.get_async_questions().observe(record, str(self.session_path or ""))
         event = extract_event(record)
         if not event:
             if line_end is not None:
@@ -6939,6 +7080,12 @@ class Bridge:
             return True
         kind, text = event
         if kind == "user":
+            report_key = ("mac-report:" + hashlib.sha256(text.encode()).hexdigest()
+                          if format_mac_report(text) is not None else "")
+            if report_key and self.bridge_state and ring_contains(self.bridge_state, report_key):
+                if line_end is not None:
+                    self.persist_state(line_end)
+                return True
             # Some CLI versions emit both representations of the same input.
             # Do not reset the flow card or consume the Telegram match twice.
             source = str(record.get("type") or "")
@@ -6962,7 +7109,10 @@ class Bridge:
                     self.persist_state(line_end)
                 return True
             self.last_user_pair_sources = {source} if source else set()
-            self.handle_user_event(text)
+            if self.handle_user_event(text) is False:
+                return False
+            if report_key:
+                self.persist_state(event_key=report_key)
             if line_end is not None:
                 self.persist_state(line_end)
             return True
@@ -6974,7 +7124,7 @@ class Bridge:
             return True
         elif kind == "progress":
             self.handle_public_progress(text)
-            if not self.maybe_send_followup_reply(text):
+            if not self.send_public_commentary(record, text):
                 return False
             if line_end is not None:
                 self.persist_state(line_end)
@@ -7073,6 +7223,9 @@ class Bridge:
             state = read_json(self.config.state_path)
             cursor = cursor_offset_for_state(state, identity)
             self.session_path = path
+            self.choice_focus_request = None
+            self.choice_focus_seen = set()
+            self.recover_choice_request(path)
             self.session_identity = identity
             self.clear_midreport_recovery_candidate()
             if state:
@@ -8783,117 +8936,249 @@ class Bridge:
         )
         self._end_clear_slash_turn()
 
+    def observe_choice_request(self, record: dict[str, Any]) -> None:
+        """JSONL is a wake-up hint, never authority to submit a stored answer."""
+        if not isinstance(record, dict):
+            return
+        payload = record.get("payload") or {}
+        if (record.get("type") != "response_item" or not isinstance(payload, dict)
+                or payload.get("type") != "function_call"
+                or str(payload.get("name", "")).split(".")[-1]
+                not in {"request_user_input"}):
+            return
+        try:
+            args = json.loads(payload.get("arguments") or "{}")
+        except (TypeError, ValueError):
+            return
+        if not isinstance(args, dict):
+            return
+        questions = args.get("questions")
+        if not isinstance(questions, list):
+            return
+        titles = [str(q.get("question") or q.get("title") or "")
+                  for q in questions if isinstance(q, dict)]
+        call_id = str(payload.get("call_id") or "")
+        if not call_id or not any(titles):
+            return
+        # Some test/legacy consumers construct Bridge without __init__.
+        seen = getattr(self, "choice_focus_seen", set())
+        self.choice_focus_seen = seen
+        if call_id in seen:
+            return
+        seen.add(call_id)
+        if len(seen) > 256:
+            self.choice_focus_seen = {call_id}
+        previous = getattr(self, "choice_focus_request", None)
+        if previous:
+            titles = list(dict.fromkeys(previous["titles"] + titles))
+        self.choice_focus_request = {"titles": titles, "attempts": 0}
+        self.choice_focus_attempt_at = 0.0
+
+    def note_choice_visible(self, prompt: ChoicePrompt) -> None:
+        request = getattr(self, "choice_focus_request", None)
+        if not request:
+            return
+        title = canonical_choice_signature_text(prompt.title)
+        remaining = [item for item in request["titles"]
+                     if canonical_choice_signature_text(item) != title]
+        if not remaining:
+            self.choice_focus_request = None
+        elif remaining != request["titles"]:
+            self.choice_focus_request = {"titles": remaining, "attempts": 0}
+
+    def recover_choice_request(self, path: Path) -> None:
+        """Recover the latest hint on restart without replaying user input."""
+        try:
+            with path.open("rb") as stream:
+                stream.seek(0, 2)
+                stream.seek(max(0, stream.tell() - 2 * 1024 * 1024))
+                lines = stream.read().decode("utf-8", errors="replace").splitlines()
+            for line in reversed(lines):
+                try:
+                    record = json.loads(line)
+                except ValueError:
+                    continue
+                self.observe_choice_request(record)
+                if getattr(self, "choice_focus_request", None):
+                    self.choice_focus_request["recovered"] = True
+                    break
+        except OSError:
+            pass
+
+    def choice_visible_screen(self) -> str:
+        capture = getattr(self.repl, "capture_visible_screen", None)
+        if getattr(self.repl, "supports_pane_features", False) and callable(capture):
+            return capture()
+        return self.repl.capture_screen()
+
+    def choice_screen(self, expected: ChoicePrompt | None = None) -> str:
+        screen = self.choice_visible_screen()
+        if self.config.bridge_kill:
+            return screen
+        current = parse_choice_prompt(screen)
+        if current or parse_approval_prompt(screen):
+            if current:
+                self.note_choice_visible(current)
+            return screen
+        request = getattr(self, "choice_focus_request", None)
+        focus = getattr(self.repl, "focus_pending_question", None)
+        if not callable(focus) or (not request and expected is None):
+            return screen
+        if expected is None and (request["attempts"] >= 3
+                or time.monotonic() - self.choice_focus_attempt_at < 2):
+            return screen
+        if request:
+            request["attempts"] += 1
+        self.choice_focus_attempt_at = time.monotonic()
+        # The transport lock also protects against ordinary Telegram paste.
+        lock = getattr(self.repl, "composer_lock", nullcontext)
+        with lock():
+            focus()
+            for _ in range(5):
+                time.sleep(0.1)
+                screen = self.choice_visible_screen()
+                if parse_choice_prompt(screen) or parse_approval_prompt(screen):
+                    break
+        if parse_choice_prompt(screen):
+            self.note_choice_visible(parse_choice_prompt(screen))
+        elif request and request["attempts"] == 3 and not request.get("recovered"):
+            self.telegram.send("선택형 질문 요청을 감지했지만 터미널 질문 화면을 확인하지 못했습니다. /choices로 다시 확인할 수 있습니다. 선택은 전송하지 않았습니다.")
+        return screen
+
+    def choice_submission_confirmed(self, prompt: ChoicePrompt) -> bool:
+        """Require two nonblank visible redraws past this question, not a key ACK."""
+        clear_reads = 0
+        for _ in range(12):
+            time.sleep(0.15)
+            screen = self.choice_visible_screen()
+            current = parse_choice_prompt(screen)
+            title_visible = canonical_choice_signature_text(prompt.title) in canonical_choice_signature_text(screen)
+            if screen.strip() and not title_visible and (current is not None or
+                    screen_has_repl_busy_marker(screen) or
+                    any(line.lstrip().startswith("›") for line in screen.splitlines())):
+                clear_reads += 1
+                if clear_reads >= 2:
+                    return True
+            else:
+                clear_reads = 0
+        return False
+
     def approval_loop(self) -> None:
         while not self.stop_event.is_set():
             try:
-                screen = self.repl.capture_screen()
-                self.maybe_notify_fast_mode(screen, source="terminal_observe")
-                prompt = parse_approval_prompt(screen)
-                choice_prompt = None if prompt else parse_choice_prompt(screen)
-                should_send = False
-                if prompt:
-                    with self.choice_lock:
-                        choice_to_clear = self.pending_choice
-                        choice_message_id = self.pending_choice_message_id
-                        if choice_to_clear is not None:
-                            log("CHOICE", "choice prompt cleared by approval")
-                            if choice_to_clear.signature not in self.resolved_choice_ids:
-                                self.telegram.update_choice_prompt(
-                                    choice_message_id,
-                                    choice_to_clear,
-                                    "Selection prompt is no longer active.",
-                                )
-                        self.pending_choice = None
-                        self.pending_choice_message_id = None
-                    with self.approval_lock:
-                        previous = self.pending_approval
-                        if previous is None or previous.signature != prompt.signature:
-                            self.pending_approval = prompt
-                            self.pending_approval_message_id = None
-                            self.pending_approval_send_attempt_at = 0.0
-                            should_send = True
-                        elif should_resend_prompt_card(
-                            self.pending_approval_message_id,
-                            prompt.signature,
-                            self.resolved_approval_ids,
-                            self.pending_approval_send_attempt_at,
-                            time.monotonic(),
-                        ):
-                            # C3 (T-260705-72): 발송 실패 승인카드 재발송
-                            should_send = True
-                        if should_send:
-                            self.pending_approval_send_attempt_at = time.monotonic()
-                    if should_send:
-                        log("APPROV", f"approval prompt detected {prompt.short_signature}")
-                        message_id = self.telegram.send_approval_prompt(prompt)
-                        with self.approval_lock:
-                            if self.pending_approval and self.pending_approval.signature == prompt.signature:
-                                self.pending_approval_message_id = message_id
-                elif choice_prompt:
-                    with self.approval_lock:
-                        prompt_to_clear = self.pending_approval
-                        message_id = self.pending_approval_message_id
-                        if prompt_to_clear is not None:
-                            log("APPROV", "approval prompt cleared by choice")
-                            if prompt_to_clear.signature not in self.resolved_approval_ids:
-                                self.telegram.update_approval_prompt(
-                                    message_id,
-                                    prompt_to_clear,
-                                    "Approval prompt is no longer active.",
-                                )
-                        self.pending_approval = None
-                        self.pending_approval_message_id = None
-                    with self.choice_lock:
-                        previous_choice = self.pending_choice
-                        if previous_choice is None or previous_choice.signature != choice_prompt.signature:
-                            self.pending_choice = choice_prompt
-                            self.pending_choice_message_id = None
-                            self.pending_choice_send_attempt_at = 0.0
-                            should_send = True
-                        elif should_resend_prompt_card(
-                            self.pending_choice_message_id,
-                            choice_prompt.signature,
-                            self.resolved_choice_ids,
-                            self.pending_choice_send_attempt_at,
-                            time.monotonic(),
-                        ):
-                            # C3 (T-260705-72): 발송 실패 선택카드 재발송 — 승인카드와 동형
-                            should_send = True
-                        if should_send:
-                            self.pending_choice_send_attempt_at = time.monotonic()
-                    if should_send:
-                        log("CHOICE", f"choice prompt detected {choice_prompt.short_signature}")
-                        message_id = self.telegram.send_choice_prompt(choice_prompt)
+                with self.choice_submit_lock:
+                    self.expire_choice_confirmations()
+                    screen = self.choice_screen()
+                    self.maybe_notify_fast_mode(screen, source="terminal_observe")
+                    prompt = parse_approval_prompt(screen)
+                    choice_prompt = None if prompt else parse_choice_prompt(screen)
+                    if choice_prompt and getattr(self, "async_questions_lock", None) is not None and self.get_async_questions().owns_title(choice_prompt.title, str(self.session_path or "")):
+                        choice_prompt = None
+                    should_send = False
+                    if prompt:
                         with self.choice_lock:
-                            if self.pending_choice and self.pending_choice.signature == choice_prompt.signature:
-                                self.pending_choice_message_id = message_id
-                else:
-                    with self.approval_lock:
-                        prompt_to_clear = self.pending_approval
-                        message_id = self.pending_approval_message_id
-                        if prompt_to_clear is not None:
-                            log("APPROV", "approval prompt cleared")
-                            if prompt_to_clear.signature not in self.resolved_approval_ids:
-                                self.telegram.update_approval_prompt(
-                                    message_id,
-                                    prompt_to_clear,
-                                    "Approval prompt is no longer active.",
-                                )
-                        self.pending_approval = None
-                        self.pending_approval_message_id = None
-                    with self.choice_lock:
-                        choice_to_clear = self.pending_choice
-                        message_id = self.pending_choice_message_id
-                        if choice_to_clear is not None:
-                            log("CHOICE", "choice prompt cleared")
-                            if choice_to_clear.signature not in self.resolved_choice_ids:
-                                self.telegram.update_choice_prompt(
-                                    message_id,
-                                    choice_to_clear,
-                                    "Selection prompt is no longer active.",
-                                )
-                        self.pending_choice = None
-                        self.pending_choice_message_id = None
+                            choice_to_clear = self.pending_choice
+                            choice_message_id = self.pending_choice_message_id
+                            if choice_to_clear is not None:
+                                log("CHOICE", "choice prompt cleared by approval")
+                                if choice_to_clear.short_signature not in self.resolved_choice_ids:
+                                    self.telegram.update_choice_prompt(
+                                        choice_message_id,
+                                        choice_to_clear,
+                                        "Selection prompt is no longer active.",
+                                    )
+                            self.pending_choice = None
+                            self.pending_choice_message_id = None
+                        with self.approval_lock:
+                            previous = self.pending_approval
+                            if previous is None or previous.signature != prompt.signature:
+                                self.pending_approval = prompt
+                                self.pending_approval_message_id = None
+                                self.pending_approval_send_attempt_at = 0.0
+                                should_send = True
+                            elif should_resend_prompt_card(
+                                self.pending_approval_message_id,
+                                prompt.signature,
+                                self.resolved_approval_ids,
+                                self.pending_approval_send_attempt_at,
+                                time.monotonic(),
+                            ):
+                                # C3 (T-260705-72): 발송 실패 승인카드 재발송
+                                should_send = True
+                            if should_send:
+                                self.pending_approval_send_attempt_at = time.monotonic()
+                        if should_send:
+                            log("APPROV", f"approval prompt detected {prompt.short_signature}")
+                            message_id = self.telegram.send_approval_prompt(prompt)
+                            with self.approval_lock:
+                                if self.pending_approval and self.pending_approval.signature == prompt.signature:
+                                    self.pending_approval_message_id = message_id
+                    elif choice_prompt:
+                        with self.approval_lock:
+                            prompt_to_clear = self.pending_approval
+                            message_id = self.pending_approval_message_id
+                            if prompt_to_clear is not None:
+                                log("APPROV", "approval prompt cleared by choice")
+                                if prompt_to_clear.signature not in self.resolved_approval_ids:
+                                    self.telegram.update_approval_prompt(
+                                        message_id,
+                                        prompt_to_clear,
+                                        "Approval prompt is no longer active.",
+                                    )
+                            self.pending_approval = None
+                            self.pending_approval_message_id = None
+                        with self.choice_lock:
+                            previous_choice = self.pending_choice
+                            if (previous_choice is None or previous_choice.signature != choice_prompt.signature
+                                    or (previous_choice.is_expired() and previous_choice.short_signature not in self.resolved_choice_ids)):
+                                choice_prompt = replace(choice_prompt,
+                                    instance_id=os.urandom(8).hex(),
+                                    expires_at=time.time() + self.config.approval_ttl_seconds,
+                                    session_path=str(self.session_path or ""))
+                                self.pending_choice = choice_prompt
+                                self.pending_choice_message_id = None
+                                self.pending_choice_send_attempt_at = 0.0
+                                should_send = True
+                            elif should_resend_prompt_card(
+                                self.pending_choice_message_id,
+                                self.pending_choice.short_signature,
+                                self.resolved_choice_ids,
+                                self.pending_choice_send_attempt_at,
+                                time.monotonic(),
+                            ):
+                                # C3 (T-260705-72): 발송 실패 선택카드 재발송 — 승인카드와 동형
+                                should_send = True
+                            if should_send:
+                                self.pending_choice_send_attempt_at = time.monotonic()
+                        if should_send:
+                            log("CHOICE", f"choice prompt detected {choice_prompt.short_signature}")
+                            message_id = self.telegram.send_choice_prompt(self.pending_choice)
+                            with self.choice_lock:
+                                if self.pending_choice and self.pending_choice.signature == choice_prompt.signature:
+                                    self.pending_choice_message_id = message_id
+                    else:
+                        with self.approval_lock:
+                            prompt_to_clear = self.pending_approval
+                            message_id = self.pending_approval_message_id
+                            if prompt_to_clear is not None:
+                                log("APPROV", "approval prompt cleared")
+                                if prompt_to_clear.signature not in self.resolved_approval_ids:
+                                    self.telegram.update_approval_prompt(
+                                        message_id,
+                                        prompt_to_clear,
+                                        "Approval prompt is no longer active.",
+                                    )
+                            self.pending_approval = None
+                            self.pending_approval_message_id = None
+                        with self.choice_lock:
+                            choice_to_clear = self.pending_choice
+                            message_id = self.pending_choice_message_id
+                            if choice_to_clear is not None and choice_to_clear.is_expired():
+                                if choice_to_clear.short_signature not in self.resolved_choice_ids:
+                                    self.telegram.update_choice_prompt(
+                                        message_id, choice_to_clear, "선택 질문이 만료됐습니다.")
+                                self.pending_choice = None
+                                self.pending_choice_message_id = None
             except Exception as exc:  # noqa: BLE001
                 log("APPROV", f"watch error: {exc}")
             self.stop_event.wait(1.0)
@@ -9031,6 +9316,11 @@ class Bridge:
 
     def handle_callback_query(self, callback: dict[str, Any]) -> bool:
         data = str(callback.get("data") or "")
+        if data.startswith(ASYNC_QUESTION_PREFIX + ":"):
+            if self.config.bridge_kill:
+                return True
+            # Resolve the currently bound session, not a stale cached JSONL path.
+            return self.get_async_questions().callback(callback, str(self.repl.session_file()))
         if data.startswith(f"{SELF_UPDATE_CALLBACK}::"):
             message = callback.get("message") if isinstance(callback.get("message"), dict) else {}
             chat = message.get("chat") if isinstance(message.get("chat"), dict) else {}
@@ -9138,91 +9428,172 @@ class Bridge:
         choice: str,
         signature: str | None = None,
         callback_query_id: str | None = None,
+        other_text: str | None = None,
     ) -> bool:
-        with self.choice_lock:
-            prompt = self.pending_choice
-            message_id = self.pending_choice_message_id
-        if not prompt:
+        def answer(text: str) -> None:
             if callback_query_id:
-                self.telegram.call(
-                    "answerCallbackQuery",
-                    callback_query_id=callback_query_id,
-                    text="No active Codex selection prompt.",
-                )
-            return False
-        if signature and signature != prompt.short_signature:
-            if callback_query_id:
-                self.telegram.call(
-                    "answerCallbackQuery",
-                    callback_query_id=callback_query_id,
-                    text="That selection prompt is no longer active.",
-                )
-            return True
-        if getattr(prompt, "is_expired", lambda: False)():
+                self.telegram.call("answerCallbackQuery",
+                    callback_query_id=callback_query_id, text=text)
+            else:
+                self.telegram.send(text)
+
+        with self.choice_submit_lock:
             with self.choice_lock:
-                if self.pending_choice and self.pending_choice.signature == prompt.signature:
-                    self.pending_choice = None
-                    self.pending_choice_message_id = None
-            if callback_query_id:
-                self.telegram.call(
-                    "answerCallbackQuery",
-                    callback_query_id=callback_query_id,
-                    text="That selection prompt expired.",
-                )
-            return True
-        if prompt.signature in self.resolved_choice_ids:
-            if callback_query_id:
-                self.telegram.call(
-                    "answerCallbackQuery",
-                    callback_query_id=callback_query_id,
-                    text="This selection was already sent.",
-                )
+                prompt = self.pending_choice
+                message_id = self.pending_choice_message_id
+            if not prompt:
+                answer("활성 선택 질문이 없습니다.")
+                return bool(callback_query_id)
+            if signature and signature != prompt.short_signature:
+                answer("이전 질문의 버튼입니다. 최신 질문을 확인해주세요.")
+                return True
+            if self.config.bridge_kill or not prompt.is_active():
+                answer("질문이 만료됐거나 브릿지 입력이 중지됐습니다.")
+                return True
+            if prompt.short_signature in self.resolved_choice_ids:
+                answer("이미 전송을 시도한 선택입니다. 중복 제출하지 않습니다.")
+                return True
+            option = prompt.option(choice)
+            if option is None:
+                return False
+            is_other = option.label.strip().casefold() in {"other", "직접 입력", "기타"}
+            if is_other and other_text is None:
+                answer("직접 입력할 답변을 요청합니다.")
+                response = self.telegram.call("sendMessage", chat_id=self.config.chat_id,
+                    text=f"Codex 선택 답변 · {prompt.short_signature}\n{prompt.title}\n\n이 메시지에 답장으로 직접 입력할 내용을 보내주세요.",
+                    reply_markup=json.dumps({"force_reply": True, "selective": True}))
+                result = response.get("result", {}) if isinstance(response, dict) else {}
+                if isinstance(result.get("message_id"), int):
+                    self.choice_text_request = {"message_id": result["message_id"],
+                        "signature": prompt.short_signature, "choice": choice}
+                return True
+            answer("현재 질문 확인 및 제출 중…")
+            lock = getattr(self.repl, "composer_lock", nullcontext)
+            try:
+                # Refresh before acquiring composer lock: focus navigation has
+                # its own lock. Recheck again inside the lock before sending.
+                if prompt.session_path and str(self.repl.session_file()) != prompt.session_path:
+                    raise RuntimeError("Codex session changed")
+                self.choice_screen(expected=prompt)
+                with lock():
+                    if prompt.session_path and str(self.repl.session_file()) != prompt.session_path:
+                        raise RuntimeError("Codex 세션이 변경됐습니다. 이전 버튼은 사용할 수 없습니다.")
+                    current = parse_choice_prompt(self.choice_visible_screen())
+                    if current is None or current.signature != prompt.signature:
+                        raise RuntimeError("현재 터미널 질문이 카드와 다릅니다. 선택을 전송하지 않았습니다.")
+                    current_option = current.option(choice)
+                    if current_option is None:
+                        raise RuntimeError("현재 선택지를 확인할 수 없습니다.")
+                    selected = current.selected_option()
+                    # Claim before sending. A transport failure may occur after
+                    # Enter was delivered: never automatically resend it.
+                    self.resolved_choice_ids.add(prompt.short_signature)
+                    confirmations = getattr(self, "choice_confirmations", {})
+                    self.choice_confirmations = confirmations
+                    confirmations[prompt.short_signature] = {
+                        "prompt": prompt, "option": option, "message_id": message_id,
+                        "answer": other_text if is_other else option.label,
+                        "session_path": str(self.session_path or ""),
+                        "deadline": time.monotonic() + 60, "sent_at": time.time(),
+                    }
+                    self.repl.send_choice(TransportChoice(
+                        value=current_option.value, key=current_option.key,
+                        index=current_option.index,
+                        selected_index=selected.index if selected is not None else None))
+                    if is_other:
+                        # Do not let a free-text reply become a new main prompt.
+                        # Unknown/nonempty editor layouts fail closed.
+                        editor_ready = False
+                        for _ in range(10):
+                            time.sleep(0.1)
+                            editor = self.choice_visible_screen()
+                            title_matches = canonical_choice_signature_text(prompt.title) in canonical_choice_signature_text(editor)
+                            empty_hint = re.search(r"type (?:your |an? )?answer|type something|답변을 입력", editor, re.IGNORECASE)
+                            if title_matches and empty_hint and parse_choice_prompt(editor) is None:
+                                editor_ready = True
+                                break
+                        if not editor_ready or not callable(getattr(self.repl, "send_choice_text", None)):
+                            raise RuntimeError("empty answer editor not verified")
+                        self.repl.send_choice_text(other_text)
+                    confirmed = self.choice_submission_confirmed(prompt)
+            except Exception as exc:  # noqa: BLE001
+                log("CHOICE", f"delivery failed: {type(exc).__name__}")
+                self.telegram.update_choice_prompt(message_id, prompt,
+                    "선택 제출을 확인하지 못했습니다. 최신 질문을 다시 확인해주세요.")
+                self.telegram.send("선택 제출 실패 또는 상태 불일치. 자동 재전송하지 않았습니다.")
+                return True
+            if confirmed:
+                self.choice_confirmations.pop(prompt.short_signature, None)
+                status = f"✅ 제출 확인: {option.value}. {option.short_label} (터미널 질문 종료 확인)"
+            else:
+                status = ("선택 키를 전송했고 Codex 응답을 기다리고 있습니다. 제출은 아직 확인되지 않았습니다. "
+                          "응답을 받으면 이 카드에 확인 결과를 표시합니다. 자동 재전송하지 않습니다.")
+            self.telegram.update_choice_prompt(message_id, prompt, status,
+                selected=option if confirmed else None)
+            self.telegram.send(status)
             return True
 
-        option = prompt.option(choice)
-        if option is None:
+    def confirm_choice_answer(self, record: dict[str, Any]) -> None:
+        """Async questions surface their accepted answer as a quoted user item.
+
+        It can arrive after the short TUI redraw window. The question and answer
+        must both match an in-flight submission in this same bound session.
+        """
+        if not getattr(self, "choice_confirmations", None):
+            return
+        payload = record.get("payload") or {}
+        if (record.get("type") != "response_item" or payload.get("type") != "message"
+                or payload.get("role") != "user"):
+            return
+        text = extract_response_user_message(payload)
+        if not text:
+            return
+        normalized = " ".join(text.split())
+        with self.choice_submit_lock:
+            for key, pending in list(self.choice_confirmations.items()):
+                prompt = pending["prompt"]
+                # Native async replies in this CLI encode the separator as
+                # literal backslash-n. Accept that exact envelope as well as
+                # real newlines; do not unescape arbitrary answer content.
+                expected = {
+                    " ".join(f'> {prompt.title}{separator}{pending["answer"]}'.split())
+                    for separator in ("\n\n", r"\n\n")
+                }
+                if (normalized not in expected or pending["session_path"] != str(self.session_path or "")
+                        or parse_event_timestamp(record) < pending["sent_at"]
+                        or time.monotonic() > pending["deadline"]):
+                    continue
+                self.choice_confirmations.pop(key, None)
+                option = pending["option"]
+                status = f"✅ 제출 확인: {option.value}. {option.short_label} (Codex 응답 수신)"
+                self.telegram.update_choice_prompt(pending["message_id"], prompt, status, selected=option)
+                self.telegram.send(status)
+                log("CHOICE", f"submission confirmed by native answer {key}")
+
+    def expire_choice_confirmations(self) -> None:
+        for key, pending in list(getattr(self, "choice_confirmations", {}).items()):
+            if time.monotonic() <= pending["deadline"]:
+                continue
+            self.choice_confirmations.pop(key, None)
+            self.telegram.update_choice_prompt(pending["message_id"], pending["prompt"],
+                "선택은 전송했지만 제한 시간 안에 제출을 확인하지 못했습니다. 자동 재전송하지 않습니다.")
+
+    def handle_choice_reply(self, message: dict[str, Any]) -> bool:
+        request = getattr(self, "choice_text_request", None)
+        reply = message.get("reply_to_message") or {}
+        if not request or reply.get("message_id") != request["message_id"]:
+            if str(reply.get("text") or "").startswith("Codex 선택 답변 · "):
+                self.telegram.send("이 직접 입력 요청은 더 이상 활성 상태가 아닙니다. 최신 질문을 확인해주세요.")
+                return True
             return False
-        try:
-            selected = prompt.selected_option()
-            self.repl.send_choice(
-                TransportChoice(
-                    value=option.value,
-                    key=option.key,
-                    index=option.index,
-                    selected_index=selected.index if selected is not None else None,
-                )
-            )
-        except Exception as exc:  # noqa: BLE001
-            log("CHOICE", f"choice failed: {exc}")
-            self.telegram.send(f"Codex selection failed: {exc}")
-            if callback_query_id:
-                self.telegram.call(
-                    "answerCallbackQuery",
-                    callback_query_id=callback_query_id,
-                    text="Selection failed.",
-                )
+        text = message.get("text")
+        if (not isinstance(text, str) or not text.strip() or len(text) > 4000
+                or any(ord(c) < 32 and c not in "\n\t" for c in text)):
+            self.telegram.send("직접 답변은 1~4000자의 텍스트로 보내주세요.")
             return True
-
-        log("CHOICE", f"choice {choice} -> {option.key or option.value}")
-        self.telegram.update_choice_prompt(
-            message_id,
-            prompt,
-            f"✅ Selected {option.value}. {option.short_label}",
-            selected=option,
-        )
-        with self.choice_lock:
-            if self.pending_choice and self.pending_choice.signature == prompt.signature:
-                self.resolved_choice_ids.add(prompt.signature)
-                self.pending_choice = prompt
-                self.pending_choice_message_id = None
-        if callback_query_id:
-            self.telegram.call(
-                "answerCallbackQuery",
-                callback_query_id=callback_query_id,
-                text=f"Sent choice {choice} to Codex.",
-            )
-        else:
-            self.telegram.send(f"Sent Codex selection {choice}: {option.short_label}")
+        self.choice_text_request = None
+        self.handle_choice_choice(request["choice"],
+            signature=request["signature"], other_text=text.strip())
         return True
 
     def handle_choice_callback_query(self, callback: dict[str, Any]) -> bool:
@@ -9957,8 +10328,25 @@ class Bridge:
         chat = message.get("chat") if isinstance(message.get("chat"), dict) else {}
         if str(chat.get("id")) != self.config.chat_id:
             return
+        if self.handle_choice_reply(message):
+            return
+        if getattr(self, "async_questions_lock", None) is not None and not self.config.bridge_kill:
+            answer = self.get_async_questions().reply_text(message, str(self.repl.session_file()))
+            if answer is not None:
+                try:
+                    self.submit_async_answer(answer, int(message.get("message_id") or 0))
+                except Exception:
+                    self.telegram.send("질문 답변을 전달하지 못했거나 확인이 필요합니다. 자동 재전송하지 않습니다.")
+                return
         raw_text = message.get("text")
         if isinstance(raw_text, str):
+            if raw_text.strip().lower() == "/choices":
+                with self.choice_submit_lock:
+                    self.choice_focus_request = {"titles": [], "attempts": 0}
+                    self.choice_focus_attempt_at = 0.0
+                    if not parse_choice_prompt(self.choice_screen()):
+                        self.telegram.send("현재 선택 질문 화면을 확인하지 못했습니다. 선택은 전송하지 않았습니다.")
+                return
             hold_response = release_hold_response(raw_text.strip())
             if hold_response:
                 self.telegram.send(hold_response)
