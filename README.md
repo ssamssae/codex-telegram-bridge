@@ -1100,3 +1100,27 @@ The sent indicator means terminal submission, not task completion. Draft input,
 selection/approval screens, changed sessions, and expired buttons block submission.
 Persisted state prevents repeated clicks from submitting twice, including after
 a restart. Uncertain delivery is marked for review and is not retried automatically.
+
+### Keep the terminal input clean
+
+To keep Telegram messages unchanged in the Codex terminal, set
+`CRB_SUGGESTED_TAIL_PROMPT=0` in the bridge service environment and restart
+only the bridge. Keep `SUGGESTED_REPLY_BUBBLE=1` and `CRB_SUGGESTED_CONFIRM=1`.
+The sample configuration uses this mode. Existing installations keep their
+current environment and flag settings until changed.
+
+Put the recommendation rule in your existing Codex `AGENTS.md` instead of
+appending it to each message. For example, append this rule without replacing
+other instructions:
+
+```text
+When a useful next action exists, end your final answer with one concrete
+follow-up request inside <추천답변>...</추천답변>. Omit it when unnecessary.
+Do not execute the suggested request unless the user asks you to.
+```
+
+The bridge still displays suggestions and confirmation buttons when the model
+produces the marker. Omitting the per-message instruction does not force a
+suggestion on every answer. New conversations read the updated instruction file;
+existing conversations may retain earlier instructions. Previously submitted
+messages are not rewritten.
