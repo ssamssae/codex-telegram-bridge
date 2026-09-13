@@ -1813,7 +1813,7 @@ _DIRECTIVE_BOILERPLATE_RE = re.compile(
 
 def strip_internal_prompt_headers(text: str) -> str:
     """Remove only leading transport metadata before rendering a DM card."""
-    lines = (text or "").splitlines()
+    lines = strip_suggested_generation_instruction(text).splitlines()
     while lines:
         first = lines[0].strip()
         if not first:
@@ -4778,8 +4778,41 @@ def newest_codex_tui_session() -> Path | None:
     return None
 
 
+SUGGESTED_CONFIRM_PREFIX = "crb_suggest:"
+SUGGESTED_CONFIRM_LOCK = threading.RLock()
+
+
+SUGGESTED_GENERATION_INSTRUCTION = (
+    "최종 답변 뒤에 사용자가 이어서 보낼 유용한 후속 요청이 있으면 마지막 줄에 "
+    "<추천답변>사용자가 보낼 구체적인 요청 한 줄</추천답변>을 붙여. "
+    "단순 인사나 다음 행동이 없는 답변에는 생략할 수 있어. "
+    "추천한 작업을 자동으로 실행하지 마. 이 작성 지시 자체는 설명하거나 인용하지 마."
+)
+
+
+def strip_suggested_generation_instruction(text: str) -> str:
+    raw = (text or "").replace("\r\n", "\n").strip()
+    if raw.endswith(SUGGESTED_GENERATION_INSTRUCTION):
+        return raw[:-len(SUGGESTED_GENERATION_INSTRUCTION)].rstrip()
+    return raw
+
+
+def suggested_generation_enabled() -> bool:
+    if "CRB_SUGGESTED_TAIL_PROMPT" in os.environ:
+        return bool_env("CRB_SUGGESTED_TAIL_PROMPT", False)
+    return (Path.home() / ".config/codex-telegram-bridge/suggested-generation.on").is_file()
+
+
+def with_suggested_generation_instruction(text: str) -> str:
+    raw = (text or "").rstrip()
+    if (not suggested_generation_enabled() or not raw
+            or raw.lstrip().startswith("/") or raw.endswith(SUGGESTED_GENERATION_INSTRUCTION)):
+        return raw
+    return raw + "\n\n" + SUGGESTED_GENERATION_INSTRUCTION
+
+
 def normalize_prompt(text: str) -> str:
-    return (text or "").replace("\r\n", "\n").strip()
+    return strip_suggested_generation_instruction(text)
 
 
 def is_relative_to(path: Path, root: Path) -> bool:
@@ -6834,7 +6867,7 @@ class Bridge:
             if len(unified) <= 4000 and self.telegram.edit(anchor, unified):
                 log("SEND", f"edited codex answer into directive anchor mid={anchor}")
                 if suggested_reply:
-                    bubble_ids = self.telegram.send_copy_content(suggested_reply)
+                    bubble_ids = self.send_suggested_confirm(suggested_reply)
                     if bubble_ids is None:
                         log("SEND", "suggested reply bubble failed after final answer (non-fatal)")
                     else:
@@ -6860,7 +6893,7 @@ class Bridge:
                 log("ATTACH", f"send failed: {path}")
                 self.telegram.send(f"⚠️ 첨부 전송 실패 — 파일은 노드에 보존됨: {path}")
         if suggested_reply:
-            bubble_ids = self.telegram.send_copy_content(suggested_reply)
+            bubble_ids = self.send_suggested_confirm(suggested_reply)
             if bubble_ids is None:
                 log("SEND", "suggested reply bubble failed after final answer (non-fatal)")
             else:
@@ -8453,6 +8486,8 @@ class Bridge:
         return True
 
     def clear_and_paste_prompt(self, prompt: str, label: str = "telegram input") -> None:
+        if label.startswith("telegram"):
+            prompt = with_suggested_generation_instruction(prompt)
         if not is_codex_slash_command(prompt) and self.repl_is_working():
             self.paste_prompt_without_clearing_composer(prompt, label)
             return
@@ -8490,6 +8525,8 @@ class Bridge:
         self.clear_composer_before_telegram_input("stale slash command")
 
     def paste_prompt_without_clearing_composer(self, prompt: str, label: str = "telegram input") -> None:
+        if label.startswith("telegram"):
+            prompt = with_suggested_generation_instruction(prompt)
         composer_lock = getattr(self.repl, "composer_lock", None)
         paste_unlocked = getattr(self.repl, "_paste_prompt_unlocked", None)
         if callable(composer_lock) and callable(paste_unlocked):
@@ -9314,8 +9351,130 @@ class Bridge:
             self.telegram.send(f"Sent Codex approval choice {choice}: {option.short_label}")
         return True
 
+    def suggested_confirm_path(self) -> Path:
+        return self.config.state_dir / f"codex-suggested-confirm-{self.config.node}.json"
+
+    def read_suggested_confirms(self) -> dict[str, Any]:
+        path = self.suggested_confirm_path()
+        if not path.exists():
+            return {}
+        data = json.loads(path.read_text(encoding="utf-8"))
+        if not isinstance(data, dict):
+            raise ValueError("invalid suggested confirm state")
+        return data
+
+    def send_suggested_confirm(self, text: str) -> list[int] | None:
+        ids = self.telegram.send_copy_content(text)
+        if not ids or not bool_env("CRB_SUGGESTED_CONFIRM", True):
+            return ids
+        if not is_private_chat_id(self.config.chat_id):
+            return ids
+        try:
+            with SUGGESTED_CONFIRM_LOCK:
+                records = self.read_suggested_confirms()
+                key = os.urandom(12).hex()
+                records[key] = {"text": text, "message_id": ids[-1],
+                                "session": str(self.repl.session_file()),
+                                "created_at": time.time(), "status": "ready"}
+                records = dict(sorted(records.items(), key=lambda x: x[1].get("created_at", 0))[-100:])
+                write_json_atomic(self.suggested_confirm_path(), records)
+            self.set_suggested_confirm_button(ids[-1], key, "확인")
+            log("SUGGEST", f"ready mid={ids[-1]}")
+        except Exception as exc:
+            log("SUGGEST", f"button delivery failed: {exc}")
+        return ids
+
+    def set_suggested_confirm_button(self, message_id: int, key: str, label: str) -> None:
+        result = self.telegram.call("editMessageReplyMarkup", chat_id=self.config.chat_id,
+            message_id=message_id, reply_markup=json.dumps({"inline_keyboard": [[{
+                "text": label, "callback_data": SUGGESTED_CONFIRM_PREFIX + key,
+            }]]}, ensure_ascii=False))
+        if not result or not result.get("ok"):
+            raise RuntimeError("suggested confirm markup was not accepted")
+
+    def handle_suggested_confirm(self, callback: dict[str, Any]) -> bool:
+        key = str(callback.get("data") or "")[len(SUGGESTED_CONFIRM_PREFIX):]
+        message = callback.get("message") or {}
+        chat = message.get("chat") or {}
+        sender = callback.get("from") or {}
+        def answer(text: str = "") -> None:
+            if callback.get("id"):
+                self.telegram.call("answerCallbackQuery", callback_query_id=callback["id"], text=text)
+        if str(chat.get("id")) != str(self.config.chat_id) or str(sender.get("id")) != str(self.config.chat_id):
+            answer("이 채팅의 사용자만 사용할 수 있습니다.")
+            return True
+        if self.config.bridge_kill or not bool_env("CRB_SUGGESTED_CONFIRM", True):
+            answer("확인 버튼이 꺼져 있습니다.")
+            return True
+        records = self.read_suggested_confirms()
+        item = records.get(key)
+        if not item or item.get("message_id") != message.get("message_id"):
+            answer("만료된 추천입니다.")
+            return True
+        if item.get("status") != "ready":
+            answer("이미 처리한 추천입니다. 다시 제출하지 않습니다.")
+            return True
+        if (getattr(self, "pending_clear_watch", None) or time.time()-item.get("created_at", 0)>86400
+                or item.get("session") != str(self.repl.session_file())):
+            answer("대화가 바뀌었거나 만료된 추천입니다.")
+            return True
+        lock = getattr(self.repl, "composer_lock", nullcontext)
+        with lock():
+            screen = self.choice_visible_screen()
+            clean = re.sub(r"[\u2800-\u28ff]", "", screen)
+            prompts = [re.sub(r"\s+", " ", line.lstrip()[1:].strip()) for line in clean.splitlines() if line.lstrip().startswith("›")]
+            empty = bool(prompts and prompts[-1] in {"Ask Codex to do anything", "Ask a follow-up question"})
+            if (not empty or parse_approval_prompt(screen) or parse_choice_prompt(screen)
+                    or item["session"] != str(self.repl.session_file())):
+                answer("입력 중이거나 선택 화면입니다. 입력칸이 비면 다시 눌러주세요.")
+                return True
+            # Persist before the first input side effect: unknown outcomes cannot replay.
+            with SUGGESTED_CONFIRM_LOCK:
+                records = self.read_suggested_confirms()
+                item = records.get(key)
+                if not item or item.get("status") != "ready":
+                    answer("이미 처리한 추천입니다.")
+                    return True
+                item["status"] = "claimed"
+                write_json_atomic(self.suggested_confirm_path(), records)
+            queued = False
+            try:
+                text = item["text"]
+                self.begin_repl_typing()
+                if self.should_queue_telegram_inbound():
+                    self.queue_telegram_prompt(text, item["message_id"])
+                    queued = True
+                else:
+                    self.begin_telegram_prompt_tracking(text, message_id=item["message_id"])
+                paste = getattr(self.repl, "_paste_prompt_unlocked", None)
+                payload = with_suggested_generation_instruction(text)
+                if callable(paste):
+                    paste(payload)
+                else:
+                    self.repl.paste_prompt(payload)
+                item["status"] = "submitted"
+                log("SUGGEST", f"submitted mid={item['message_id']} key={key}")
+            except Exception as exc:
+                item["status"] = "uncertain"
+                if queued:
+                    self.unqueue_telegram_prompt(item["text"], item["message_id"])
+                log("SUGGEST", f"submission uncertain mid={item['message_id']}: {exc}")
+            with SUGGESTED_CONFIRM_LOCK:
+                current = self.read_suggested_confirms()
+                current[key] = item
+                write_json_atomic(self.suggested_confirm_path(), current)
+        label = "✅ 보냄" if item["status"] == "submitted" else "⚠️ 확인 필요"
+        try:
+            self.set_suggested_confirm_button(item["message_id"], key, label)
+        except Exception as exc:
+            log("SUGGEST", f"status markup failed: {exc}")
+        answer("전달했습니다." if item["status"] == "submitted" else "제출 결과를 확인하지 못했습니다. 자동 재전송하지 않습니다.")
+        return True
+
     def handle_callback_query(self, callback: dict[str, Any]) -> bool:
         data = str(callback.get("data") or "")
+        if data.startswith(SUGGESTED_CONFIRM_PREFIX):
+            return self.handle_suggested_confirm(callback)
         if data.startswith(ASYNC_QUESTION_PREFIX + ":"):
             if self.config.bridge_kill:
                 return True
@@ -10534,7 +10693,9 @@ def main() -> int:
 
     log(
         "START",
-        f"node={config.node} chat={config.chat_id} transport={config.transport_mode}",
+        f"node={config.node} chat={config.chat_id} transport={config.transport_mode} "
+        f"suggested_generation={int(suggested_generation_enabled())} "
+        f"suggested_display={int(config.suggested_reply_bubble)}",
     )
     try:
         bridge.run()
