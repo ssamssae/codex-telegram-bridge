@@ -1124,3 +1124,7 @@ produces the marker. Omitting the per-message instruction does not force a
 suggestion on every answer. New conversations read the updated instruction file;
 existing conversations may retain earlier instructions. Previously submitted
 messages are not rewritten.
+
+## Contributing
+
+See [CONTRIBUTING.md](CONTRIBUTING.md).
