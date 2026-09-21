@@ -840,7 +840,7 @@ Required settings are intentionally small and explicit.
 | `CRB_TYPING_MAX_SECONDS` | no | `7200` | Maximum lifetime for repeated Telegram `typing` actions during one visible Codex turn. |
 | `CRB_TELEGRAM_FALLBACK_SECONDS` | no | `90` | One-shot fallback progress reply delay for Telegram-origin REPL prompts when `final_answer` is delayed. Set `0` to disable. |
 | `CRB_FLOW_MIRROR` | no | `0` | Opt in to live Codex tool/stage mirroring. The flag `~/.config/codex-telegram-bridge/flow-mirror.on` is an equivalent runtime gate. |
-| `SUGGESTED_REPLY_BUBBLE` | no | `1` | Split a final-line `<추천답변>...</추천답변>` into a separate copy-ready Telegram bubble. Set `0` to disable. |
+| `SUGGESTED_REPLY_BUBBLE` | no | `0` | Opt in with `1` to show final-line suggestion tags as separate Telegram bubbles. |
 | `CRB_REASONING_MIRROR` | no | `1` | Mirror Codex's public reasoning summary to Telegram with the `🧠 코덱스 사고` header, sent right after the final answer. Only the runtime-public summary is sent (never raw chain-of-thought); copy-payload replies do not emit a reasoning mirror. Set `0` to disable. |
 | `CRB_LONG_RUNNING_PROGRESS_SECONDS` | no | `0` | Legacy periodic progress interval for long-running Telegram-origin REPL prompts. The flow mirror replaces it by default; set a positive second value to re-enable. |
 | `CRB_AUDIO_TRANSCRIBE_CMD` | no | empty | Optional command template for audio transcription. Use `{path}` for the media file. |
@@ -1069,7 +1069,15 @@ python3 -m unittest discover -s tests
 
 ### Suggested reply display switch
 
-`SUGGESTED_REPLY_BUBBLE=1` (default) separates a final
+As of 0.9.13, suggested reply bubbles and their confirmation buttons are off by
+default. Ordinary answers and approval/choice buttons are unchanged. To disable
+suggestions on an existing installation, set `SUGGESTED_REPLY_BUBBLE=0`,
+`CRB_SUGGESTED_CONFIRM=0`, and `CRB_SUGGESTED_TAIL_PROMPT=0`, then restart only
+the bridge. Existing Telegram messages remain visible, but their suggestion
+buttons cannot submit while confirmation is disabled. Explicit opt-in settings
+are preserved on upgrade.
+
+`SUGGESTED_REPLY_BUBBLE=1` (opt-in) separates a final
 `<추천답변>...</추천답변>` into the configured copy-ready suggestion surface.
 Set `SUGGESTED_REPLY_BUBBLE=0` in the bridge service environment and restart
 the bridge to disable that display processing. This is a rendering switch;
@@ -1091,7 +1099,7 @@ to enable generation without a restart, or rename/remove that flag to disable it
 An explicit `CRB_SUGGESTED_TAIL_PROMPT` environment value overrides the file.
 `SUGGESTED_REPLY_BUBBLE=1` controls suggestion display separately.
 
-`CRB_SUGGESTED_CONFIRM=1` (default) adds a confirmation button below a new
+`CRB_SUGGESTED_CONFIRM=1` (opt-in) adds a confirmation button below a new
 suggestion. Clicking submits that suggestion to the connected Codex terminal;
 it is not a clipboard-only action. Set it to `0` and restart the bridge to keep
 the suggestion text without the button. Existing messages are not retrofitted.
@@ -1106,7 +1114,7 @@ a restart. Uncertain delivery is marked for review and is not retried automatica
 To keep Telegram messages unchanged in the Codex terminal, set
 `CRB_SUGGESTED_TAIL_PROMPT=0` in the bridge service environment and restart
 only the bridge. Keep `SUGGESTED_REPLY_BUBBLE=1` and `CRB_SUGGESTED_CONFIRM=1`.
-The sample configuration uses this mode. Existing installations keep their
+The sample configuration instead disables suggestion display and buttons. Existing installations keep their
 current environment and flag settings until changed.
 
 Put the recommendation rule in your existing Codex `AGENTS.md` instead of

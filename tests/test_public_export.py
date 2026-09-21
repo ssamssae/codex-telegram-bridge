@@ -35,9 +35,9 @@ class PublicExportTest(unittest.TestCase):
         # str(Path) is backslashed on Windows; compare the POSIX form instead.
         self.assertTrue(Path(cfg.state_dir).as_posix().endswith(".local/state/codex-telegram-bridge"))
         self.assertTrue(str(cfg.directive_signal_path).endswith("received-directive.jsonl"))
-        self.assertTrue(cfg.suggested_reply_bubble)
+        self.assertFalse(cfg.suggested_reply_bubble)
         self.assertIn(
-            "SUGGESTED_REPLY_BUBBLE=1",
+            "SUGGESTED_REPLY_BUBBLE=0",
             (path.parent / "config.example.env").read_text(encoding="utf-8"),
         )
         self.assertEqual(mod.extract_codex_context_text("Model: gpt-5"), "Codex context not visible yet.")

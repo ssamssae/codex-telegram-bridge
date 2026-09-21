@@ -109,3 +109,30 @@ class FloodIntegration(unittest.TestCase):
         self.assertLessEqual(max(waits),m.TELEGRAM_FLOOD_WAIT_CAP_SECONDS)
 
 if __name__ == '__main__': unittest.main()
+
+
+class SuggestedReplyDefaults(unittest.TestCase):
+    def test_disabled_hides_plain_classified_and_marker_only_suggestions(self):
+        for attrs in ('', ' class="auto-ok"', ' class="hold"'):
+            marker = '<추천답변' + attrs + '>next action</추천답변>'
+            for surface in ('aniki_dm', 'node'):
+                self.assertEqual(m.suggested_reply_messages('answer\n' + marker, False, surface), ['answer'])
+                self.assertEqual(m.suggested_reply_messages(marker, False, surface), [''])
+        self.assertEqual(m.suggested_reply_messages('ordinary answer', False, 'aniki_dm'), ['ordinary answer'])
+
+    def test_explicit_opt_in_still_displays_suggestion(self):
+        self.assertEqual(m.suggested_reply_messages('answer\n<추천답변>next</추천답변>', True, 'aniki_dm'), ['answer', 'next'])
+
+    def test_default_disables_new_and_existing_confirmation_buttons(self):
+        b = object.__new__(m.Bridge)
+        b.config = SimpleNamespace(chat_id='123', bridge_kill=False)
+        b.telegram = Mock()
+        b.telegram.send_copy_content.return_value = [45]
+        b.repl = Mock()
+        with patch.dict(m.os.environ, {}, clear=True):
+            b.send_suggested_confirm('next')
+            b.telegram.call.assert_not_called()
+            b.handle_suggested_confirm({'id':'cb', 'data':m.SUGGESTED_CONFIRM_PREFIX+'old', 'from':{'id':123}, 'message':{'chat':{'id':123}}})
+        b.repl.paste_prompt.assert_not_called()
+        b.repl._paste_prompt_unlocked.assert_not_called()
+        self.assertIn('꺼져', b.telegram.call.call_args.kwargs['text'])
