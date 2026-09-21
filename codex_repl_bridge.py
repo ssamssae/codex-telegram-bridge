@@ -467,13 +467,12 @@ def suggested_reply_messages(text: str, enabled: bool, surface: str) -> list[str
         if parsed.body == original:
             return [original]
         return [parsed.body] if parsed.body else [""]
+    # Disabled means no suggestion content, including marker-only and classified replies.
+    if not enabled:
+        return [parsed.body] if parsed.body else [""]
     if not parsed.body:
         return [parsed.reply]
-    # A declared class marker always splits in the DM so the raw tag never
-    # leaks into the answer body, mirroring the Claude bridge (T-260716-07/-08).
-    if surface == "aniki_dm" and (
-        enabled or parsed.declared_class in SUGGESTED_REPLY_FORCED_CLASSES
-    ):
+    if surface == "aniki_dm":
         return [parsed.body, parsed.reply]
     return [parsed.body]
 
@@ -3084,7 +3083,7 @@ class Config:
     transport_mode: str = "tmux"
     conpty_state_path: Path | None = None
     conpty_timeout_ms: int = 5000
-    suggested_reply_bubble: bool = True
+    suggested_reply_bubble: bool = False
     suggested_reply_confirmation_enabled: bool = True
     native_turn_stale_seconds: int = 300
     activity_eyes_enabled: bool = True
@@ -3196,7 +3195,7 @@ class Config:
                 or str(default_conpty_state)
             ).expanduser(),
             conpty_timeout_ms=int_env("CRB_CONPTY_TIMEOUT_MS", 5000, minimum=100),
-            suggested_reply_bubble=bool_env("SUGGESTED_REPLY_BUBBLE", True),
+            suggested_reply_bubble=bool_env("SUGGESTED_REPLY_BUBBLE", False),
             suggested_reply_confirmation_enabled=bool_env("CRB_SUGGESTED_REPLY_EYES", True),
             native_turn_stale_seconds=int_env(
                 "CRB_NATIVE_TURN_STALE_SECONDS",
@@ -9365,7 +9364,7 @@ class Bridge:
 
     def send_suggested_confirm(self, text: str) -> list[int] | None:
         ids = self.telegram.send_copy_content(text)
-        if not ids or not bool_env("CRB_SUGGESTED_CONFIRM", True):
+        if not ids or not bool_env("CRB_SUGGESTED_CONFIRM", False):
             return ids
         if not is_private_chat_id(self.config.chat_id):
             return ids
@@ -9403,7 +9402,7 @@ class Bridge:
         if str(chat.get("id")) != str(self.config.chat_id) or str(sender.get("id")) != str(self.config.chat_id):
             answer("이 채팅의 사용자만 사용할 수 있습니다.")
             return True
-        if self.config.bridge_kill or not bool_env("CRB_SUGGESTED_CONFIRM", True):
+        if self.config.bridge_kill or not bool_env("CRB_SUGGESTED_CONFIRM", False):
             answer("확인 버튼이 꺼져 있습니다.")
             return True
         records = self.read_suggested_confirms()
