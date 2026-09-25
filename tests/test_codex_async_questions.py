@@ -16,7 +16,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from codex_async_questions import AsyncQuestions, freeform_editor, PREFIX, TTL
 
 NOW = 1789220000
-SESSION = '/sessions/current.jsonl'
+SESSION = str(Path('/sessions/current.jsonl'))
 
 
 def request(title='어느 PR인가요?', options=None, name='request_user_input_async'):

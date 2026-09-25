@@ -1,6 +1,7 @@
 import hashlib
 import importlib.util
 import json
+import os
 from pathlib import Path
 import sys
 import tempfile
@@ -39,7 +40,8 @@ class VoiceProvenanceTest(unittest.TestCase):
         data = json.loads(self.record.read_text())
         self.assertEqual(data['sha256'], hashlib.sha256(self.req['text'].encode()).hexdigest())
         self.assertEqual(self.req['text'], '승인\n본문 그대로')
-        self.assertEqual(self.record.stat().st_mode & 0o777, 0o600)
+        if os.name != "nt":
+            self.assertEqual(self.record.stat().st_mode & 0o777, 0o600)
 
     def test_wrong_body_session_target_offset_and_time_rejected(self):
         for changes in [dict(text='승인'), dict(session_path=self.root/'other'),
@@ -97,7 +99,7 @@ class VoiceProvenanceTest(unittest.TestCase):
         self.record.unlink()
         path = voice.record_voice_input(self.req, None, directory=self.record.parent, now=100, pane_pid=23)
         context = json.dumps({'payload': {'role': 'user', 'content': 'initial context'}})+'\n'
-        self.session.write_text(context + json.dumps({'payload': {'role': 'user', 'content': self.req['text']}})+'\n')
+        self.session.write_bytes((context + json.dumps({'payload': {'role': 'user', 'content': self.req['text']}})+'\n').encode())
         offset = len(context.encode())
         voice.bind_voice_input_session(path, self.session)
         self.assertTrue(self.match(event_offset=offset))
@@ -111,7 +113,7 @@ class VoiceProvenanceTest(unittest.TestCase):
         voice.record_voice_input(request, old, directory=self.record.parent, now=100, pane_pid=23)
         context = json.dumps({'payload': {'role': 'user', 'content': 'initial context'}})+'\n'
         event = {'timestamp': stamp, 'payload': {'role': 'user', 'content': self.req['text']}}
-        self.session.write_text(context + json.dumps(event)+'\n')
+        self.session.write_bytes((context + json.dumps(event)+'\n').encode())
         return len(context.encode())
 
     def test_clear_stale_session_rebinds_before_smaller_offset_check(self):
