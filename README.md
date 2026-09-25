@@ -1088,15 +1088,10 @@ and has no effect on this Codex package.
 
 ## Suggested replies and confirmation buttons
 
-Set `CRB_SUGGESTED_TAIL_PROMPT=1` in the bridge service environment to request
-a useful follow-up suggestion on ordinary Telegram inputs. Set it to `0` to
-disable the generation instruction. Restart the bridge after environment changes.
-The model may omit suggestions when there is no useful follow-up; existing
-conversation instructions can still influence its output.
-
-Alternatively, create `~/.config/codex-telegram-bridge/suggested-generation.on`
-to enable generation without a restart, or rename/remove that flag to disable it.
-An explicit `CRB_SUGGESTED_TAIL_PROMPT` environment value overrides the file.
+The bridge no longer asks the model to generate suggested replies or appends
+reply-style reminders to incoming messages. The retired
+`CRB_SUGGESTED_TAIL_PROMPT` setting and `suggested-generation.on` flag have no
+effect, including when enabled. Legacy suffixes are stripped from retried input.
 `SUGGESTED_REPLY_BUBBLE=1` controls suggestion display separately.
 
 `CRB_SUGGESTED_CONFIRM=1` (opt-in) adds a confirmation button below a new
@@ -1111,27 +1106,17 @@ a restart. Uncertain delivery is marked for review and is not retried automatica
 
 ### Keep the terminal input clean
 
-To keep Telegram messages unchanged in the Codex terminal, set
-`CRB_SUGGESTED_TAIL_PROMPT=0` in the bridge service environment and restart
-only the bridge. Keep `SUGGESTED_REPLY_BUBBLE=1` and `CRB_SUGGESTED_CONFIRM=1`.
-The sample configuration instead disables suggestion display and buttons. Existing installations keep their
-current environment and flag settings until changed.
+Incoming messages receive no suggested-reply generation instructions. Existing
+conversation history and previously submitted messages are not rewritten.
 
-Put the recommendation rule in your existing Codex `AGENTS.md` instead of
-appending it to each message. For example, append this rule without replacing
-other instructions:
+## Voice input receipts (0.9.14)
 
-```text
-When a useful next action exists, end your final answer with one concrete
-follow-up request inside <추천답변>...</추천답변>. Omit it when unnecessary.
-Do not execute the suggested request unless the user asks you to.
-```
-
-The bridge still displays suggestions and confirmation buttons when the model
-produces the marker. Omitting the per-message instruction does not force a
-suggestion on every answer. New conversations read the updated instruction file;
-existing conversations may retain earlier instructions. Previously submitted
-messages are not rewritten.
+Optional local Jarvis voice receipts label where dictation started and was captured,
+without modifying the prompt or treating metadata as identity/approval. The package
+includes `voice_input_provenance` for receiver integrations. Fresh conversations
+and `/clear` transitions retain the first input card and rebind unmatched receipts
+only to the same live pane with an exact body hash and post-injection event time.
+Generic terminal input mirroring stays available when no voice receipt matches.
 
 ## Contributing
 

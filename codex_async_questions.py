@@ -2,6 +2,7 @@
 import hashlib
 import json
 import os
+import re
 import tempfile
 import threading
 import time
@@ -12,11 +13,16 @@ PREFIX = 'crb_asyncq'
 TTL = 3600
 
 
+class QuestionNotSubmitted(RuntimeError):
+    """Preflight rejected the answer before any answer key or text was sent."""
+
+
 class AsyncQuestions:
-    def __init__(self, path, telegram, submit, clock=time.time):
+    def __init__(self, path, telegram, submit, clock=time.time, recover=None):
         self.path = Path(path)
         self.telegram = telegram
         self.submit = submit
+        self.recover = recover
         self.clock = clock
         self.lock = threading.RLock()
         if self.path.exists():
@@ -55,6 +61,40 @@ class AsyncQuestions:
                                    reply_markup=json.dumps({'inline_keyboard': []}))
             except Exception:
                 pass  # Durable state, not a stale Telegram keyboard, controls admission.
+
+    def refresh_buttons(self, key, item):
+        if item['status'] == 'open':
+            buttons = [[{'text': f'{i+1}. {label.strip()}'[:64],
+                         'callback_data': f'{PREFIX}:{key}:{i}'}]
+                       for i, label in enumerate(item['options'])]
+        elif item['status'] == 'uncertain':
+            buttons = [[{'text': '터미널 질문 확인 · 선택지 복구',
+                         'callback_data': f'{PREFIX}:{key}:recover'}]]
+        else:
+            buttons = []
+        try:
+            self.telegram.call('editMessageReplyMarkup', chat_id=self.telegram.chat_id,
+                               message_id=item['message_id'],
+                               reply_markup=json.dumps({'inline_keyboard': buttons}, ensure_ascii=False))
+        except Exception:
+            pass  # Persisted state remains authoritative; never resend an answer.
+
+    def finish_submission(self, key, item, confirmed, error=None):
+        if confirmed is True:
+            item['status'] = 'answered'
+        elif isinstance(error, QuestionNotSubmitted):
+            item['status'] = 'open'
+            item['failure_stage'] = 'before_input'
+        else:
+            item['status'] = 'uncertain'
+            item['failure_stage'] = 'delivery_unconfirmed'
+        # Only fixed classifications are persisted: exception text can contain input.
+        self.save()
+        self.refresh_buttons(key, item)
+        if item['status'] == 'open':
+            self.telegram.send('터미널의 해당 질문을 확인하지 못해 답변을 입력하지 않았습니다. 질문 화면을 연 뒤 다시 선택하거나 답장해 주세요.')
+        elif item['status'] == 'uncertain':
+            self.telegram.send('선택 답변의 전달 여부를 확인하지 못했습니다. 자동 재전송하지 않습니다. 아래 질문 확인 버튼으로 선택지를 복구할 수 있습니다.')
 
     def observe(self, record, session):
         if not session or record.get('type') != 'response_item':
@@ -108,7 +148,8 @@ class AsyncQuestions:
                                for i, label in enumerate(item['options'])]
                     labels = '\n'.join(f'{i+1}. {o}' for i, o in enumerate(item['options']))
                     text = ('확인이 필요한 질문\n\n' + item['title'] + '\n\n' + labels)[:3600]
-                    text += '\n\n버튼으로 선택해 주세요. 직접 입력 답변은 현재 터미널에서 제출해 주세요. 선택지는 1시간 동안 유효합니다.'
+                    text += ('\n\n버튼으로 선택해 주세요. 직접 입력은 표시된 선택지와 같은 답만 지원합니다.' if buttons else '\n\n이 질문 메시지에 Telegram 답장으로 답변해 주세요.')
+                    text += ' 질문은 1시간 동안 유효합니다.'
                     try:
                         result = self.telegram.call('sendMessage', chat_id=self.telegram.chat_id,
                                                     text=text, reply_markup=json.dumps({'inline_keyboard': buttons}, ensure_ascii=False))
@@ -131,10 +172,13 @@ class AsyncQuestions:
             return True
         def ack(text):
             if callback.get('id'):
-                self.telegram.call('answerCallbackQuery', callback_query_id=callback['id'], text=text)
+                try:
+                    self.telegram.call('answerCallbackQuery', callback_query_id=callback['id'], text=text)
+                except Exception:
+                    pass  # An expired callback notification must not strand submitting state.
         with self.lock:
             parts = data.split(':')
-            if len(parts) != 3 or not parts[2].isdigit():
+            if len(parts) != 3 or not (parts[2].isdigit() or parts[2] == 'recover'):
                 ack('유효하지 않은 선택입니다.')
                 return True
             item = self.items.get(parts[1])
@@ -147,6 +191,22 @@ class AsyncQuestions:
                 self.clear_buttons(item)
                 ack('만료된 질문입니다. 메시지로 다시 알려주세요.')
                 return True
+            if parts[2] == 'recover':
+                if item['status'] != 'uncertain' or not callable(self.recover):
+                    ack('복구할 수 없는 질문입니다.')
+                    return True
+                try:
+                    ready = self.recover(item) is True
+                except Exception:
+                    ready = False
+                if ready:
+                    item['status'] = 'open'
+                    self.save()
+                    self.refresh_buttons(parts[1], item)
+                    ack('같은 질문을 확인했습니다. 답변을 다시 선택하거나 답장해 주세요.')
+                else:
+                    ack('터미널에서 같은 질문을 확인하지 못했습니다. 답변은 전송하지 않았습니다.')
+                return True
             index = int(parts[2])
             if item['status'] != 'open' or index >= len(item['options']):
                 ack('이미 선택했거나 더 이상 사용할 수 없는 질문입니다.')
@@ -155,15 +215,13 @@ class AsyncQuestions:
             item.update(status='submitting', selected=index)
             self.save()  # Crash or ambiguous input failure must never repeat submission.
             ack('선택한 답변을 Codex에 전달합니다.')
+            confirmed, error = False, None
             try:
                 confirmed = self.submit(text, item['message_id'])
-                item['status'] = 'answered' if confirmed is True else 'uncertain'
-            except Exception:
-                item['status'] = 'uncertain'
-                self.telegram.send('선택 답변의 전달 여부를 확인하지 못했습니다. 중복 전송은 하지 않습니다.')
+            except Exception as exc:
+                error = exc
             finally:
-                self.save()
-                self.clear_buttons(item)
+                self.finish_submission(parts[1], item, confirmed, error)
             return True
 
     def owns_title(self, title, session):
@@ -174,15 +232,93 @@ class AsyncQuestions:
                        self.clock() - item['created'] < TTL
                        for item in self.items.values())
 
-    def reply_text(self, message, session):
-        """Attach full question context to a free-text reply to the question card."""
-        reply = message.get('reply_to_message') or {}
+    def finish_reply(self, message_id, confirmed, error=None):
         with self.lock:
-            for item in self.items.values():
-                if item['session'] == session and item.get('message_id') == reply.get('message_id') and item['status'] == 'open':
-                    if self.clock() - item['created'] < TTL and isinstance(message.get('text'), str):
-                        item['status'] = 'submitting'
-                        self.save()
-                        self.clear_buttons(item)
-                        return '> ' + item['title'].replace('\n', '\n> ') + '\n\n' + message['text']
+            for key, item in self.items.items():
+                if item.get('message_id') == message_id and item['status'] in {'submitting', 'uncertain'}:
+                    self.finish_submission(key, item, confirmed, error)
+
+    def reply_text(self, message, session):
+        """None means unrelated; empty text means owned but inadmissible.
+
+        Retain ownership even after expiry/restart so stale replies never become
+        ordinary prompts. Only an explicit reply to this card can claim it.
+        """
+        reply = message.get('reply_to_message') or {}
+        if not isinstance(reply, dict) or not isinstance(reply.get('message_id'), int):
+            return None
+        with self.lock:
+            owned = [item for item in self.items.values()
+                     if item.get('message_id') == reply['message_id']]
+            if not owned:
+                return None
+            sender = message.get('from') or {}
+            chat = message.get('chat') or {}
+            if (len(owned) != 1 or not isinstance(sender, dict) or not isinstance(chat, dict)
+                    or str(sender.get('id')) != str(self.telegram.chat_id)
+                    or str(chat.get('id')) != str(self.telegram.chat_id)):
+                return ''
+            item = owned[0]
+            if item['session'] != session or item['status'] != 'open':
+                return ''
+            if self.clock() - item['created'] >= TTL:
+                item['status'] = 'expired'
+                self.save()
+                self.clear_buttons(item)
+                return ''
+            answer = message.get('text')
+            if (not isinstance(answer, str) or not answer.strip()
+                    or any(ord(c) < 32 and c != '\n' for c in answer) or '\x7f' in answer):
+                return ''
+            item['status'] = 'submitting'
+            self.save()
+            self.clear_buttons(item)
+            return '> ' + item['title'].replace('\n', '\n> ') + '\n\n' + answer
+
+
+def freeform_editor(screen, title):
+    """Read only the observed queued-input editor, never a main composer.
+
+    The title and answer are separated by a blank row. Missing/truncated or
+    multiple panels are ambiguous. Preserve answer contents, including newlines.
+    """
+    lines = screen.splitlines()
+    heads = [i for i, line in enumerate(lines)
+             if re.fullmatch(r'\s*[•·]?\s*Queued follow-up inputs\s*', line)]
+    feet = [i for i, line in enumerate(lines) if re.fullmatch(
+        r'\s*enter submit\s+ctrl \+ \] skip\s+[⌥⎇] \+ ↓ main prompt\s*', line, re.I)]
+    if len(heads) != 1 or len(feet) != 1 or feet[0] <= heads[0]:
         return None
+    body = lines[heads[0] + 1:feet[0]]
+    while body and not body[0].strip():
+        body.pop(0)
+    if not body:
+        return None
+    # Infer layout padding only from two independent fixed panel elements.
+    # Never infer it from the answer: extra spaces there belong to the user.
+    title_padding = re.match(r' *', body[0]).group()
+    footer_padding = re.match(r' *', lines[feet[0]]).group()
+    if title_padding != footer_padding:
+        return None
+    if any(line and not line.startswith(title_padding) for line in body):
+        return None
+    body = [line[len(title_padding):] if line else '' for line in body]
+    # A title may contain blank paragraphs and may wrap on the terminal.
+    # Consume its entire normalized text; an internal blank is not the editor.
+    normalized_title = ''.join(title.split())
+    boundaries = [i for i in range(1, len(body))
+                  if body[i] == '' and body[i - 1].strip()
+                  and ''.join(''.join(body[:i]).split()) == normalized_title]
+    if len(boundaries) != 1 or not body or body[-1] != '':
+        return None
+    # The observed layout has exactly one blank spacer before the footer.
+    # Remove only that row, never strip answer text or arbitrary blank rows.
+    editor = body[boundaries[0] + 1:-1]
+    if not editor:
+        return None
+    if editor[0] == '' and any(editor[1:]):
+        # A leading answer newline is indistinguishable from extra layout rows.
+        return None
+    if any(line.startswith(('›', '•')) for line in editor):
+        return None
+    return '\n'.join(editor)

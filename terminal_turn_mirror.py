@@ -14,6 +14,8 @@ from __future__ import annotations
 import re
 
 SENT_DIRECTIVE_HEADER = "보낸 지시"
+# T-260914-021: Codex AMBIENT_DIRECTIVE_HEADER 동형 — 주입 즉시 받은 지시 카드.
+RECEIVED_DIRECTIVE_HEADER = "📥 받은 지시"
 TERMINAL_QUERY_PREFIX = "터미널에서 물어본 것 — "
 # Telegram payload budget used by the Telegram chunk sender (not a truncation cap).
 TELEGRAM_CHUNK_LIMIT = 3500
@@ -142,6 +144,20 @@ def format_sent_directive(text: str, limit: int | None = None) -> str:
     if body:
         lines.append(body)
     return SENT_DIRECTIVE_HEADER + "\n" + "\n".join(lines)
+
+
+def format_received_directive(text: str, limit: int | None = None) -> str:
+    """Telegram/directive inject echo. Codex `📥 받은 지시` parity (T-260914-021)."""
+    del limit
+    masked = mask_secrets(text or "").strip()
+    if not masked:
+        return ""
+    link = _link_line(text or "")
+    parts = []
+    if link:
+        parts.append(link)
+    parts.append(masked)
+    return RECEIVED_DIRECTIVE_HEADER + "\n" + "\n".join(parts)
 
 
 def format_terminal_query(text: str, limit: int | None = None) -> str:
