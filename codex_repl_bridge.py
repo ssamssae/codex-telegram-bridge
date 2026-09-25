@@ -45,7 +45,7 @@ if _SCRIPTS_DIR not in sys.path:
     sys.path.insert(0, _SCRIPTS_DIR)
 import bridge_flow_progress as _flow_progress  # noqa: E402
 from bridge_public_text import strip_memory_citation  # noqa: E402
-from codex_async_questions import AsyncQuestions, PREFIX as ASYNC_QUESTION_PREFIX
+from codex_async_questions import AsyncQuestions, QuestionNotSubmitted, freeform_editor, PREFIX as ASYNC_QUESTION_PREFIX
 from codex_side_reply import SideReplyMirror, latest_completed_side_reply, is_side_screen, prompt_key  # noqa: E402
 
 try:
@@ -202,8 +202,8 @@ FLOW_MIRROR_SCREEN_FALLBACK_SECONDS = 2.0
 AMBIENT_DIRECTIVE_HEADER = "📥 받은 지시"
 SENT_DIRECTIVE_HEADER = "📤 보낸 지시"
 # T-260709-56: 터미널 에코(자기→자기)는 라우팅 줄이 "작업 노드 → 작업 노드" 으로 읽혀 혼선 —
-# 자기 노드 입력은 ⌨️ 헤더 + 본문만. 노드간(from≠to)은 📤 라우팅 카드 유지.
-TERMINAL_INPUT_HEADER = "⌨️ 터미널 입력"
+# 자기 노드 입력은 수신 경로와 미확인 출처 + 본문. 노드간(from≠to)은 📤 라우팅 카드 유지.
+TERMINAL_INPUT_HEADER = "📥 받은 입력 — 터미널 경로 · 지시자/전달 프로그램 미확인"
 AMBIENT_DIRECTIVE_LIMIT = 400
 DIRECTIVE_SIGNAL_ENV = "CRB_DIRECTIVE_SIGNAL_PATH"
 # Codex REPL "dead/interrupted mid-turn" markers. When these appear at the
@@ -1276,7 +1276,7 @@ def append_rate_limit_resets(status_text: str, path: Path | None) -> str:
 
 
 def codex_bridge_launchd_label(node: str) -> str:
-    return f"com.codex-telegram-bridge.{node}"
+    return os.environ.get("CRB_LAUNCHD_LABEL") or f"com.codex-telegram-bridge.{node}"
 
 
 def codex_bridge_restart_command(node: str) -> list[str]:
@@ -1753,41 +1753,29 @@ def format_ambient_directive(
     task: str | None = None,
     self_emoji: str | None = None,
     self_alias: str | None = None,
+    instruction_author: str | None = None,
+    delivery_program: str | None = None,
 ) -> str:
     # ⚙️ A2 받은-지시 카드 본문 — directive-received-ack.sh 가 신호로 남긴 디렉티브 gist
     # (이미 보일러플레이트 헤더 제거된 1~2줄)에 "발신 → 수신 · task" 라우트 줄을 얹는다.
     # from/task 는 신호 메타. claude-telegram-bridge.py format_ambient_directive 동형
     # (claude 는 full text 파싱, codex 는 신호 메타 사용). (T-260630-33)
     body = (gist or "").strip()
-    # alt3 이야기체 (spec v0.2 매트릭스 directive_sent aniki_dm 동형, claude PR#358 이관 —
-    # T-260703-14): 라우트 줄을 사람 문장으로. 발신·수신 라벨이 둘 다 해석될 때만 —
-    # 못 읽으면 아래 v0.1 카드 그대로 (fallback, 유실 0).
-    if from_node and alt3_narrative_enabled():
-        s_label, s_emoji = node_label_emoji(from_node)
-        recv_token = self_alias or node_defaults()[0]
-        r_label, r_emoji = node_label_emoji(recv_token)
-        if s_label and r_label:
-            sentence = (
-                f"{s_emoji} {s_label}{subject_particle(s_label)} "
-                f"{r_emoji} {r_label}에게 맡겼어요"
-            )
-            if task:
-                sentence = f"{sentence} ({task})"
-            parts = [sentence]
-            if body:
-                parts.append(body)
-            return "\n".join(parts)[:AMBIENT_DIRECTIVE_LIMIT].strip()
+    # T-260922-014: a transport node is not a person or an application.
     route_line = ""
     if from_node:
         label, emoji = node_label_emoji(from_node)
         sender = f"{emoji} {label}".strip()
         recv = self_emoji if self_emoji is not None else node_defaults()[1]
-        route_line = f"{sender} → {recv}"
+        route_line = f"전달 기기: {sender} → {recv}"
         if task:
             route_line = f"{route_line} · {task}"
     parts: list[str] = []
     if route_line:
         parts.append(route_line)
+        def recorded(value):
+            return re.sub(r"\s+", " ", value).strip()[:80] if isinstance(value, str) and value.strip() else "미확인"
+        parts.append(f"지시자: {recorded(instruction_author)} · 전달 프로그램: {recorded(delivery_program)}")
     if body:
         parts.append(body)
     elif task and not route_line:
@@ -1857,7 +1845,7 @@ def format_sent_directive(text: str, from_alias: str, to_alias: str) -> str:
     if not body:
         return ""
     if (from_alias or "").strip() == (to_alias or "").strip():
-        # T-260910-012: 함대는 보낸 지시, 사람 터미널은 ⌨️ 전문. 400자 gist 금지.
+        # T-260910-012: 함대는 보낸 지시, 터미널 경로 입력은 수신 전문. 400자 gist 금지.
         try:
             import terminal_turn_mirror as _turn_mirror
         except ImportError:
@@ -2694,18 +2682,23 @@ def kst_now(ts: float | None = None) -> datetime:
 
 def kst_midreport_slot_id(ts: float) -> str:
     dt = kst_now(ts)
-    minute = 0 if dt.minute < 30 else 30
-    return dt.replace(minute=minute, second=0, microsecond=0).strftime("%Y-%m-%dT%H:%M")
+    hour = dt.hour - (dt.hour % 2)
+    return dt.replace(hour=hour, minute=0, second=0, microsecond=0).strftime("%Y-%m-%dT%H:%M")
 
 
 def next_kst_midreport_epoch(ts: float) -> float:
     dt = kst_now(ts)
-    on_boundary = dt.second == 0 and dt.microsecond == 0 and dt.minute in (0, 30)
+    on_boundary = (
+        dt.second == 0
+        and dt.microsecond == 0
+        and dt.minute == 0
+        and dt.hour % 2 == 0
+    )
     if on_boundary:
         return dt.timestamp()
-    if dt.minute < 30:
-        return dt.replace(minute=30, second=0, microsecond=0).timestamp()
-    return (dt.replace(minute=0, second=0, microsecond=0) + timedelta(hours=1)).timestamp()
+    even_hour = dt.hour - (dt.hour % 2)
+    slot_start = dt.replace(hour=even_hour, minute=0, second=0, microsecond=0)
+    return (slot_start + timedelta(hours=2)).timestamp()
 
 
 def kst_midreport_due(
@@ -2713,13 +2706,13 @@ def kst_midreport_due(
 ) -> tuple[bool, str, float]:
     """Return (should_fire, slot_id, seconds_to_wait).
 
-    A failed send keeps ``pending_slot`` so the same half-hour can retry after
-    the 20s grace. Older pending slots are not backfilled.
+    A failed send keeps ``pending_slot`` so the same even-hour 2h slot can
+    retry after the 20s grace. Older pending slots are not backfilled.
     """
     slot_id = kst_midreport_slot_id(ts)
     dt = kst_now(ts)
-    minute = 0 if dt.minute < 30 else 30
-    slot_start = dt.replace(minute=minute, second=0, microsecond=0)
+    hour = dt.hour - (dt.hour % 2)
+    slot_start = dt.replace(hour=hour, minute=0, second=0, microsecond=0)
     into_slot = (dt - slot_start).total_seconds()
 
     def wait_next() -> float:
@@ -3058,6 +3051,7 @@ class Config:
     typing_max_seconds: int
     typing_liveness_seconds: int
     long_running_progress_seconds: int
+    scheduled_midreport: bool = False
     telegram_fallback_seconds: int
     approval_ttl_seconds: int
     workdir: Path
@@ -3087,11 +3081,13 @@ class Config:
     suggested_reply_confirmation_enabled: bool = True
     native_turn_stale_seconds: int = 300
     activity_eyes_enabled: bool = True
+    state_node: str = ""
 
     @classmethod
     def from_env(cls) -> "Config":
         default_node, default_emoji = node_defaults()
         node = env("CRB_NODE", default_node) or default_node
+        state_node = env("CRB_STATE_NODE", node) or node
         state_dir = Path(
             env("CRB_STATE_DIR", env("TAB_STATE_DIR", "~/.local/state/codex-telegram-bridge") or "") or ""
         ).expanduser()
@@ -3104,7 +3100,7 @@ class Config:
             if env("TAB_BOT_TOKEN")
             else Path("~/.config/codex-telegram-bridge/token.json").expanduser()
         )
-        default_state_path = state_dir / f"codex-repl-bridge-{node}.state.json"
+        default_state_path = state_dir / f"codex-repl-bridge-{state_node}.state.json"
         local_app_data = env("LOCALAPPDATA")
         native_state_root = Path(local_app_data) if local_app_data else state_dir
         default_conpty_state = native_state_root / "codex-telegram-bridge" / "repl-host.json"
@@ -3117,6 +3113,7 @@ class Config:
             )
         return cls(
             node=node,
+            state_node=state_node,
             emoji=env("CRB_EMOJI", env("TAB_PREFIX", default_emoji) or default_emoji)
             or default_emoji,
             token_file=token_file,
@@ -3148,6 +3145,7 @@ class Config:
                 600,
                 minimum=0,
             ),
+            scheduled_midreport=bool_env("CRB_SCHEDULED_MIDREPORT", False),
             telegram_fallback_seconds=int_env(
                 "CRB_TELEGRAM_FALLBACK_SECONDS",
                 90,
@@ -3220,20 +3218,24 @@ class Config:
         return f"={target}:"
 
     @property
+    def storage_node(self) -> str:
+        return self.state_node or self.node
+
+    @property
     def offset_file(self) -> Path:
-        return self.state_dir / f"codex-repl-bridge-{self.node}.offset"
+        return self.state_dir / f"codex-repl-bridge-{self.storage_node}.offset"
 
     @property
     def processed_file(self) -> Path:
-        return self.state_dir / f"codex-repl-bridge-{self.node}.processed"
+        return self.state_dir / f"codex-repl-bridge-{self.storage_node}.processed"
 
     @property
     def poll_heartbeat_file(self) -> Path:
-        return self.state_dir / f"codex-repl-bridge-{self.node}.poll-heartbeat"
+        return self.state_dir / f"codex-repl-bridge-{self.storage_node}.poll-heartbeat"
 
     @property
     def pid_file(self) -> Path:
-        return self.state_dir / f"codex-repl-bridge-{self.node}.pid"
+        return self.state_dir / f"codex-repl-bridge-{self.storage_node}.pid"
 
 
 # F3≡C3 (T-260705-72): 429 flood control 대응 상수 — claude-telegram-bridge.py 동형.
@@ -4781,7 +4783,7 @@ SUGGESTED_CONFIRM_PREFIX = "crb_suggest:"
 SUGGESTED_CONFIRM_LOCK = threading.RLock()
 
 
-SUGGESTED_GENERATION_INSTRUCTION = (
+LEGACY_SUGGESTED_GENERATION_INSTRUCTION = (
     "최종 답변 뒤에 사용자가 이어서 보낼 유용한 후속 요청이 있으면 마지막 줄에 "
     "<추천답변>사용자가 보낼 구체적인 요청 한 줄</추천답변>을 붙여. "
     "단순 인사나 다음 행동이 없는 답변에는 생략할 수 있어. "
@@ -4789,25 +4791,31 @@ SUGGESTED_GENERATION_INSTRUCTION = (
 )
 
 
+LEGACY_NO_SUGGESTED_GENERATION_INSTRUCTION = (
+    "사용자 지시: 답변 끝에 추천답변 태그·복사용 후속 답변·확인 문구를 자동으로 붙이지 않는다. "
+    "이전 대화의 추천답변 작성 지시보다 이 지시를 우선한다. 사용자가 답장 초안을 명시적으로 요청한 경우에만 요청한 내용을 제공한다."
+)
+
+
 def strip_suggested_generation_instruction(text: str) -> str:
     raw = (text or "").replace("\r\n", "\n").strip()
-    if raw.endswith(SUGGESTED_GENERATION_INSTRUCTION):
-        return raw[:-len(SUGGESTED_GENERATION_INSTRUCTION)].rstrip()
+    for marker in (LEGACY_SUGGESTED_GENERATION_INSTRUCTION, LEGACY_NO_SUGGESTED_GENERATION_INSTRUCTION):
+        if raw.endswith(marker):
+            return raw[:-len(marker)].rstrip()
     return raw
 
 
 def suggested_generation_enabled() -> bool:
-    if "CRB_SUGGESTED_TAIL_PROMPT" in os.environ:
-        return bool_env("CRB_SUGGESTED_TAIL_PROMPT", False)
-    return (Path.home() / ".config/codex-telegram-bridge/suggested-generation.on").is_file()
+    # Retired: old environment variables and flag files cannot enable injection.
+    return False
 
 
 def with_suggested_generation_instruction(text: str) -> str:
     raw = (text or "").rstrip()
-    if (not suggested_generation_enabled() or not raw
-            or raw.lstrip().startswith("/") or raw.endswith(SUGGESTED_GENERATION_INSTRUCTION)):
-        return raw
-    return raw + "\n\n" + SUGGESTED_GENERATION_INSTRUCTION
+    for marker in (LEGACY_SUGGESTED_GENERATION_INSTRUCTION, LEGACY_NO_SUGGESTED_GENERATION_INSTRUCTION):
+        if raw.endswith(marker):
+            return raw[:-len(marker)].rstrip()
+    return raw
 
 
 def normalize_prompt(text: str) -> str:
@@ -5591,6 +5599,72 @@ def parse_choice_prompt(screen: str) -> ChoicePrompt | None:
     return ChoicePrompt(signature=signature, title=title, options=options)
 
 
+EMPTY_ANSWER_HINT_RE = re.compile(
+    r"type (?:your |an? )?answer|type something|답변을 입력",
+    re.IGNORECASE,
+)
+# 긴 주관식 제목이 TUI에서 잘려도 같은 카드로 인정할 최소 canonical 접두.
+_TITLE_PREFIX_MIN = 24
+
+
+def question_title_matches_visible_text(title: str, visible: str) -> bool:
+    """Match a full title or a sufficiently long TUI-truncated prefix."""
+    expected = canonical_choice_signature_text(title)
+    shown = canonical_choice_signature_text(visible)
+    if not expected or not shown:
+        return False
+    if shown == expected:
+        return True
+    return len(shown) >= _TITLE_PREFIX_MIN and expected.startswith(shown)
+
+
+def empty_type_answer_editor(screen: str, title: str) -> bool:
+    """True for the empty freeform editor used by choice Other.
+
+    Live Codex async questions with no options (T-260913-057 card 2762) show
+    this panel, not the queued-input editor that freeform_editor() reads.
+    """
+    if parse_approval_prompt(screen) or parse_choice_prompt(screen) is not None:
+        return False
+    lines = clean_pane_lines(screen)
+    hint_indexes = [
+        index for index, line in enumerate(lines)
+        if EMPTY_ANSWER_HINT_RE.fullmatch(line.strip())
+    ]
+    if len(hint_indexes) != 1:
+        return False
+    hint_index = hint_indexes[0]
+    if not any(
+        re.search(r'\benter\s+submit\b', line, re.IGNORECASE)
+        for line in lines[hint_index + 1:hint_index + 5]
+    ):
+        return False
+
+    # Bind the editor to the title immediately above its placeholder. A stale
+    # matching title elsewhere in scrollback must never authorize text input
+    # into a different question.
+    title_lines = lines[max(0, hint_index - 8):hint_index]
+    while title_lines and not title_lines[-1].strip():
+        title_lines.pop()
+    return any(
+        question_title_matches_visible_text(title, "\n".join(title_lines[start:]))
+        for start in range(len(title_lines))
+    )
+
+
+def type_answer_panel_blocking(screen: str, title: str, submitted: str = "") -> bool:
+    """True while the Type-your-answer editor is still the live panel.
+
+    After a paste the placeholder hint can linger. If the submitted text is
+    already visible, do not treat that leftover hint as an open panel.
+    """
+    if not empty_type_answer_editor(screen, title):
+        return False
+    if submitted and canonical_choice_signature_text(submitted) in canonical_choice_signature_text(screen):
+        return False
+    return True
+
+
 def extract_message_content(payload: dict[str, Any]) -> str:
     content = payload.get("content")
     if not isinstance(content, list):
@@ -5927,8 +6001,32 @@ class Bridge:
         with self.async_questions_lock:
             if self.async_questions is None:
                 path = self.config.state_path.with_name(self.config.state_path.stem + ".questions.json")
-                self.async_questions = AsyncQuestions(path, self.telegram, self.submit_async_answer)
+                self.async_questions = AsyncQuestions(path, self.telegram, self.submit_async_answer, recover=self.recover_async_question)
             return self.async_questions
+
+    def recover_async_question(self, item):
+        """Read-only recovery: two matching current panels, never input or navigation."""
+        if self.config.bridge_kill:
+            return False
+        normalize = canonical_choice_signature_text
+        with self.repl.composer_lock():
+            for _ in range(2):
+                if str(self.repl.session_file()) != item['session']:
+                    return False
+                screen = self.repl.capture_visible_screen()
+                if parse_approval_prompt(screen):
+                    return False
+                prompt = parse_choice_prompt(screen)
+                if item['options']:
+                    if (prompt is None or normalize(prompt.title) != normalize(item['title'])
+                            or prompt.selected_option() is None
+                            or [normalize(o.label) for o in prompt.options[:len(item['options'])]]
+                            != [normalize(o) for o in item['options']]):
+                        return False
+                elif freeform_editor(screen, item['title']) != '':
+                    return False
+                time.sleep(0.15)
+            return str(self.repl.session_file()) == item['session']
 
     def submit_async_answer(self, text, message_id):
         """Submit only inside the matching native question, never the composer."""
@@ -5936,58 +6034,85 @@ class Bridge:
         candidates = []
         for item in questions.items.values():
             prefix = '> ' + item['title'].replace('\n', '\n> ') + '\n\n'
-            if item['status'] == 'submitting' and text.startswith(prefix):
+            if item['status'] == 'submitting' and item.get('message_id') == message_id and text.startswith(prefix):
                 candidates.append((item, text[len(prefix):]))
         if len(candidates) != 1 or self.config.bridge_kill:
-            raise RuntimeError('No unique active question')
+            raise QuestionNotSubmitted('No unique active question')
         item, answer = candidates[0]
         normalize = canonical_choice_signature_text
+        if sum(1 for other in questions.items.values()
+               if other['session'] == item['session']
+               and other['status'] in {'open', 'submitting', 'uncertain'}
+               and normalize(other['title']) == normalize(item['title'])) != 1:
+            raise QuestionNotSubmitted('Native question title is ambiguous')
         with self.repl.composer_lock():
             if str(self.repl.session_file()) != item['session']:
-                raise RuntimeError('Question session changed')
+                raise QuestionNotSubmitted('Question session changed')
             screen = self.repl.capture_visible_screen()
             if parse_approval_prompt(screen):
-                raise RuntimeError('Approval panel is open')
+                raise QuestionNotSubmitted('Approval panel is open')
             prompt = parse_choice_prompt(screen)
-            if prompt is None:
+            type_answer = empty_type_answer_editor(screen, item['title'])
+            if prompt is None and freeform_editor(screen, item['title']) is None and not type_answer:
                 # This live TUI has no shared app-server response connection.
                 # Navigate only when its own pending-question hint is visible.
                 if not re.search(r'shift\s*\+\s*←\s*to answer', screen, re.IGNORECASE):
-                    raise RuntimeError('No pending native question hint')
+                    raise QuestionNotSubmitted('No pending native question hint')
                 focus = getattr(self.repl, 'focus_pending_question', None)
                 if not callable(focus):
-                    raise RuntimeError('Native question navigation unavailable')
+                    raise QuestionNotSubmitted('Native question navigation unavailable')
                 focus()
                 for _ in range(10):
                     time.sleep(0.1)
                     screen = self.repl.capture_visible_screen()
                     if parse_approval_prompt(screen):
-                        raise RuntimeError('Approval panel appeared')
+                        raise QuestionNotSubmitted('Approval panel appeared')
                     prompt = parse_choice_prompt(screen)
-                    if prompt:
+                    type_answer = empty_type_answer_editor(screen, item['title'])
+                    if prompt or freeform_editor(screen, item['title']) is not None or type_answer:
                         break
-            # Full title and all supplied labels must survive wrapping. Never
-            # guess a choice by index on an unrelated or truncated panel.
-            if (prompt is None or normalize(item['title']) not in normalize(screen)
-                    or any(normalize(label) not in normalize(screen) for label in item['options'])):
-                raise RuntimeError('Native question does not match event')
-            matches = [option for option in prompt.options
-                       if normalize(option.label) == normalize(answer)]
-            if len(matches) != 1:
-                raise RuntimeError('Native answer option not verified; no text fallback')
-            selected = prompt.selected_option()
-            if selected is None:
-                raise RuntimeError('Native selected option unavailable')
-            option = matches[0]
-            self.repl.send_choice(TransportChoice(value=option.value, key='',
-                index=option.index, selected_index=selected.index))
+            editor = freeform_editor(screen, item['title'])
+            type_answer = empty_type_answer_editor(screen, item['title'])
+            if not item['options'] and prompt is None and (editor is not None or type_answer):
+                if not answer.strip() or any(ord(c) < 32 and c != '\n' for c in answer) or '\x7f' in answer:
+                    raise QuestionNotSubmitted('Unsafe or empty question answer')
+                if type_answer:
+                    self.repl.send_choice_text(answer)
+                elif editor == answer:
+                    self.repl.send_key('Enter')
+                elif not editor:
+                    self.repl.send_choice_text(answer)
+                else:
+                    raise QuestionNotSubmitted('Existing question input differs; preserved')
+            else:
+                # Full title and all supplied labels must survive wrapping. Never
+                # guess a choice by index on an unrelated or truncated panel.
+                if (prompt is None or normalize(item['title']) != normalize(prompt.title)
+                        or any(normalize(label) not in normalize(screen) for label in item['options'])):
+                    raise QuestionNotSubmitted('Native question does not match event')
+                matches = [option for option in prompt.options
+                           if normalize(option.label) == normalize(answer)]
+                if len(matches) != 1:
+                    raise QuestionNotSubmitted('Native answer option not verified; no text fallback')
+                selected = prompt.selected_option()
+                if selected is None:
+                    raise QuestionNotSubmitted('Native selected option unavailable')
+                option = matches[0]
+                self.repl.send_choice(TransportChoice(value=option.value, key='',
+                    index=option.index, selected_index=selected.index))
             # A key ACK or an ordinary quoted user message is not completion.
             clear_reads = 0
             for _ in range(15):
                 time.sleep(0.15)
                 screen = self.repl.capture_visible_screen()
                 current = parse_choice_prompt(screen)
-                old_panel = current is not None and normalize(item['title']) in normalize(screen)
+                old_panel = (
+                    current is not None
+                    or 'Queued follow-up inputs' in screen
+                    or type_answer_panel_blocking(screen, item['title'], answer)
+                )
+                if parse_approval_prompt(screen) or str(self.repl.session_file()) != item['session']:
+                    raise RuntimeError('Question completion context changed')
                 if screen.strip() and not old_panel and not re.search(r'shift\s*\+\s*←\s*to answer', screen, re.IGNORECASE) and (
                         screen_has_repl_busy_marker(screen) or any(line.lstrip().startswith('›') for line in screen.splitlines())):
                     clear_reads += 1
@@ -6198,36 +6323,44 @@ class Bridge:
         """Feed newly visible REPL activities into the one-card flow renderer."""
         if not self.flow_mirror_active() or not getattr(self.repl, "supports_pane_features", True):
             return False
-        with self.lock:
+        with self.flow_lock:
+            generation = self.flow_generation
             scope = self.active_telegram_prompt or self.current_flow_scope
-        if not scope:
-            return False
+            if self.suppress_until_user or not scope:
+                return False
         try:
             screen = self.repl.capture_screen(FLOW_MIRROR_SCREEN_CAPTURE_LINES)
         except Exception as exc:  # noqa: BLE001
             log("FLOW", f"screen capture failed (non-fatal): {exc}")
             return False
-        current = extract_codex_flow_steps(screen)
-        if not current:
-            return False
-        with self.lock:
-            previous = list(self.flow_screen_snapshot)
-            self.flow_screen_snapshot = list(current)
-            structured_age = time.monotonic() - self.last_structured_flow_at
-        new_steps = appended_flow_steps(previous, current)
-        if not new_steps:
-            return False
-        # JSONL function_call records are more precise.  When one just arrived,
-        # keep the screen snapshot current but do not duplicate its TUI rendering.
-        if structured_age <= FLOW_MIRROR_SCREEN_FALLBACK_SECONDS:
-            log("FLOW", "screen steps covered by recent structured event")
-            return False
-        emitted = False
-        for step in new_steps:
-            key = flow_mirror_dedup_key(step, scope)
-            self.handle_flow_event(step, key, source="screen")
-            emitted = True
-        return emitted
+        # Capturing the terminal can outlive a response or even the next prompt.
+        # Validate its original generation before touching snapshots or typing,
+        # and serialize the whole batch with final-card cleanup.
+        with self.flow_lock:
+            if (self.suppress_until_user or self.flow_generation != generation
+                    or scope != (self.active_telegram_prompt or self.current_flow_scope)):
+                return False
+            current = extract_codex_flow_steps(screen)
+            if not current:
+                return False
+            with self.lock:
+                previous = list(self.flow_screen_snapshot)
+                self.flow_screen_snapshot = list(current)
+                structured_age = time.monotonic() - self.last_structured_flow_at
+            new_steps = appended_flow_steps(previous, current)
+            if not new_steps:
+                return False
+            # JSONL function_call records are more precise.  When one just arrived,
+            # keep the screen snapshot current but do not duplicate its TUI rendering.
+            if structured_age <= FLOW_MIRROR_SCREEN_FALLBACK_SECONDS:
+                log("FLOW", "screen steps covered by recent structured event")
+                return False
+            emitted = False
+            for step in new_steps:
+                key = flow_mirror_dedup_key(step, scope)
+                self.handle_flow_event(step, key, source="screen")
+                emitted = True
+            return emitted
 
     def handle_user_event(self, text: str) -> bool | None:
         self.clear_midreport_recovery_candidate()
@@ -6278,17 +6411,45 @@ class Bridge:
                 self.midreport_prompt = normalize_prompt(text)
         self.start_long_running_progress(text)
 
-    def emit_sent_directive_card(self, text: str) -> bool:
+    def emit_sent_directive_card(self, text: str, *, voice_only: bool = False) -> bool:
         if self.config.bridge_kill:
             log("SEND", "sent-directive echo blocked by CRB_KILL=1")
             return
         node = str(getattr(self.config, "node", "") or node_defaults()[0])
         message = format_sent_directive(text, from_alias=node, to_alias=node)
+        try:
+            from voice_input_provenance import match_voice_input
+        except ImportError:
+            match_voice_input = None  # Older standalone/exported packages keep the fallback.
+        pane_pid = getattr(getattr(self, "repl", None), "pane_pid", lambda: None)
+        provenance = (match_voice_input(text, getattr(self, "session_path", None),
+                                       getattr(self, "input_event_offset", None), node, details=True,
+                                       pane_pid=pane_pid(), resolve_session=session_file_from_descendants)
+                      if match_voice_input else None)
+        if voice_only and not provenance:
+            return None
+        voice_key = ""
+        if provenance:
+            voice_key = "voice-card:" + hashlib.sha256(
+                f"{self.session_path}:{self.input_event_offset}:{text}".encode()
+            ).hexdigest()
+            if ring_contains(self.bridge_state, voice_key):
+                return True
+            label, emoji = node_label_emoji(node)
+            source = "네스트로 시작 · " if provenance.get("start_source") == "google-home-matter" else ""
+            capture_node = provenance.get("capture_node")
+            if isinstance(capture_node, str) and 0 < len(capture_node) <= 64:
+                capture_label, _ = node_label_emoji(capture_node)
+                source += f"{capture_label} 음성 입력 · "
+            message = message.replace(TERMINAL_INPUT_HEADER,
+                f"🎙 받은 음성 입력 — {source}자비스 전달 → {emoji} {label} 코덱스", 1)
         if not message:
             return
         if not self.telegram.send(message, viewer=True):
             log("SEND", "sent-directive echo failed")
             return False
+        if voice_key:
+            self.persist_state(event_key=voice_key)
         log("SEND", "sent terminal-origin directive card")
         return True
 
@@ -6322,38 +6483,40 @@ class Bridge:
         self.pending_reasoning_mirror = (message, key)
 
     def handle_flow_event(self, text: str, key: str, source: str = "jsonl") -> None:
-        generation = self.flow_generation
-        if is_copy_payload_message(text):
-            self.handle_copy_payload_event(text)
-            return
-        self.mark_repl_activity()
-        with self.lock:
-            self.last_public_progress = format_progress_summary(text, 220)
-            if source != "screen":
-                self.last_structured_flow_at = time.monotonic()
-        if not self.has_repl_typing():
-            log("TYPE", "recover from flow")
-            self.begin_repl_typing()
-        if not self.flow_mirror_active():
-            return
-        scope = self.active_telegram_prompt or self.current_flow_scope
-        flow_key = flow_mirror_dedup_key(text, scope)
-        dedup_key = flow_key or key
-        if self.bridge_state and ring_contains(self.bridge_state, dedup_key):
-            log("SEND", "skip duplicate flow mirror")
-            mesh_ledger_record("sendMessage", self.config.chat_id, text, result="suppressed")
-            return
-        # Collapse each flow event to a single short line (claude parity).
-        # Full narration was overflowing FLOW_MIRROR_LIMIT after 1-2 steps and
-        # spilling into multiple long messages instead of one growing card.
-        summary = user_visible_flow_line(flow_step_summary(text))
-        if not summary:
-            return
-        if self.config.bridge_kill:
-            log("SEND", "flow mirror blocked by CRB_KILL=1")
-            return
-
         with self.flow_lock:
+            if self.suppress_until_user or self.flow_closing:
+                return
+            generation = self.flow_generation
+            if is_copy_payload_message(text):
+                self.handle_copy_payload_event(text)
+                return
+            self.mark_repl_activity()
+            with self.lock:
+                self.last_public_progress = format_progress_summary(text, 220)
+                if source != "screen":
+                    self.last_structured_flow_at = time.monotonic()
+            if not self.has_repl_typing():
+                log("TYPE", "recover from flow")
+                self.begin_repl_typing()
+            if not self.flow_mirror_active():
+                return
+            scope = self.active_telegram_prompt or self.current_flow_scope
+            flow_key = flow_mirror_dedup_key(text, scope)
+            dedup_key = flow_key or key
+            if self.bridge_state and ring_contains(self.bridge_state, dedup_key):
+                log("SEND", "skip duplicate flow mirror")
+                mesh_ledger_record("sendMessage", self.config.chat_id, text, result="suppressed")
+                return
+            # Collapse each flow event to a single short line (claude parity).
+            # Full narration was overflowing FLOW_MIRROR_LIMIT after 1-2 steps and
+            # spilling into multiple long messages instead of one growing card.
+            summary = user_visible_flow_line(flow_step_summary(text))
+            if not summary:
+                return
+            if self.config.bridge_kill:
+                log("SEND", "flow mirror blocked by CRB_KILL=1")
+                return
+
             if self.flow_generation != generation or self.flow_closing:
                 return
             self._update_flow_card(scope, summary, dedup_key)
@@ -6755,9 +6918,10 @@ class Bridge:
         if self.request_incomplete_copy_payload_pair_repair_if_needed():
             return True
         self.warn_incomplete_copy_payload_pair_if_needed()
-        self.clear_active_telegram_prompt()
-        self.close_flow_card("sent")
-        self.mark_repl_turn_finished()
+        with self.flow_lock:
+            self.clear_active_telegram_prompt()
+            self.close_flow_card("sent")
+            self.mark_repl_turn_finished()
         return True
 
     def mark_repl_turn_finished(self) -> None:
@@ -6781,9 +6945,10 @@ class Bridge:
             )
 
     def finish_duplicate_final_turn(self) -> None:
-        self.clear_active_telegram_prompt()
-        self.close_flow_card("sent")
-        self.mark_repl_turn_finished()
+        with self.flow_lock:
+            self.clear_active_telegram_prompt()
+            self.close_flow_card("sent")
+            self.mark_repl_turn_finished()
 
     def send_answer(self, answer: str) -> bool:
         answer = strip_memory_citation(answer)
@@ -7141,6 +7306,7 @@ class Bridge:
                     self.persist_state(line_end)
                 return True
             self.last_user_pair_sources = {source} if source else set()
+            self.input_event_offset = line_start
             if self.handle_user_event(text) is False:
                 return False
             if report_key:
@@ -7255,6 +7421,7 @@ class Bridge:
             state = read_json(self.config.state_path)
             cursor = cursor_offset_for_state(state, identity)
             self.session_path = path
+            self.voice_attach_recovery_until = time.monotonic() + 10
             self.choice_focus_request = None
             self.choice_focus_seen = set()
             self.recover_choice_request(path)
@@ -7333,6 +7500,8 @@ class Bridge:
                     self.backfill_cursorless_session(path, identity)
                     self.bind_preexisting_session_user(path)
                 self.persist_state(self.session_pos)
+        if time.monotonic() < getattr(self, "voice_attach_recovery_until", 0):
+            self.recover_attached_voice_card(path)
         # Run on every existing JSONL poll: a failed Telegram send must retry
         # even when the new session's path no longer changes.
         self.maybe_confirm_pending_clear()
@@ -7400,6 +7569,18 @@ class Bridge:
         self.begin_repl_typing()
         return True
 
+    def recover_attached_voice_card(self, path: Path) -> None:
+        try:
+            events = read_tail_jsonl_events(path, self.config.tail_scan_bytes)
+        except OSError:
+            return
+        latest, _ = self._latest_tail_user(events)
+        if latest is None:
+            return
+        self.input_event_offset = latest.start
+        if self.emit_sent_directive_card(latest.text, voice_only=True) is True:
+            self.voice_attach_recovery_until = 0
+
     def bind_preexisting_session_user(self, path: Path) -> None:
         """Bind origin for an unfinished user already in a new jsonl at EOF attach.
 
@@ -7407,13 +7588,14 @@ class Bridge:
         on disk, so handle_user_event never runs and suppress_until_user from the
         previous turn would swallow the later final_answer (T-260911-002 r25).
         Closed historical turns keep suppression and the active prompt.
-        Do not emit a second directive card; the prompt was already injected.
+        Matched voice receipts may emit their once-only input card on EOF attach.
         """
         try:
             events = read_tail_jsonl_events(path, self.config.tail_scan_bytes)
         except OSError as exc:
             log("JSONL", f"session attach user bind failed: {exc}")
             return
+        self.recover_attached_voice_card(path)
         latest, later_assistants = self._latest_tail_user(events)
         if latest is None:
             log("JSONL", "session attach: no preexisting user to bind")
@@ -7621,6 +7803,8 @@ class Bridge:
             str(data.get("gist", "")),
             from_node=str(data.get("from", "")) or None,
             task=str(data.get("task", "")) or None,
+            instruction_author=data.get("instruction_author"),
+            delivery_program=data.get("delivery_program"),
         )
         if not body:
             return
@@ -7982,6 +8166,9 @@ class Bridge:
         expected = normalize_prompt(prompt)
         if not self.midreport_turn_active(expected):
             return "inactive", 1.0
+        # Keep the timer/lost-turn watchdog alive while suppressing periodic recap cards.
+        if not getattr(self.config, "scheduled_midreport", False):
+            return "disabled", 60.0
         now = float(self.now_fn())
         with self.lock:
             last_slot = self.last_midreport_slot
@@ -8003,15 +8190,18 @@ class Bridge:
             message, progress = self.long_running_progress_update(
                 prompt, elapsed_seconds, public_only=True
             )
-            if not message:
-                return "empty"
             if not self.midreport_turn_active(expected) or self._midreport_prompt_candidate() not in (
                 "",
                 expected,
             ):
                 return "inactive"
-            unchanged = bool(progress) and progress == self.last_midreport_progress
+            unchanged = (not progress) or progress == self.last_midreport_progress or not message
             log("PROG", f"send kst midreport slot={slot_id} unchanged={unchanged}")
+            if unchanged:
+                self.last_midreport_slot = slot_id
+                self.pending_midreport_slot = ""
+                self.persist_state()
+                return "unchanged"
             try:
                 ok = self.telegram.send(message)
             except Exception as exc:  # noqa: BLE001
@@ -8319,10 +8509,10 @@ class Bridge:
                 recent_progress = self.last_public_progress
             last_sent = self.last_midreport_progress
             note_at = self.last_midreport_note_at
-        unchanged = bool(recent_progress) and recent_progress == last_sent
+        unchanged = (not recent_progress) or recent_progress == last_sent
         checked = kst_now(float(self.now_fn())).strftime("%H:%M")
         note_when = kst_now(note_at).strftime("%H:%M") if note_at else ""
-        if not public_only and (not recent_progress or recent_progress == last_sent):
+        if unchanged:
             return "", ""
         return (
             format_long_running_progress_message(
@@ -8332,7 +8522,7 @@ class Bridge:
                 recent_progress=recent_progress,
                 checked_at=checked,
                 note_at=note_when,
-                unchanged=unchanged or not recent_progress,
+                unchanged=False,
             ),
             recent_progress,
         )
@@ -9351,7 +9541,7 @@ class Bridge:
         return True
 
     def suggested_confirm_path(self) -> Path:
-        return self.config.state_dir / f"codex-suggested-confirm-{self.config.node}.json"
+        return self.config.state_dir / f"codex-suggested-confirm-{getattr(self.config, 'storage_node', self.config.node)}.json"
 
     def read_suggested_confirms(self) -> dict[str, Any]:
         path = self.suggested_confirm_path()
@@ -10171,7 +10361,7 @@ class Bridge:
 
         caption = message.get("caption")
         caption_text = caption.strip() if isinstance(caption, str) else ""
-        media_dir = self.config.state_dir / "codex-repl-bridge-media" / self.config.node
+        media_dir = self.config.state_dir / "codex-repl-bridge-media" / getattr(self.config, "storage_node", self.config.node)
 
         photos = message.get("photo")
         if isinstance(photos, list) and photos:
@@ -10486,16 +10676,23 @@ class Bridge:
         chat = message.get("chat") if isinstance(message.get("chat"), dict) else {}
         if str(chat.get("id")) != self.config.chat_id:
             return
-        if self.handle_choice_reply(message):
-            return
-        if getattr(self, "async_questions_lock", None) is not None and not self.config.bridge_kill:
+        if getattr(self, "async_questions_lock", None) is not None:
             answer = self.get_async_questions().reply_text(message, str(self.repl.session_file()))
             if answer is not None:
+                if not answer or self.config.bridge_kill:
+                    self.telegram.send("이미 처리됐거나 만료된 질문, 또는 제출할 수 없는 답변입니다. 일반 대화로 보내지 않았습니다.")
+                    return
+                confirmed, error = False, None
+                card_id = int(message["reply_to_message"]["message_id"])
                 try:
-                    self.submit_async_answer(answer, int(message.get("message_id") or 0))
-                except Exception:
-                    self.telegram.send("질문 답변을 전달하지 못했거나 확인이 필요합니다. 자동 재전송하지 않습니다.")
+                    confirmed = self.submit_async_answer(answer, card_id)
+                except Exception as exc:
+                    error = exc
+                finally:
+                    self.get_async_questions().finish_reply(card_id, confirmed, error)
                 return
+        if self.handle_choice_reply(message):
+            return
         raw_text = message.get("text")
         if isinstance(raw_text, str):
             if raw_text.strip().lower() == "/choices":

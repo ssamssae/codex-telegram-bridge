@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "codex-telegram-bridge"
-version = "0.9.13"
+version = "0.9.14"
 description = "Control a live Codex CLI session from Telegram."
 readme = "README.md"
 requires-python = ">=3.10"
@@ -48,6 +48,7 @@ py-modules = [
   "bridge_flow_progress",
   "bridge_public_text",
   "terminal_turn_mirror",
+  "voice_input_provenance",
   "bridge_setup",
   "bridge_watchdog",
   "telegram_agent_bridge",
