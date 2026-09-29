@@ -322,6 +322,7 @@ class ClearAcknowledgementTest(unittest.TestCase):
         self.db.commit()
         self.assertIsNone(self.transport.clear_log_cursor())
         self.assertFalse(self.transport.clear_log_confirms_reset(cursor))
+        self.db.close()  # Windows cannot unlink an open SQLite database.
         self.log_path.unlink()
         self.assertIsNone(self.transport.clear_log_cursor())
         self.assertFalse(self.log_path.exists())
