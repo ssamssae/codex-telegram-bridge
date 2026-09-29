@@ -5,9 +5,11 @@ from __future__ import annotations
 import importlib.util
 import json
 import os
+import sqlite3
 import sys
 import tempfile
 import threading
+import time
 import unittest
 from dataclasses import replace
 from pathlib import Path
@@ -23,6 +25,7 @@ class ClearAcknowledgementTest(unittest.TestCase):
         self.root = Path(self.tmp.name)
         env = mock.patch.dict(os.environ, {
             "HOME": str(self.root), "USERPROFILE": str(self.root),
+            "CODEX_HOME": str(self.root / ".codex"),
             "CRB_CHAT_ID": "1234", "CRB_FLOW_MIRROR": "0",
         })
         env.start()
@@ -212,6 +215,116 @@ class ClearAcknowledgementTest(unittest.TestCase):
         self.screen = '› Ask Codex to do anything\n'
         self.repl.capture_visible_screen = mock.Mock(side_effect=lambda: self.screen)
         self.bridge.ensure_session_file()
+
+    def log_transport(self):
+        self.native()
+        self.transport = object.__new__(self.mod.TmuxTransport)
+        self.transport.pane_pid = mock.Mock(return_value=120)
+        patch = mock.patch.object(self.mod, "descendants", return_value={120, 121})
+        patch.start()
+        self.addCleanup(patch.stop)
+        self.log_path = self.root / ".codex" / "logs_2.sqlite"
+        self.log_path.parent.mkdir()
+        self.db = sqlite3.connect(self.log_path)
+        self.addCleanup(self.db.close)
+        self.db.execute("CREATE TABLE logs (id INTEGER PRIMARY KEY, target TEXT, process_uuid TEXT, feedback_log_body TEXT, ts INTEGER, ts_nanos INTEGER)")
+        self.owner = "pid:121:11111111-1111-1111-1111-111111111111"
+        self.db.execute("INSERT INTO logs (id,target,process_uuid,feedback_log_body) VALUES (1, 'codex_tui::chatwidget', ?, 'idle')", (self.owner,))
+        self.db.commit()
+        self.repl.clear_log_cursor = self.transport.clear_log_cursor
+        self.repl.clear_log_confirms_reset = self.transport.clear_log_confirms_reset
+        self.screen = "OpenAI Codex (v0.155.1)\n› Ask Codex to do anything\nContext 0% used\n"
+
+    def start_receipt(self, owner=None, method="thread/start", client="codex-tui", at_ns=None, request_id="7"):
+        now = time.time_ns() if at_ns is None else at_ns
+        self.db.execute("INSERT INTO logs (target, process_uuid, feedback_log_body, ts, ts_nanos) VALUES (?, ?, ?, ?, ?)", (
+            "codex_app_server::outgoing_message", owner or self.owner,
+            f'app_server.request{{rpc.method="{method}" app_server.client_name="{client}" rpc.request_id={request_id}}}: '
+            'app-server event: thread/started targeted_connections=0', now // 1_000_000_000, now % 1_000_000_000))
+        self.db.commit()
+
+    def test_log_receipt_completes_without_banner_or_new_rollout(self):
+        self.log_transport()
+        self.repl.paste_prompt.side_effect = lambda *_: self.start_receipt()
+        self.request()
+        self.assertEqual(self.sent(), [self.mod.CLEAR_SLASH_COMPLETE])
+        self.assertEqual(self.repl.session_file(), self.old)
+
+    def test_log_watermark_survives_bridge_restart_and_ack_is_once(self):
+        self.log_transport()
+        self.request()
+        self.assertIn("log_cursor", self.state()["pending_clear_watch"])
+        self.bridge = self.make_bridge()
+        self.start_receipt()
+        self.bridge.maybe_confirm_pending_clear()
+        self.bridge.maybe_confirm_pending_clear()
+        self.assertEqual(self.sent().count(self.mod.CLEAR_SLASH_COMPLETE), 1)
+
+    def test_old_log_and_empty_screen_do_not_complete(self):
+        self.log_transport()
+        self.start_receipt()
+        self.request()
+        self.assertNotIn(self.mod.CLEAR_SLASH_COMPLETE, self.sent())
+
+    def test_other_process_and_non_tui_or_resume_events_do_not_complete(self):
+        self.log_transport()
+        self.request()
+        self.start_receipt(owner="pid:999:11111111-1111-1111-1111-111111111111")
+        self.start_receipt(client="codex-exec")
+        self.start_receipt(method="thread/resume")
+        self.bridge.maybe_confirm_pending_clear()
+        self.assertNotIn(self.mod.CLEAR_SLASH_COMPLETE, self.sent())
+
+    def test_process_restart_and_multiple_receipts_fail_closed(self):
+        self.log_transport()
+        cursor = self.transport.clear_log_cursor()
+        self.start_receipt(owner="pid:121:22222222-2222-2222-2222-222222222222")
+        self.assertFalse(self.transport.clear_log_confirms_reset(cursor))
+        self.start_receipt()
+        self.start_receipt()
+        self.assertFalse(self.transport.clear_log_confirms_reset(cursor))
+
+    def test_delayed_old_start_log_is_not_a_fresh_receipt(self):
+        self.log_transport()
+        cursor = self.transport.clear_log_cursor()
+        self.start_receipt(at_ns=cursor["at_ns"] - 1)
+        self.assertFalse(self.transport.clear_log_confirms_reset(cursor))
+        self.start_receipt()
+        self.assertTrue(self.transport.clear_log_confirms_reset(cursor))
+
+    def test_temporary_background_thread_is_not_clear_completion(self):
+        self.log_transport()
+        cursor = self.transport.clear_log_cursor()
+        self.start_receipt(request_id="temporary-structured-example")
+        self.assertFalse(self.transport.clear_log_confirms_reset(cursor))
+
+    def test_detached_process_is_not_completion(self):
+        self.log_transport()
+        cursor = self.transport.clear_log_cursor()
+        self.start_receipt()
+        with mock.patch.object(self.mod, "descendants", return_value={777}):
+            self.assertFalse(self.transport.clear_log_confirms_reset(cursor))
+
+    def test_log_receipt_requires_idle_empty_main_screen(self):
+        self.log_transport()
+        self.request()
+        self.start_receipt()
+        for screen in ("", "OpenAI Codex\n› Ask Codex to do anything\nContext 20% used",
+                       self.screen + "\nWorking (esc to interrupt)",
+                       self.screen + "\n'/clear' is disabled while a task is in progress"):
+            self.screen = screen
+            self.assertFalse(self.bridge._pending_clear_reset_confirmed(self.bridge.pending_clear_watch))
+
+    def test_missing_or_changed_log_schema_fails_closed(self):
+        self.log_transport()
+        cursor = self.transport.clear_log_cursor()
+        self.db.execute("DROP TABLE logs")
+        self.db.commit()
+        self.assertIsNone(self.transport.clear_log_cursor())
+        self.assertFalse(self.transport.clear_log_confirms_reset(cursor))
+        self.log_path.unlink()
+        self.assertIsNone(self.transport.clear_log_cursor())
+        self.assertFalse(self.log_path.exists())
 
     def receipt(self, sid=None):
         return (f'To continue this session, run codex resume, then\n'

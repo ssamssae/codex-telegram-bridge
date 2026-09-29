@@ -1121,3 +1121,10 @@ Generic terminal input mirroring stays available when no voice receipt matches.
 ## Contributing
 
 See [CONTRIBUTING.md](CONTRIBUTING.md).
+
+### Clear acknowledgement on recent Codex versions
+
+When the native resume banner is absent, the tmux bridge checks a fresh
+`thread/started` log event from the attached TUI process and its empty main
+conversation. Old or delayed logs, other processes, and failed clears cannot
+confirm success. Missing log support retains the existing confirmation path.
