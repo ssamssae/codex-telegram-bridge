@@ -24,6 +24,7 @@ import os
 import re
 import secrets
 import signal
+import sqlite3
 import shlex
 import shutil
 import subprocess
@@ -34,7 +35,7 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
-from contextlib import contextmanager, nullcontext
+from contextlib import closing, contextmanager, nullcontext
 from dataclasses import dataclass, replace
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -4231,6 +4232,65 @@ class TmuxTransport:
 
     # Compatibility aliases for external callers during the transport rename.
     capture_pane = capture_screen
+
+    def clear_log_cursor(self) -> dict[str, Any] | None:
+        """Read-only watermark, bound to the TUI process in this pane."""
+        try:
+            pids = descendants(self.pane_pid())
+            path = Path(os.environ.get("CODEX_HOME") or Path.home() / ".codex") / "logs_2.sqlite"
+            with closing(sqlite3.connect(path.as_uri() + "?mode=ro", uri=True, timeout=0.2)) as db:
+                top = int(db.execute("SELECT coalesce(max(id), 0) FROM logs").fetchone()[0])
+                rows = db.execute(
+                    "SELECT DISTINCT process_uuid FROM logs WHERE id > ? AND target LIKE 'codex_tui::%'",
+                    (max(0, top - 20000),),
+                )
+                owners = []
+                for (owner,) in rows:
+                    match = re.fullmatch(r"pid:(\d+):[0-9a-f-]{36}", owner or "")
+                    if match and int(match[1]) in pids:
+                        owners.append((owner, int(match[1])))
+                if len(owners) != 1:
+                    return None
+                return {"path": str(path), "after_id": top,
+                        "process_uuid": owners[0][0], "pid": owners[0][1],
+                        "at_ns": time.time_ns()}
+        except (OSError, ValueError, sqlite3.Error, subprocess.SubprocessError, RuntimeError):
+            return None
+
+    def clear_log_confirms_reset(self, cursor: dict[str, Any]) -> bool:
+        """A fresh thread/started receipt from the same, still attached TUI.
+
+        Codex 0.155 can omit the resume banner and delays rollout creation until
+        input arrives. Neither a blank screen nor another thread's file suffices.
+        Missing/changed log schemas fail closed to the existing receipt path.
+        """
+        try:
+            if int(cursor["pid"]) not in descendants(self.pane_pid()):
+                return False
+            path = Path(cursor["path"])
+            with closing(sqlite3.connect(path.as_uri() + "?mode=ro", uri=True, timeout=0.2)) as db:
+                rows = db.execute(
+                    "SELECT feedback_log_body FROM logs WHERE id > ? AND process_uuid = ? "
+                    "AND (ts > ? OR (ts = ? AND ts_nanos >= ?)) "
+                    "AND target = 'codex_app_server::outgoing_message' "
+                    "AND feedback_log_body LIKE '%app-server event: thread/started%' "
+                    "ORDER BY id LIMIT 2",
+                    (int(cursor["after_id"]), str(cursor["process_uuid"]),
+                     int(cursor["at_ns"]) // 1_000_000_000,
+                     int(cursor["at_ns"]) // 1_000_000_000,
+                     int(cursor["at_ns"]) % 1_000_000_000),
+                ).fetchall()
+            if len(rows) > 1:
+                return False
+            receipts = [body for (body,) in rows if body
+                        and 'rpc.method="thread/start"' in body
+                        and 'app_server.client_name="codex-tui"' in body
+                        and re.search(r'rpc.request_id=\d+(?:\s|})', body)
+                        and re.search(r'app-server event: thread/started(?:\s|$)', body)]
+            return len(receipts) == 1
+        except (KeyError, TypeError, OSError, ValueError, sqlite3.Error,
+                subprocess.SubprocessError, RuntimeError):
+            return False
 
     def prepare_main_for_clear(self) -> str:
         """Select the parent view without interrupting either conversation."""
@@ -8880,9 +8940,24 @@ class Bridge:
         if str(watch.get("outcome") or "") == "timeout":
             return False
         if getattr(self.repl, "supports_pane_features", False):
-            # Tmux pane: native visible resume receipt is required. Path/ino of an
-            # unrelated thread switch is not bound to this /clear command.
-            return self._screen_confirms_session_reset(watch)
+            if self._screen_confirms_session_reset(watch):
+                return True
+            # Newer TUI versions omit the resume receipt. Require both a fresh,
+            # process-bound start event and the current empty main conversation.
+            cursor = watch.get("log_cursor")
+            confirm = getattr(self.repl, "clear_log_confirms_reset", None)
+            if not isinstance(cursor, dict) or not callable(confirm):
+                return False
+            screen = ANSI_RE.sub("", self._visible_clear_screen())
+            if (is_side_screen(screen) or screen_has_repl_busy_marker(screen)
+                    or CLEAR_DISABLED_RE.search(screen)
+                    or "'/clear' is unavailable" in screen
+                    or extract_unrecognized_slash_error(screen, "/clear")):
+                return False
+            empty = (CLEAR_IDLE_COMPOSER_RE.search(screen)
+                     and re.search(r"\bContext\s+0%\s+used\b", screen)
+                     and "OpenAI Codex" in screen)
+            return bool(empty and confirm(cursor))
         # ConPTY / pane-less: the host exposes only the bound session_file() this
         # bridge drives. There is no tmux visible receipt, so that file's path/ino
         # change remains the authoritative reset signal.
@@ -9127,6 +9202,8 @@ class Bridge:
         # before any session-file switch. Keep an existing flow mid so we can
         # edit that card later; do not reset a newer turn's card.
         before_visible = self._visible_clear_screen()
+        get_cursor = getattr(self.repl, "clear_log_cursor", None)
+        log_cursor = get_cursor() if callable(get_cursor) else None
         self.begin_repl_typing()
         self.persist_state()
         try:
@@ -9141,6 +9218,8 @@ class Bridge:
             self._end_clear_slash_turn()
             return
         watch = self._new_clear_watch(before_path, before_ino, prompt, before_visible)
+        if isinstance(log_cursor, dict):
+            watch["log_cursor"] = log_cursor
         mid = int(watch.get("flow_message_id") or 0)
         if mid and self.flow_message_id == mid:
             self.reset_flow_card()
