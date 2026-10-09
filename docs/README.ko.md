@@ -1,6 +1,6 @@
 # Codex Telegram Bridge — 한국어 사용 안내
 
-[English README](https://github.com/ssamssae/codex-telegram-bridge#readme) · [언어 전환 웹 설명서](https://ssamssae.github.io/codex-telegram-bridge/?lang=ko)
+[English README](https://github.com/ssamssae/codex-telegram-bridge#readme) · [언어 전환 웹 설명서](https://product.kangdaejong.com/codex-telegram-bridge/?lang=ko)
 
 컴퓨터에서 브릿지를 실행하고, 본인 전용 텔레그램 봇에 요청을 보내 휴대전화로 결과를 받습니다.
 
