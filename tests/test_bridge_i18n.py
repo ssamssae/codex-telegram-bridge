@@ -1,5 +1,6 @@
 """Locale behavior at the command and Telegram rendering boundaries; no live I/O."""
 import importlib.util
+import io
 import json
 import os
 from pathlib import Path
@@ -145,6 +146,32 @@ class ReplLanguageTests(unittest.TestCase):
 
 
 class ExecLanguageTests(unittest.TestCase):
+    def test_legacy_console_encoding_does_not_block_original_telegram_text(self):
+        package_root = ROOT.parent / 'packaging' / 'codex-telegram-bridge'
+        if package_root.exists():
+            sys.path.insert(0, str(package_root))
+        import telegram_agent_bridge as tab
+        for encoding in ('cp1252', 'ascii', 'utf-8'):
+            with self.subTest(encoding=encoding), tempfile.TemporaryDirectory() as tmp:
+                config = SimpleNamespace(state_dir=Path(tmp), chat_id='123',
+                                         prefix='', prefix_line=False, telegram_chunk=3500)
+                telegram = Mock()
+                bridge = tab.Bridge(config, SimpleNamespace(name='codex'), telegram)
+                bridge.language.code = 'ko'
+                raw = io.BytesIO()
+                with io.TextIOWrapper(raw, encoding=encoding, errors='strict') as output:
+                    with patch('sys.stdout', output):
+                        bridge.handle_message_text('/ping')
+                        status = telegram.call.call_args.kwargs['text']
+                        bridge.mirror_prompt(tab.BridgeJob('telegram', '원문 입력'))
+                        bridge.mirror_answer(tab.BridgeJob('telegram', 'question'), '원문 답변 🤖')
+                    self.assertIn('실행 중', status)
+                    self.assertEqual(telegram.call.call_args.kwargs['text'], '원문 답변 🤖')
+                    self.assertTrue(bridge.jobs.empty())
+                    self.assertTrue(raw.getvalue())
+                    if encoding == 'utf-8':
+                        self.assertIn('원문 답변 🤖', raw.getvalue().decode(encoding))
+
     def test_chat_command_does_not_enqueue_and_answer_remains_original(self):
         package_root = ROOT.parent / 'packaging' / 'codex-telegram-bridge'
         if package_root.exists():

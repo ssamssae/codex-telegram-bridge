@@ -13,6 +13,9 @@
 
 ## Fixed
 
+- Preserve Telegram delivery when Korean text or Unicode answers cannot be
+  represented by a legacy Windows console encoding.
+
 - Keep the Telegram typing indicator alive during quiet native turns and slow
   screen reads; stop it after the matching completion or interruption.
 - Recognize custom tool calls and narrow background-wait rows in progress cards.

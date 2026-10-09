@@ -450,7 +450,13 @@ class Bridge:
                 self.telegram.call("sendMessage", chat_id=self.config.chat_id, text=chunk)
 
     def print_local(self, text: str) -> None:
-        print(text, flush=True)
+        try:
+            print(text, flush=True)
+        except UnicodeEncodeError:
+            # Legacy Windows code pages must not interrupt Telegram delivery.
+            encoding = getattr(sys.stdout, "encoding", None) or "utf-8"
+            printable = text.encode(encoding, errors="backslashreplace").decode(encoding)
+            print(printable, flush=True)
 
     def mirror_prompt(self, job: BridgeJob) -> None:
         if job.source == "local":

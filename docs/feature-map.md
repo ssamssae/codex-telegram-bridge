@@ -39,7 +39,7 @@ these buttons.
 | Native pending-input section | Wait at least ten seconds with the native Esc interrupt-and-send hint visible, then press Apply now | One native action for the matching pending messages; their receipt removes only confirmed queue entries. Ordinary Tab queues remain ineligible. |
 | Running native turn | Wait through quiet tool activity, then let the turn complete | Typing continues during the active turn and stops after completion or interruption. |
 
-Release preparation on 2026-10-09: the sanitized export passed 284 tests on
+Release preparation on 2026-10-09: the sanitized export passed 285 tests on
 macOS/Python 3.14. Source control and typing regressions passed another 50 tests.
 These checks use fake Telegram/terminal clients. This release task did not
 restart an installed bridge or perform a live Telegram round trip.
