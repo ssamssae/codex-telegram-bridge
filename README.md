@@ -9,6 +9,43 @@ Control your live Codex CLI session from Telegram. Only Codex is supported.
 Other AI CLIs are intentionally out of scope; a Claude bridge should be a
 separate Claude-specific program, not a shared mode in this repository.
 
+## Interface language
+
+Bridge messages, approval/selection card instructions, and recovery buttons
+support English and Korean without an external translation service. In your
+allowlisted bot chat, send `/language en` or `/language ko`. Send `/language`
+to see the current setting. The selection is saved across bridge restarts.
+
+For a new installation, use `codex-telegram-bridge setup --language ko`
+(the default is `en`). Manual configuration uses `TAB_LANGUAGE=en` or
+`TAB_LANGUAGE=ko`; `CRB_LANGUAGE` is the REPL-compatible override.
+
+Your prompts, Codex answers, code, and the actual question options stay in their
+original language. Terminal setup/diagnostic output and advanced operator flow
+reports are currently unchanged. Read the [language reference and verification
+paths](docs/i18n.md) or the [한국어 시작 안내](README.ko.md).
+
+## GitHub release 0.9.16
+
+Install this GitHub release with:
+
+```bash
+pipx install "git+https://github.com/ssamssae/codex-telegram-bridge.git@v0.9.16"
+```
+
+This source release does not update the PyPI package.
+
+With the POSIX tmux transport and live flow cards enabled (`CRB_FLOW_MIRROR=1`),
+the current progress card can show **Stop**. The bridge checks the same live
+session and turn before sending the interrupt. A stale card, a draft, or a
+pending approval cannot stop another turn.
+
+If Codex shows pending messages with its native “press esc to interrupt and
+send immediately” hint for at least ten seconds, the card can also show
+**Apply now**. It invokes Codex's native action for those pending messages.
+Ordinary Tab queues are not eligible. These controls are unavailable in native
+Windows and one-shot `exec` mode; WSL with tmux supports them.
+
 Codex Telegram Bridge is a phone remote for your already-running Codex TUI. Send
 prompts, screenshots, videos, voice notes, and files from Telegram; the bridge
 pastes them into your visible tmux Codex session, watches Codex's structured

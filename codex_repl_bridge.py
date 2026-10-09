@@ -46,7 +46,8 @@ if _SCRIPTS_DIR not in sys.path:
     sys.path.insert(0, _SCRIPTS_DIR)
 import bridge_flow_progress as _flow_progress  # noqa: E402
 from bridge_public_text import strip_memory_citation  # noqa: E402
-from codex_async_questions import AsyncQuestions, QuestionNotSubmitted, freeform_editor, PREFIX as ASYNC_QUESTION_PREFIX
+from bridge_i18n import Language, translate  # noqa: E402
+from codex_async_questions import AsyncQuestions, QuestionNotSubmitted, UnsupportedChoiceAnswer, freeform_editor, PREFIX as ASYNC_QUESTION_PREFIX
 from codex_side_reply import SideReplyMirror, latest_completed_side_reply, is_side_screen, prompt_key  # noqa: E402
 
 try:
@@ -371,7 +372,8 @@ REPL_BUSY_RE = re.compile(
     re.IGNORECASE,
 )
 REPL_ACTIVE_BUSY_RE = re.compile(
-    r"esc to interru|interrupt to stop|^[•◦*]\s*Working\b|Churning|Saut[eé]ed|✻|✽",
+    r"esc to interru|interrupt to stop|^[•◦*]\s*Working\b|"
+    r"^[•◦*]\s*Waiting for background terminal\s*\(\d|Churning|Saut[eé]ed|✻|✽",
     re.IGNORECASE,
 )
 # A live Codex status row, including narrow-pane truncation and background count.
@@ -2941,6 +2943,41 @@ def cursor_offset_for_state(state: dict[str, Any] | None, identity: SessionIdent
     return offset
 
 
+def consumed_native_turn(path: Path, offset: int, max_bytes: int = 8 * 1024 * 1024) -> str | None:
+    """Recover the last native boundary already consumed by this watcher.
+
+    None means unknown; an empty string means a completed/aborted turn. Never
+    inspect unread records: restart may still need to deliver an earlier final.
+    """
+    try:
+        with path.open("rb") as handle:
+            end = min(max(0, offset), os.fstat(handle.fileno()).st_size)
+            start = max(0, end - max_bytes)
+            handle.seek(start)
+            lines = handle.read(end - start).splitlines(keepends=True)
+    except OSError:
+        return None
+    if start:
+        lines = lines[1:]
+    for line in reversed(lines):
+        if not line.endswith(b"\n"):
+            continue
+        try:
+            record = json.loads(line)
+        except (ValueError, UnicodeError):
+            continue
+        if not isinstance(record, dict) or record.get("type") != "event_msg":
+            continue
+        payload = record.get("payload")
+        if not isinstance(payload, dict):
+            continue
+        if payload.get("type") in {"task_complete", "turn_aborted"}:
+            return ""
+        if payload.get("type") == "task_started":
+            return str(payload.get("turn_id") or "")
+    return None
+
+
 def parse_jsonl_event_line(line: str, start: int, end: int, turn_id: str = "") -> JsonlEvent | None:
     try:
         record = json.loads(line)
@@ -3426,11 +3463,19 @@ class TelegramClient:
         self.chat_id = chat_id
         self.emoji = emoji
         self.chunk_size = chunk_size
+        self.language = Language(default="en")
         self.flood_cooldown_until = 0.0
         # In-memory confirmed-prefix for a failed multi-chunk send. Lost on restart.
         self._answer_chunk_progress: dict[str, int] = {}
         self._viewer_chunk_progress: dict[str, int] = {}
         self.codex_route_guard_active, self.codex_expected_chat_id = assert_codex_egress_chat(token, chat_id)
+
+    def tr(self, source: str, **values: object) -> str:
+        return translate(source, self.language_code(), **values)
+
+    def language_code(self) -> str:
+        language = getattr(self, "language", None)
+        return language.code if isinstance(language, Language) else ""
 
     def note_flood_retry_after(self, seconds: float) -> None:
         # Deadline keeps the full server retry_after (+ caller margin).
@@ -3516,7 +3561,7 @@ class TelegramClient:
             except urllib.error.HTTPError as exc:
                 with exc:
                     body = exc.read().decode("utf-8", errors="replace")
-                if method == "editMessageText" and exc.code == 400:
+                if method in {"editMessageText", "editMessageReplyMarkup"} and exc.code == 400:
                     try:
                         edit_payload = json.loads(body)
                     except (ValueError, TypeError):
@@ -3652,7 +3697,9 @@ class TelegramClient:
     def send_typing(self) -> bool:
         payload = self.call(
             "sendChatAction",
-            _request_timeout=10,
+            # Shorter than Telegram's 5s action lifetime so a hung call cannot
+            # hold the refresher until the indicator has already expired.
+            _request_timeout=4,
             _attempts=1,
             chat_id=self.chat_id,
             action="typing",
@@ -3869,14 +3916,14 @@ class TelegramClient:
 
     def send_update_button(self, text: str, callback_data: str) -> None:
         reply_markup = json.dumps(
-            {"inline_keyboard": [[{"text": "\U0001f504 지금 업데이트", "callback_data": callback_data}]]},
+            {"inline_keyboard": [[{"text": self.tr('🔄 지금 업데이트'), "callback_data": callback_data}]]},
             ensure_ascii=False,
         )
         self.call("sendMessage", chat_id=self.chat_id, text=self.with_emoji_prefix(text), reply_markup=reply_markup)
 
     def send_restart_button(self, text: str, callback_data: str) -> bool:
         reply_markup = json.dumps(
-            {"inline_keyboard": [[{"text": "\U0001f504 브릿지 재시작", "callback_data": callback_data}]]},
+            {"inline_keyboard": [[{"text": self.tr('🔄 브릿지 재시작'), "callback_data": callback_data}]]},
             ensure_ascii=False,
         )
         payload = self.call(
@@ -3887,26 +3934,29 @@ class TelegramClient:
         )
         return bool(payload and payload.get("ok"))
 
-    def send_message_id(self, text: str, *, viewer: bool = False) -> int | None:
+    def send_message_id(self, text: str, *, viewer: bool = False, reply_markup: str | None = None) -> int | None:
         call_budget = dict(self.VIEWER_CALL_BUDGET) if viewer else {}
         payload = self.call(
             "sendMessage",
             **call_budget,
             chat_id=self.chat_id,
             text=self.with_emoji_prefix(text),
+            **({'reply_markup': reply_markup} if reply_markup is not None else {}),
         )
         result = payload.get("result") if isinstance(payload, dict) else None
         if isinstance(result, dict) and isinstance(result.get("message_id"), int):
             return int(result["message_id"])
         return None
 
-    def edit(self, message_id: int, text: str, *, viewer: bool = False) -> bool:
-        return self.edit_message_id(message_id, text, viewer=viewer) is not None
+    def edit(self, message_id: int, text: str, *, viewer: bool = False, reply_markup: str | None = None) -> bool:
+        return self.edit_message_id(message_id, text, viewer=viewer,
+                                    **({'reply_markup': reply_markup} if reply_markup is not None else {})) is not None
 
     def edit_message_id(
         self, message_id: int, text: str, *, viewer: bool = False,
         replace_missing: bool = False,
         reserve_replacement: Callable[[], bool] | None = None,
+        reply_markup: str | None = None,
     ) -> int | None:
         call_budget = dict(self.VIEWER_CALL_BUDGET) if viewer else {}
         payload = self.call(
@@ -3915,13 +3965,15 @@ class TelegramClient:
             chat_id=self.chat_id,
             message_id=message_id,
             text=self.with_emoji_prefix(text),
+            **({'reply_markup': reply_markup} if reply_markup is not None else {}),
         )
         if payload and (payload.get("ok") or telegram_edit_error(payload) == "unchanged"):
             return message_id
         if replace_missing and telegram_edit_error(payload) == "missing":
             if reserve_replacement is not None and not reserve_replacement():
                 return None
-            return self.send_message_id(text, viewer=viewer)
+            return self.send_message_id(text, viewer=viewer,
+                                        **({'reply_markup': reply_markup} if reply_markup is not None else {}))
         return None
 
     def send_local_attachment(self, path: Path, max_bytes: int) -> bool:
@@ -3992,7 +4044,7 @@ class TelegramClient:
         payload = self.call(
             "sendMessage",
             chat_id=self.chat_id,
-            text=self.with_emoji_prefix(prompt.telegram_text()),
+            text=self.with_emoji_prefix(prompt.telegram_text(self.language_code())),
             reply_markup=reply_markup,
         )
         result = payload.get("result") if isinstance(payload, dict) else None
@@ -4024,7 +4076,7 @@ class TelegramClient:
             "editMessageText",
             chat_id=self.chat_id,
             message_id=message_id,
-            text=self.with_emoji_prefix(f"{prompt.telegram_text()}\n\n{status_text}"),
+            text=self.with_emoji_prefix(f"{prompt.telegram_text(self.language_code())}\n\n{status_text}"),
             reply_markup=json.dumps({"inline_keyboard": buttons}, ensure_ascii=False),
         )
 
@@ -4044,7 +4096,7 @@ class TelegramClient:
         payload = self.call(
             "sendMessage",
             chat_id=self.chat_id,
-            text=self.with_emoji_prefix(prompt.telegram_text()),
+            text=self.with_emoji_prefix(prompt.telegram_text(self.language_code())),
             reply_markup=reply_markup,
         )
         result = payload.get("result") if isinstance(payload, dict) else None
@@ -4076,7 +4128,7 @@ class TelegramClient:
             "editMessageText",
             chat_id=self.chat_id,
             message_id=message_id,
-            text=self.with_emoji_prefix(f"{prompt.telegram_text()}\n\n{status_text}"),
+            text=self.with_emoji_prefix(f"{prompt.telegram_text(self.language_code())}\n\n{status_text}"),
             reply_markup=json.dumps({"inline_keyboard": buttons}, ensure_ascii=False),
         )
 
@@ -5129,13 +5181,13 @@ class ApprovalRequest:
     def option(self, choice: str) -> ApprovalOption | None:
         return next((item for item in self.options if item.number == choice), None)
 
-    def telegram_text(self) -> str:
-        lines = [f"{self.source_head} is waiting for command approval.", ""]
+    def telegram_text(self, language: str = "") -> str:
+        lines = [translate("{engine} is waiting for command approval.", language, engine=self.source_head), _flow_progress.recovery_notice("approval", tr=lambda text, **values: translate(text, language, **values)), ""]
         if self.command:
-            lines.extend(["Command:", truncate_text(self.command, 600), ""])
+            lines.extend([translate("Command:", language), truncate_text(self.command, 600), ""])
         if self.reason:
-            lines.extend(["Reason:", truncate_text(self.reason, 600), ""])
-        lines.append("Choose a button, or reply with the visible number/shortcut.")
+            lines.extend([translate("Reason:", language), truncate_text(self.reason, 600), ""])
+        lines.append(translate("Choose a button, or reply with the visible number/shortcut.", language))
         return "\n".join(lines)
 
 
@@ -5154,13 +5206,13 @@ class ApprovalPrompt:
     def short_signature(self) -> str:
         return self.signature[:16]
 
-    def telegram_text(self) -> str:
-        lines = ["Codex is waiting for command approval.", ""]
+    def telegram_text(self, language: str = "") -> str:
+        lines = [_flow_progress.recovery_notice("approval", tr=lambda text, **values: translate(text, language, **values)), ""]
         if self.command:
-            lines.extend(["Command:", truncate_text(self.command, 600), ""])
+            lines.extend([translate("Command:", language), truncate_text(self.command, 600), ""])
         if self.reason:
-            lines.extend(["Reason:", truncate_text(self.reason, 600), ""])
-        lines.append("Choose a button, or reply with the visible number/shortcut.")
+            lines.extend([translate("Reason:", language), truncate_text(self.reason, 600), ""])
+        lines.append(translate("Choose a button, or reply with the visible number/shortcut.", language))
         return "\n".join(lines)
 
 
@@ -5242,11 +5294,11 @@ class ChoicePrompt:
     def selected_option(self) -> ChoiceOption | None:
         return next((item for item in self.options if item.selected), None)
 
-    def telegram_text(self) -> str:
-        lines = ["Codex is waiting for a selection.", ""]
+    def telegram_text(self, language: str = "") -> str:
+        lines = [translate("Codex is waiting for a selection.", language), ""]
         if self.title:
-            lines.extend(["Prompt:", truncate_text(self.title, 600), ""])
-        lines.append("Choose a button, or reply with the visible number/letter/shortcut.")
+            lines.extend([translate("Prompt:", language), truncate_text(self.title, 600), ""])
+        lines.append(translate("Choose a button, or reply with the visible number/letter/shortcut.", language))
         return "\n".join(lines)
 
 
@@ -5833,6 +5885,10 @@ def extract_event(record: dict[str, Any]) -> tuple[str, str] | None:
             if summary:
                 return "flow", summary
             return None
+        if payload_type == "custom_tool_call":
+            # Freeform exec input may contain credentials or private content.
+            # The tool label alone starts the progress/Stop card immediately.
+            return "flow", tool_label_ko(str(payload.get("name") or ""))
         if payload_type == "reasoning":
             summary = extract_reasoning_summary(payload)
             if summary:
@@ -5938,8 +5994,24 @@ class Bridge:
     def __init__(self, config: Config, telegram: TelegramClient, repl: ReplTransport) -> None:
         self.config = config
         self.telegram = telegram
+        self.language = Language(config.state_path.parent, default="en")
+        self.telegram.language = self.language
         self.repl = repl
         self.lock = threading.RLock()
+        self.stop_buttons = None
+        self.send_now_buttons = None
+        if os.name != 'nt' and getattr(repl, 'supports_pane_features', True):
+            try:
+                from agent_control_adapters import TelegramStopButtons
+                self.stop_buttons = TelegramStopButtons(config.node, 'codex', self, globals())
+            except Exception:
+                log('FLOW', 'stop controls unavailable; bridge delivery continues')
+            if callable(getattr(repl, 'tmux', None)):
+                try:
+                    from codex_send_now import SendNowButtons
+                    self.send_now_buttons = SendNowButtons(self, globals())
+                except ImportError:
+                    log('FLOW', 'send-now controls unavailable; bridge delivery continues')
         self.flow_lock = threading.RLock()
         self.exec_lock = threading.Lock()
         self.typing_lock = threading.Lock()
@@ -5956,6 +6028,9 @@ class Bridge:
         self.choice_text_request: dict[str, Any] | None = None
         self.choice_confirmations: dict[str, dict[str, Any]] = {}
         self.repl_typing_stop: threading.Event | None = None
+        # Only native starts consumed by this process may protect typing from
+        # an idle-looking pane. Persisted active_turn can outlive a finished turn.
+        self.native_typing_turn: tuple[str, str] | None = None
         self.long_running_progress_stop: threading.Event | None = None
         # A persisted active prompt may survive a hard bridge restart. Progress
         # is armed only by a Telegram prompt observed in this process, so
@@ -6057,11 +6132,15 @@ class Bridge:
         self.async_questions_lock = threading.RLock()
         self.async_questions = None
 
+    def tr(self, source: str, **values: object) -> str:
+        language = getattr(self, "language", None)
+        return translate(source, language.code if isinstance(language, Language) else "", **values)
+
     def get_async_questions(self):
         with self.async_questions_lock:
             if self.async_questions is None:
                 path = self.config.state_path.with_name(self.config.state_path.stem + ".questions.json")
-                self.async_questions = AsyncQuestions(path, self.telegram, self.submit_async_answer, recover=self.recover_async_question)
+                self.async_questions = AsyncQuestions(path, self.telegram, self.submit_async_answer, recover=self.recover_async_question, translate=self.tr)
             return self.async_questions
 
     def recover_async_question(self, item):
@@ -6100,6 +6179,10 @@ class Bridge:
             raise QuestionNotSubmitted('No unique active question')
         item, answer = candidates[0]
         normalize = canonical_choice_signature_text
+        if item['options'] and not any(normalize(answer) == normalize(label) for label in item['options']):
+            # Reject unsupported card replies before opening or touching the TUI.
+            # An ordinary message is routed separately and must not be retried here.
+            raise UnsupportedChoiceAnswer('Reply does not match a supplied option')
         if sum(1 for other in questions.items.values()
                if other['session'] == item['session']
                and other['status'] in {'open', 'submitting', 'uncertain'}
@@ -6431,7 +6514,8 @@ class Bridge:
         self.close_flow_card("context_changed")
         self.current_flow_scope = normalize_prompt(text)
         self.prime_flow_screen_snapshot()
-        pending_mid = self.consume_pending_match(text)
+        queued_mid = self.consume_send_now_receipt(text, getattr(self, 'input_event_offset', None))
+        pending_mid = self.consume_pending_match(text) if queued_mid is None else None
         if pending_mid is not None:
             self.current_origin = "telegram"
             if pending_mid > 0 and self.active_telegram_message_id <= 0:
@@ -6439,7 +6523,8 @@ class Bridge:
             log("JSONL", "matched Telegram-origin prompt")
             self.begin_repl_typing()
             return
-        queued_mid = self.consume_queued_telegram(text)
+        if queued_mid is None:
+            queued_mid = self.consume_queued_telegram(text)
         if queued_mid is not None:
             log("JSONL", f"matched queued Telegram-origin prompt mid={queued_mid}")
             self.begin_telegram_prompt_tracking(
@@ -6581,6 +6666,45 @@ class Bridge:
                 return
             self._update_flow_card(scope, summary, dedup_key)
 
+    def stop_button_kwargs(self, *, create: bool = False, close: bool = False) -> dict:
+        buttons = getattr(self, 'stop_buttons', None)
+        kwargs = {}
+        try:
+            if buttons is not None:
+                kwargs = buttons.prepare() if create else buttons.markup(close=close)
+        except Exception:
+            log('FLOW', 'stop button binding unavailable; progress delivery continues')
+        send_now = getattr(self, 'send_now_buttons', None)
+        if send_now is not None:
+            try:
+                rows = send_now.markup(close=close)
+                if rows or send_now.read().get('card'):
+                    keyboard = json.loads(kwargs.get('reply_markup') or '{}').get('inline_keyboard', [])
+                    kwargs['reply_markup'] = json.dumps({'inline_keyboard': rows + keyboard}, ensure_ascii=False)
+            except Exception:
+                log('FLOW', 'send-now button unavailable; progress delivery continues')
+        return kwargs
+
+    def stop_button_sent(self, message_id: int) -> None:
+        buttons = getattr(self, 'stop_buttons', None)
+        if buttons is not None:
+            try:
+                buttons.sent(message_id)
+            except Exception:
+                log('FLOW', 'stop card receipt unavailable; callback will remain invalid')
+        send_now = getattr(self, 'send_now_buttons', None)
+        if send_now is not None:
+            try:
+                send_now.sent(message_id)
+            except Exception:
+                log('FLOW', 'send-now card receipt unavailable; progress delivery continues')
+
+    def consume_send_now_receipt(self, text: str, offset: int | None) -> int | None:
+        buttons = getattr(self, 'send_now_buttons', None)
+        if buttons is None:
+            return None
+        return buttons.consume_receipt(text, offset)
+
     def _update_flow_card(self, scope: str, summary: str, dedup_key: str) -> None:
         """Called with flow_lock held, including any replacement send and ID save."""
         if self.flow_scope != scope:
@@ -6598,6 +6722,7 @@ class Bridge:
             message_id = self.telegram.send_message_id(
                 self.render_flow_card(candidate),
                 viewer=True,
+                **self.stop_button_kwargs(create=True),
             )
             if not message_id:
                 log("SEND", "flow mirror failed")
@@ -6606,6 +6731,7 @@ class Bridge:
                 return
             self.flow_body = candidate
             self.flow_message_id = message_id
+            self.stop_button_sent(message_id)
             now_mono = time.monotonic()
             self.flow_last_render_at = now_mono  # T-260727-104 하트비트 기준점
             if self.flow_started_at <= 0:
@@ -6624,6 +6750,7 @@ class Bridge:
                 viewer=True,
                 replace_missing=True,
                 reserve_replacement=lambda: self._reserve_flow_replacement(previous_id, generation),
+                **self.stop_button_kwargs(),
             )
             if self.flow_generation != generation or self.flow_message_id != previous_id:
                 return
@@ -6631,6 +6758,7 @@ class Bridge:
                 log("SEND", "flow mirror edit failed")
                 return
             self.flow_message_id = message_id
+            self.stop_button_sent(message_id)
             self.flow_body = candidate
             self.flow_last_edit_at = time.monotonic()
             self.flow_last_render_at = self.flow_last_edit_at  # T-260727-104 하트비트 기준점
@@ -6714,6 +6842,7 @@ class Bridge:
         if not mid or not body:
             self.reset_flow_card()
             return
+        stop_markup = self.stop_button_kwargs(close=True)
         self.flow_closing = True
         self.flow_generation += 1
         try:
@@ -6724,7 +6853,8 @@ class Bridge:
                 elapsed_text=elapsed,
             )
             if rendered:
-                edited = self.telegram.edit(mid, rendered, viewer=True)
+                notice = _flow_progress.recovery_notice(status, tr=self.tr) if status in ("failed", "timeout") else ""
+                edited = self.telegram.edit(mid, rendered + ("\n\n" + notice if notice else ""), viewer=True, **stop_markup)
                 log("FLOW", f"close mid={mid} status={status} edited={bool(edited)}")
         except Exception as exc:  # noqa: BLE001
             log("SEND", f"flow close edit failed (non-fatal): {exc}")
@@ -6736,6 +6866,7 @@ class Bridge:
             self._clear_flow_card_state()
 
     def _clear_flow_card_state(self) -> None:
+        self.stop_button_kwargs(close=True)
         self.flow_generation += 1
         self.flow_closing = False
         self.flow_message_id = 0
@@ -6868,6 +6999,7 @@ class Bridge:
             edited_id = self.telegram.edit_message_id(
                 mid, body, viewer=True, replace_missing=True,
                 reserve_replacement=lambda: self._reserve_flow_replacement(mid, generation),
+                **self.stop_button_kwargs(),
             )
             ok = edited_id is not None
         except Exception as exc:  # noqa: BLE001
@@ -6890,6 +7022,7 @@ class Bridge:
         self.flow_last_render_at = now
         if edited_id != mid:
             self.flow_message_id = edited_id
+            self.stop_button_sent(edited_id)
             self.persist_state()
         log(
             "SEND",
@@ -7115,7 +7248,7 @@ class Bridge:
                 # jsonl 커서가 안 전진해 같은 본문을 폴링마다 영구 재발신(+후속 답 전면 웨지).
                 # 첨부 실패는 1줄 공지로 가시화하고 턴은 완료 처리 — 파일은 노드에 보존.
                 log("ATTACH", f"send failed: {path}")
-                self.telegram.send(f"⚠️ 첨부 전송 실패 — 파일은 노드에 보존됨: {path}")
+                self.telegram.send(self.tr("Attachment delivery failed; the file is preserved: {path}", path=path))
         if suggested_reply:
             bubble_ids = self.send_suggested_confirm(suggested_reply)
             if bubble_ids is None:
@@ -7328,6 +7461,18 @@ class Bridge:
                     "id": str(payload.get("turn_id") or ""),
                     "session_path": str(self.session_path or ""),
                 }
+            with self.typing_lock:
+                turn_id = str(payload.get("turn_id") or "")
+                self.native_typing_turn = (
+                    (str(self.session_path), turn_id) if self.session_path and turn_id else None
+                )
+        elif record.get("type") == "event_msg" and payload.get("type") in {
+            "task_complete", "turn_aborted"
+        }:
+            with self.typing_lock:
+                ended_turn = (str(self.session_path or ""), str(payload.get("turn_id") or ""))
+                if self.native_typing_turn == ended_turn:
+                    self.native_typing_turn = None
         if getattr(self, "async_questions_lock", None) is not None and not self.config.bridge_kill:
             self.get_async_questions().observe(record, str(self.session_path or ""))
         event = extract_event(record)
@@ -7477,6 +7622,8 @@ class Bridge:
     def _ensure_session_file_bound(self) -> Path:
         path = self.repl.session_file()
         if self.session_path != path:
+            with self.typing_lock:
+                self.native_typing_turn = None
             identity = session_identity(path)
             state = read_json(self.config.state_path)
             cursor = cursor_offset_for_state(state, identity)
@@ -7558,14 +7705,31 @@ class Bridge:
                 log("REPL", f"watching {path}")
                 if self.config.start_at_end:
                     self.backfill_cursorless_session(path, identity)
-                    self.bind_preexisting_session_user(path)
-                self.persist_state(self.session_pos)
+            self.restore_consumed_native_turn(path, state_matches_session)
+            if cursor is None and self.config.start_at_end:
+                self.bind_preexisting_session_user(path)
+            self.persist_state(self.session_pos)
         if time.monotonic() < getattr(self, "voice_attach_recovery_until", 0):
             self.recover_attached_voice_card(path)
         # Run on every existing JSONL poll: a failed Telegram send must retry
         # even when the new session's path no longer changes.
         self.maybe_confirm_pending_clear()
         return path
+
+    def restore_consumed_native_turn(self, path: Path, state_matches_session: bool) -> None:
+        # /clear can attach at EOF after task_started has already been written.
+        # Repair older persisted stale bindings too, without rewinding the inbox
+        # cursor or retargeting an existing Stop token to a different turn.
+        previous = self.bridge_state.get("active_turn") or {}
+        turn_id = consumed_native_turn(path, self.session_pos)
+        same_session = state_matches_session and previous.get("session_path") == str(path)
+        recovered = previous if turn_id is None and same_session else {}
+        if turn_id:
+            recovered = {"id": turn_id, "session_path": str(path)}
+        with self.flow_lock:
+            if recovered != previous or not state_matches_session:
+                self.close_flow_card("context_changed")
+            self.bridge_state["active_turn"] = recovered
 
     def _latest_tail_user(self, events: list[JsonlEvent]) -> tuple[JsonlEvent | None, int]:
         latest = None
@@ -7584,8 +7748,10 @@ class Bridge:
 
     def _bind_unfinished_preexisting_user(self, latest: JsonlEvent) -> bool:
         text = latest.text
-        pending_mid = self.consume_pending_match(text)
-        queued_mid = None if pending_mid is not None else self.consume_queued_skip_stale_prefix(text)
+        queued_mid = self.consume_send_now_receipt(text, latest.start)
+        pending_mid = self.consume_pending_match(text) if queued_mid is None else None
+        if queued_mid is None and pending_mid is None:
+            queued_mid = self.consume_queued_skip_stale_prefix(text)
         active_match = (
             pending_mid is None
             and queued_mid is None
@@ -7738,6 +7904,12 @@ class Bridge:
             # ⚙️ T-260727-104 — 여기가 침묵 구간이다(새 줄 없이 한 바퀴 돌았다).
             # 자체 시간 상한을 들고 있어 0.5초 tick 마다 불려도 실제 edit 은 45초에 1회다.
             self.maybe_heartbeat_flow_card()
+            buttons = getattr(self, 'send_now_buttons', None)
+            if buttons is not None:
+                try:
+                    buttons.poll()
+                except Exception:
+                    log('FLOW', 'send-now poll unavailable; bridge delivery continues')
             self.finish_pending_interrupt()
             time.sleep(jsonl_retry_sleep_seconds(self.telegram, send_failed=send_failed))
 
@@ -7813,7 +7985,7 @@ class Bridge:
             with self.side_reply_lock:
                 mirror.cancel(int(prompt.message_id or 0))
             log("SIDE", f"paste failed: {type(exc).__name__}")
-            self.telegram.send("보조 대화에 메시지를 전달하지 못했어. 다시 보내줘.",
+            self.telegram.send(self.tr('보조 대화에 메시지를 전달하지 못했어. 다시 보내줘.'),
                                reply_to_message_id=prompt.message_id)
         return True
 
@@ -7916,6 +8088,7 @@ class Bridge:
             if self.repl_typing_stop is not owner:
                 return
             self.repl_typing_stop = None
+            self.native_typing_turn = None
         self.stop_long_running_progress(disarm=signal != "capture_error")
         self.stop_telegram_fallback()
         if signal == "capture_error":
@@ -7955,7 +8128,7 @@ class Bridge:
         self.resolve_midreport_obligation("blocked", "codex turn ended without a final answer")
         self.close_flow_card("interrupt")
         self.clear_active_telegram_prompt()
-        self.telegram.send("코덱스 응답이 중단됐고, 완료된 답변 기록이 없습니다.")
+        self.telegram.send(_flow_progress.recovery_notice("interrupt", tr=self.tr))
         log("TYPE", "interrupt confirmed after JSONL drain; no completed answer")
 
 
@@ -7965,31 +8138,43 @@ class Bridge:
         stop_event = threading.Event()
         activity_frames, activity_reply_to = self.eye_activity_context()
 
+        def watch_screen() -> None:
+            # Screen capture and flow delivery can block on UI/network I/O.
+            # Keep them off the sendChatAction clock and stop stale observers.
+            interrupt_hits = 0
+            capture_error_hits = 0
+            checks = 0
+            if stop_event.wait(1.0):
+                return
+            while not stop_event.is_set():
+                self.poll_flow_mirror_screen()
+                if stop_event.is_set():
+                    return
+                checks += 1
+                if checks % 2 == 0:
+                    signal = self.repl_typing_stop_signal()
+                    if stop_event.is_set():
+                        return
+                    abort, interrupt_hits, capture_error_hits = update_typing_watch_hits(
+                        signal, interrupt_hits, capture_error_hits,
+                    )
+                    if abort:
+                        self.abort_typing_on_interrupt(stop_event, signal)
+                        stop_event.set()
+                        return
+                if stop_event.wait(4.0):
+                    return
+
         def loop() -> None:
             start_eye_activity_loop(self.telegram, stop_event, activity_frames, activity_reply_to)
             deadline = time.monotonic() + max_seconds if max_seconds else None
             pulse_count = 0
             last_ok: bool | None = None
-            interrupt_hits = 0
-            capture_error_hits = 0
             while not stop_event.is_set():
                 if deadline is not None and time.monotonic() >= deadline:
                     break
-                if watch_interrupt and pulse_count >= 1:
-                    self.poll_flow_mirror_screen()
-                # Every other pulse (~8s), check whether codex aborted the turn.
-                # Require consecutive hits for interrupt/capture failures to ignore transients.
-                if watch_interrupt and pulse_count >= 1 and pulse_count % 2 == 0:
-                    signal = self.repl_typing_stop_signal()
-                    abort, interrupt_hits, capture_error_hits = update_typing_watch_hits(
-                        signal,
-                        interrupt_hits,
-                        capture_error_hits,
-                    )
-                    if abort:
-                        self.abort_typing_on_interrupt(stop_event, signal)
-                        break
                 pulse_count += 1
+                pulse_started = time.monotonic()
                 try:
                     ok = self.telegram.send_typing()
                 except Exception as exc:  # noqa: BLE001
@@ -8002,14 +8187,29 @@ class Bridge:
                 elif ok and last_ok is False:
                     log("TYPE", "pulse recovered")
                 last_ok = ok
-                wait_seconds = 1.0 if pulse_count == 1 else 4.0
+                elapsed = time.monotonic() - pulse_started
+                # Cadence is measured from pulse start; the helper adds any
+                # server cooldown still remaining at this point.
+                wait_seconds = typing_pulse_wait_seconds(
+                    self.telegram, pulse_count,
+                    idle_first=max(0.0, 1.0 - elapsed),
+                    idle_later=max(0.0, 4.0 - elapsed),
+                )
+                # A zero cadence wait means the request already used this interval,
+                # so refresh immediately. Only the typing deadline ends the loop.
+                if deadline is not None and time.monotonic() >= deadline:
+                    break
+                if wait_seconds <= 0:
+                    continue
                 if deadline is not None:
                     wait_seconds = min(wait_seconds, max(0.0, deadline - time.monotonic()))
-                if wait_seconds <= 0:
-                    break
+                    if wait_seconds <= 0:
+                        break
                 stop_event.wait(wait_seconds)
             stop_event.set()
 
+        if watch_interrupt:
+            threading.Thread(target=watch_screen, daemon=True, name="crb-typing-watch").start()
         threading.Thread(target=loop, daemon=True, name="crb-typing").start()
         return stop_event
 
@@ -8049,12 +8249,23 @@ class Bridge:
                 self.config.typing_max_seconds, watch_interrupt=True
             )
 
-    def stop_repl_typing(self) -> None:
+    def stop_repl_typing(self, *, preserve_native_turn: bool = False) -> bool:
         with self.typing_lock:
+            # Check under the same lock as stop, so a just-consumed native start
+            # cannot be discarded by a liveness poll based on an older screen.
+            if (
+                preserve_native_turn
+                and self.native_typing_turn
+                and self.native_typing_turn[0] == str(self.session_path or "")
+            ):
+                return False
+            self.native_typing_turn = None
             if self.repl_typing_stop:
                 self.repl_typing_stop.set()
                 self.repl_typing_stop = None
                 log("TYPE", "stop")
+                return True
+            return False
 
     def set_active_telegram_prompt(
         self,
@@ -8649,9 +8860,9 @@ class Bridge:
                 and not prompt
                 and not self.has_recent_repl_activity()
             ):
-                log("LIVE", f"idle -> stop recovered typing ({reason})")
-                self.stop_repl_typing()
-                return True
+                if self.stop_repl_typing(preserve_native_turn=True):
+                    log("LIVE", f"idle -> stop recovered typing ({reason})")
+                    return True
             return False
         if self.completed_turn_blocks_liveness_recovery(prompt):
             log("LIVE", f"skip stale typing recovery ({reason})")
@@ -8683,8 +8894,7 @@ class Bridge:
             return False
         if not getattr(self.repl, "supports_pane_features", True):
             self.telegram.send(
-                "native ConPTY P0에서는 화면 기반 /status·/context를 아직 지원하지 않습니다. "
-                "프롬프트 주입과 JSONL 답변 미러만 사용해 주세요."
+                self.tr('native ConPTY P0에서는 화면 기반 /status·/context를 아직 지원하지 않습니다. 프롬프트 주입과 JSONL 답변 미러만 사용해 주세요.')
             )
             return True
         label = "context" if context_only else "status"
@@ -8729,7 +8939,7 @@ class Bridge:
                 )
         except Exception as exc:  # noqa: BLE001
             log("REPL", f"{label} failed: {exc}")
-            self.telegram.send(f"codex {label} failed: {exc}")
+            self.telegram.send(self.tr("codex {label} failed: {detail}", label=label, detail=exc))
         finally:
             self.stop_repl_typing()
         return True
@@ -8876,8 +9086,7 @@ class Bridge:
             self.needs_composer_clear = True
             log("REPL", f"slash command error: {error}")
             self.telegram.send(
-                f"Codex slash command error\n{error}\n\n"
-                "터미널 입력줄도 바로 비웠습니다."
+                self.tr("Codex slash command error\n{error}\n\nThe terminal input was cleared.", error=error)
             )
             self.clear_composer_before_telegram_input("slash command error")
             return True
@@ -8887,7 +9096,7 @@ class Bridge:
 
     def send_clear_notice(self, body: str, ok_log: str, fail_log: str) -> bool:
         try:
-            ok = bool(self.telegram.send(body))
+            ok = bool(self.telegram.send(self.tr(body)))
         except Exception:
             ok = False
         log("SEND", ok_log if ok else fail_log)
@@ -9211,7 +9420,7 @@ class Bridge:
         except Exception as exc:  # noqa: BLE001
             log("REPL", f"paste failed: {exc}")
             self._end_clear_slash_turn()
-            self.telegram.send(f"codex REPL delivery failed: {exc}")
+            self.telegram.send(self.tr("codex REPL delivery failed: {detail}", detail=exc))
             return
         time.sleep(0.8)
         if self.handle_slash_command_result(clear_text):
@@ -9347,7 +9556,7 @@ class Bridge:
         if parse_choice_prompt(screen):
             self.note_choice_visible(parse_choice_prompt(screen))
         elif request and request["attempts"] == 3 and not request.get("recovered"):
-            self.telegram.send("선택형 질문 요청을 감지했지만 터미널 질문 화면을 확인하지 못했습니다. /choices로 다시 확인할 수 있습니다. 선택은 전송하지 않았습니다.")
+            self.telegram.send(self.tr('선택형 질문 요청을 감지했지만 터미널 질문 화면을 확인하지 못했습니다. /choices로 다시 확인할 수 있습니다. 선택은 전송하지 않았습니다.'))
         return screen
 
     def choice_submission_confirmed(self, prompt: ChoicePrompt) -> bool:
@@ -9549,7 +9758,7 @@ class Bridge:
                 self.telegram.call(
                     "answerCallbackQuery",
                     callback_query_id=callback_query_id,
-                    text="No active Codex approval prompt.",
+                    text=self.tr('No active Codex approval prompt.'),
                 )
             return False
         if signature and signature != prompt.short_signature:
@@ -9557,7 +9766,7 @@ class Bridge:
                 self.telegram.call(
                     "answerCallbackQuery",
                     callback_query_id=callback_query_id,
-                    text="That approval prompt is no longer active.",
+                    text=self.tr('That approval prompt is no longer active.'),
                 )
             return True
         if getattr(prompt, "is_expired", lambda: False)():
@@ -9569,7 +9778,7 @@ class Bridge:
                 self.telegram.call(
                     "answerCallbackQuery",
                     callback_query_id=callback_query_id,
-                    text="That approval prompt expired.",
+                    text=self.tr('That approval prompt expired.'),
                 )
             return True
         if prompt.signature in self.resolved_approval_ids:
@@ -9577,7 +9786,7 @@ class Bridge:
                 self.telegram.call(
                     "answerCallbackQuery",
                     callback_query_id=callback_query_id,
-                    text="This approval choice was already sent.",
+                    text=self.tr('This approval choice was already sent.'),
                 )
             return True
 
@@ -9588,12 +9797,12 @@ class Bridge:
             self.repl.send_key(option.key)
         except Exception as exc:  # noqa: BLE001
             log("APPROV", f"choice failed: {exc}")
-            self.telegram.send(f"Codex approval choice failed: {exc}")
+            self.telegram.send(self.tr("Codex approval choice failed: {detail}", detail=exc))
             if callback_query_id:
                 self.telegram.call(
                     "answerCallbackQuery",
                     callback_query_id=callback_query_id,
-                    text="Approval choice failed.",
+                    text=self.tr('Approval choice failed.'),
                 )
             return True
 
@@ -9601,7 +9810,7 @@ class Bridge:
         self.telegram.update_approval_prompt(
             message_id,
             prompt,
-            f"✅ Selected {option.number}. {option.short_label}",
+            self.tr("Selected {number}. {label}", number=option.number, label=option.short_label),
             selected=option,
         )
         with self.approval_lock:
@@ -9613,10 +9822,10 @@ class Bridge:
             self.telegram.call(
                 "answerCallbackQuery",
                 callback_query_id=callback_query_id,
-                text=f"Sent choice {choice} to Codex.",
+                text=self.tr("Sent choice {choice} to Codex.", choice=choice),
             )
         else:
-            self.telegram.send(f"Sent Codex approval choice {choice}: {option.short_label}")
+            self.telegram.send(self.tr("Sent Codex approval choice {choice}: {label}", choice=choice, label=option.short_label))
         return True
 
     def suggested_confirm_path(self) -> Path:
@@ -9646,7 +9855,7 @@ class Bridge:
                                 "created_at": time.time(), "status": "ready"}
                 records = dict(sorted(records.items(), key=lambda x: x[1].get("created_at", 0))[-100:])
                 write_json_atomic(self.suggested_confirm_path(), records)
-            self.set_suggested_confirm_button(ids[-1], key, "확인")
+            self.set_suggested_confirm_button(ids[-1], key, self.tr('확인'))
             log("SUGGEST", f"ready mid={ids[-1]}")
         except Exception as exc:
             log("SUGGEST", f"button delivery failed: {exc}")
@@ -9669,22 +9878,22 @@ class Bridge:
             if callback.get("id"):
                 self.telegram.call("answerCallbackQuery", callback_query_id=callback["id"], text=text)
         if str(chat.get("id")) != str(self.config.chat_id) or str(sender.get("id")) != str(self.config.chat_id):
-            answer("이 채팅의 사용자만 사용할 수 있습니다.")
+            answer(self.tr('이 채팅의 사용자만 사용할 수 있습니다.'))
             return True
         if self.config.bridge_kill or not bool_env("CRB_SUGGESTED_CONFIRM", False):
-            answer("확인 버튼이 꺼져 있습니다.")
+            answer(self.tr('확인 버튼이 꺼져 있습니다.'))
             return True
         records = self.read_suggested_confirms()
         item = records.get(key)
         if not item or item.get("message_id") != message.get("message_id"):
-            answer("만료된 추천입니다.")
+            answer(self.tr('만료된 추천입니다.'))
             return True
         if item.get("status") != "ready":
-            answer("이미 처리한 추천입니다. 다시 제출하지 않습니다.")
+            answer(self.tr('이미 처리한 추천입니다. 다시 제출하지 않습니다.'))
             return True
         if (getattr(self, "pending_clear_watch", None) or time.time()-item.get("created_at", 0)>86400
                 or item.get("session") != str(self.repl.session_file())):
-            answer("대화가 바뀌었거나 만료된 추천입니다.")
+            answer(self.tr('대화가 바뀌었거나 만료된 추천입니다.'))
             return True
         lock = getattr(self.repl, "composer_lock", nullcontext)
         with lock():
@@ -9694,14 +9903,14 @@ class Bridge:
             empty = bool(prompts and prompts[-1] in {"Ask Codex to do anything", "Ask a follow-up question"})
             if (not empty or parse_approval_prompt(screen) or parse_choice_prompt(screen)
                     or item["session"] != str(self.repl.session_file())):
-                answer("입력 중이거나 선택 화면입니다. 입력칸이 비면 다시 눌러주세요.")
+                answer(self.tr('입력 중이거나 선택 화면입니다. 입력칸이 비면 다시 눌러주세요.'))
                 return True
             # Persist before the first input side effect: unknown outcomes cannot replay.
             with SUGGESTED_CONFIRM_LOCK:
                 records = self.read_suggested_confirms()
                 item = records.get(key)
                 if not item or item.get("status") != "ready":
-                    answer("이미 처리한 추천입니다.")
+                    answer(self.tr('이미 처리한 추천입니다.'))
                     return True
                 item["status"] = "claimed"
                 write_json_atomic(self.suggested_confirm_path(), records)
@@ -9731,15 +9940,21 @@ class Bridge:
                 current = self.read_suggested_confirms()
                 current[key] = item
                 write_json_atomic(self.suggested_confirm_path(), current)
-        label = "✅ 보냄" if item["status"] == "submitted" else "⚠️ 확인 필요"
+        label = self.tr('✅ 보냄') if item["status"] == "submitted" else self.tr('⚠️ 확인 필요')
         try:
             self.set_suggested_confirm_button(item["message_id"], key, label)
         except Exception as exc:
             log("SUGGEST", f"status markup failed: {exc}")
-        answer("전달했습니다." if item["status"] == "submitted" else "제출 결과를 확인하지 못했습니다. 자동 재전송하지 않습니다.")
+        answer(self.tr('전달했습니다.') if item["status"] == "submitted" else self.tr('제출 결과를 확인하지 못했습니다. 자동 재전송하지 않습니다.'))
         return True
 
     def handle_callback_query(self, callback: dict[str, Any]) -> bool:
+        send_now = getattr(self, 'send_now_buttons', None)
+        if send_now is not None and send_now.callback(callback):
+            return True
+        buttons = getattr(self, 'stop_buttons', None)
+        if buttons is not None and buttons.callback(callback):
+            return True
         data = str(callback.get("data") or "")
         if data.startswith(SUGGESTED_CONFIRM_PREFIX):
             return self.handle_suggested_confirm(callback)
@@ -9757,7 +9972,7 @@ class Bridge:
                 self.telegram.call(
                     "answerCallbackQuery",
                     callback_query_id=str(callback.get("id") or ""),
-                    text="업데이트를 시작합니다…",
+                    text=self.tr('업데이트를 시작합니다…'),
                 )
             perform_self_update(data.split("::", 1)[1], notify=self.telegram.send)
             return True
@@ -9773,21 +9988,21 @@ class Bridge:
                     self.telegram.call(
                         "answerCallbackQuery",
                         callback_query_id=callback_query_id,
-                        text="다른 노드의 재시작 버튼입니다.",
+                        text=self.tr('다른 노드의 재시작 버튼입니다.'),
                     )
                 return True
             if callback_query_id:
                 self.telegram.call(
                     "answerCallbackQuery",
                     callback_query_id=callback_query_id,
-                    text="코덱스 브릿지를 재시작합니다…",
+                    text=self.tr('코덱스 브릿지를 재시작합니다…'),
                 )
-            self.telegram.send("코덱스 브릿지 재시작합니다. 잠깐 끊겼다가 다시 붙습니다.")
+            self.telegram.send(self.tr('코덱스 브릿지 재시작합니다. 잠깐 끊겼다가 다시 붙습니다.'))
             try:
                 restart_codex_bridge(self.config.node)
             except Exception as exc:  # noqa: BLE001
                 log("TG", f"bridge restart failed: {exc}")
-                self.telegram.send(f"코덱스 브릿지 재시작 실패: {exc}")
+                self.telegram.send(self.tr("Bridge restart failed: {detail}", detail=exc))
             return True
         if data.startswith(f"{CHOICE_CALLBACK_PREFIX}:"):
             return self.handle_choice_callback_query(callback)
@@ -9806,7 +10021,7 @@ class Bridge:
                 self.telegram.call(
                     "answerCallbackQuery",
                     callback_query_id=str(callback.get("id") or ""),
-                    text="This approval choice was already sent.",
+                    text=self.tr('This approval choice was already sent.'),
                 )
             return True
         return self.handle_approval_choice(
@@ -9869,32 +10084,32 @@ class Bridge:
                 prompt = self.pending_choice
                 message_id = self.pending_choice_message_id
             if not prompt:
-                answer("활성 선택 질문이 없습니다.")
+                answer(self.tr('활성 선택 질문이 없습니다.'))
                 return bool(callback_query_id)
             if signature and signature != prompt.short_signature:
-                answer("이전 질문의 버튼입니다. 최신 질문을 확인해주세요.")
+                answer(self.tr('이전 질문의 버튼입니다. 최신 질문을 확인해주세요.'))
                 return True
             if self.config.bridge_kill or not prompt.is_active():
-                answer("질문이 만료됐거나 브릿지 입력이 중지됐습니다.")
+                answer(self.tr('질문이 만료됐거나 브릿지 입력이 중지됐습니다.'))
                 return True
             if prompt.short_signature in self.resolved_choice_ids:
-                answer("이미 전송을 시도한 선택입니다. 중복 제출하지 않습니다.")
+                answer(self.tr('이미 전송을 시도한 선택입니다. 중복 제출하지 않습니다.'))
                 return True
             option = prompt.option(choice)
             if option is None:
                 return False
             is_other = option.label.strip().casefold() in {"other", "직접 입력", "기타"}
             if is_other and other_text is None:
-                answer("직접 입력할 답변을 요청합니다.")
+                answer(self.tr('직접 입력할 답변을 요청합니다.'))
                 response = self.telegram.call("sendMessage", chat_id=self.config.chat_id,
-                    text=f"Codex 선택 답변 · {prompt.short_signature}\n{prompt.title}\n\n이 메시지에 답장으로 직접 입력할 내용을 보내주세요.",
+                    text=self.tr("Codex typed answer · {signature}\n{title}\n\nReply to this message with your answer.", signature=prompt.short_signature, title=prompt.title),
                     reply_markup=json.dumps({"force_reply": True, "selective": True}))
                 result = response.get("result", {}) if isinstance(response, dict) else {}
                 if isinstance(result.get("message_id"), int):
                     self.choice_text_request = {"message_id": result["message_id"],
                         "signature": prompt.short_signature, "choice": choice}
                 return True
-            answer("현재 질문 확인 및 제출 중…")
+            answer(self.tr('현재 질문 확인 및 제출 중…'))
             lock = getattr(self.repl, "composer_lock", nullcontext)
             try:
                 # Refresh before acquiring composer lock: focus navigation has
@@ -9946,15 +10161,14 @@ class Bridge:
             except Exception as exc:  # noqa: BLE001
                 log("CHOICE", f"delivery failed: {type(exc).__name__}")
                 self.telegram.update_choice_prompt(message_id, prompt,
-                    "선택 제출을 확인하지 못했습니다. 최신 질문을 다시 확인해주세요.")
-                self.telegram.send("선택 제출 실패 또는 상태 불일치. 자동 재전송하지 않았습니다.")
+                    self.tr('선택 제출을 확인하지 못했습니다. 최신 질문을 다시 확인해주세요.'))
+                self.telegram.send(self.tr('선택 제출 실패 또는 상태 불일치. 자동 재전송하지 않았습니다.'))
                 return True
             if confirmed:
                 self.choice_confirmations.pop(prompt.short_signature, None)
-                status = f"✅ 제출 확인: {option.value}. {option.short_label} (터미널 질문 종료 확인)"
+                status = self.tr("✅ 제출 확인: {value}. {label} (터미널 질문 종료 확인)", value=option.value, label=option.short_label)
             else:
-                status = ("선택 키를 전송했고 Codex 응답을 기다리고 있습니다. 제출은 아직 확인되지 않았습니다. "
-                          "응답을 받으면 이 카드에 확인 결과를 표시합니다. 자동 재전송하지 않습니다.")
+                status = (self.tr('선택 키를 전송했고 Codex 응답을 기다리고 있습니다. 제출은 아직 확인되지 않았습니다. 응답을 받으면 이 카드에 확인 결과를 표시합니다. 자동 재전송하지 않습니다.'))
             self.telegram.update_choice_prompt(message_id, prompt, status,
                 selected=option if confirmed else None)
             self.telegram.send(status)
@@ -9992,7 +10206,7 @@ class Bridge:
                     continue
                 self.choice_confirmations.pop(key, None)
                 option = pending["option"]
-                status = f"✅ 제출 확인: {option.value}. {option.short_label} (Codex 응답 수신)"
+                status = self.tr("✅ 제출 확인: {value}. {label} (Codex 응답 수신)", value=option.value, label=option.short_label)
                 self.telegram.update_choice_prompt(pending["message_id"], prompt, status, selected=option)
                 self.telegram.send(status)
                 log("CHOICE", f"submission confirmed by native answer {key}")
@@ -10003,20 +10217,20 @@ class Bridge:
                 continue
             self.choice_confirmations.pop(key, None)
             self.telegram.update_choice_prompt(pending["message_id"], pending["prompt"],
-                "선택은 전송했지만 제한 시간 안에 제출을 확인하지 못했습니다. 자동 재전송하지 않습니다.")
+                self.tr('선택은 전송했지만 제한 시간 안에 제출을 확인하지 못했습니다. 자동 재전송하지 않습니다.'))
 
     def handle_choice_reply(self, message: dict[str, Any]) -> bool:
         request = getattr(self, "choice_text_request", None)
         reply = message.get("reply_to_message") or {}
         if not request or reply.get("message_id") != request["message_id"]:
-            if str(reply.get("text") or "").startswith("Codex 선택 답변 · "):
-                self.telegram.send("이 직접 입력 요청은 더 이상 활성 상태가 아닙니다. 최신 질문을 확인해주세요.")
+            if str(reply.get("text") or "").startswith(("Codex 선택 답변 · ", "Codex typed answer · ")):
+                self.telegram.send(self.tr('이 직접 입력 요청은 더 이상 활성 상태가 아닙니다. 최신 질문을 확인해주세요.'))
                 return True
             return False
         text = message.get("text")
         if (not isinstance(text, str) or not text.strip() or len(text) > 4000
                 or any(ord(c) < 32 and c not in "\n\t" for c in text)):
-            self.telegram.send("직접 답변은 1~4000자의 텍스트로 보내주세요.")
+            self.telegram.send(self.tr('직접 답변은 1~4000자의 텍스트로 보내주세요.'))
             return True
         self.choice_text_request = None
         self.handle_choice_choice(request["choice"],
@@ -10117,11 +10331,11 @@ class Bridge:
                 answer = self.run_codex_image(prompt.text, prompt.image_path)
         except CodexExecError as exc:
             log("IMG", f"analysis failed: {exc}")
-            self.telegram.send(f"codex image analysis failed: {exc}")
+            self.telegram.send(self.tr("codex image analysis failed: {detail}", detail=exc))
             return
         except Exception as exc:  # noqa: BLE001
             log("IMG", f"analysis error: {exc}")
-            self.telegram.send("codex image analysis failed: internal error")
+            self.telegram.send(self.tr("codex image analysis failed: {detail}", detail="internal error"))
             return
         finally:
             stop_typing.set()
@@ -10647,7 +10861,7 @@ class Bridge:
         current = _self_update_installed_version() or "?"
         try:
             self.telegram.send_update_button(
-                f"\U0001f195 새 버전 v{latest} 가 출시됐어요! (현재 v{current})\n업데이트하려면 아래 버튼을 누르세요.",
+                self.tr("Version v{latest} is available (current v{current}).\nUse the button below to update.", latest=latest, current=current),
                 f"{SELF_UPDATE_CALLBACK}::{latest}",
             )
         except Exception as exc:  # noqa: BLE001
@@ -10759,7 +10973,7 @@ class Bridge:
             answer = self.get_async_questions().reply_text(message, str(self.repl.session_file()))
             if answer is not None:
                 if not answer or self.config.bridge_kill:
-                    self.telegram.send("이미 처리됐거나 만료된 질문, 또는 제출할 수 없는 답변입니다. 일반 대화로 보내지 않았습니다.")
+                    self.telegram.send(self.tr('이미 처리됐거나 만료된 질문, 또는 제출할 수 없는 답변입니다. 일반 대화로 보내지 않았습니다.'))
                     return
                 confirmed, error = False, None
                 card_id = int(message["reply_to_message"]["message_id"])
@@ -10774,12 +10988,17 @@ class Bridge:
             return
         raw_text = message.get("text")
         if isinstance(raw_text, str):
+            language = getattr(self, "language", None)
+            language_reply = language.command(raw_text) if isinstance(language, Language) else None
+            if language_reply is not None:
+                self.telegram.send(language_reply)
+                return
             if raw_text.strip().lower() == "/choices":
                 with self.choice_submit_lock:
                     self.choice_focus_request = {"titles": [], "attempts": 0}
                     self.choice_focus_attempt_at = 0.0
                     if not parse_choice_prompt(self.choice_screen()):
-                        self.telegram.send("현재 선택 질문 화면을 확인하지 못했습니다. 선택은 전송하지 않았습니다.")
+                        self.telegram.send(self.tr('현재 선택 질문 화면을 확인하지 못했습니다. 선택은 전송하지 않았습니다.'))
                 return
             hold_response = release_hold_response(raw_text.strip())
             if hold_response:
@@ -10789,7 +11008,7 @@ class Bridge:
             prompt = self.prompt_from_telegram_message(message, int(update["update_id"]))
         except Exception as exc:  # noqa: BLE001
             log("TG", f"media download failed: {exc}")
-            self.telegram.send(f"codex REPL media delivery failed: {exc}. 다시 보내주시면 재시도합니다.")
+            self.telegram.send(self.tr("Media delivery failed: {detail}. Please send it again to retry.", detail=exc))
             return
         if not prompt.text.strip():
             return
@@ -10801,7 +11020,7 @@ class Bridge:
             self.handle_image_prompt(prompt)
             return
         if prompt.text.strip().lower() in {"/start", "/ping"}:
-            self.telegram.send("codex REPL bridge running")
+            self.telegram.send(self.tr('codex REPL bridge running'))
             return
         if self.handle_status_command(prompt.text):
             return
@@ -10838,7 +11057,7 @@ class Bridge:
             else:
                 self.resolve_midreport_obligation("blocked", "codex REPL delivery failed")
                 self.clear_active_telegram_prompt()
-            self.telegram.send(f"codex REPL delivery failed: {exc}")
+            self.telegram.send(self.tr("codex REPL delivery failed: {detail}", detail=exc))
 
     def ensure_signal_fifo(self) -> None:
         path = self.config.signal_path
@@ -10901,7 +11120,7 @@ class Bridge:
             log("SIGNAL", f"paste failed: {exc}")
             self.resolve_midreport_obligation("blocked", "codex signal delivery failed")
             self.clear_active_telegram_prompt()
-            self.telegram.send(f"codex signal delivery failed: {exc}")
+            self.telegram.send(self.tr("codex signal delivery failed: {detail}", detail=exc))
             return False
         return True
 
@@ -10926,9 +11145,18 @@ class Bridge:
             log("SIGNAL", f"fifo ready: {self.config.signal_path}")
             signal_thread = threading.Thread(target=self.signal_loop, daemon=True, name="crb-signal")
             signal_thread.start()
+        control = None
+        if os.environ.get('AGENT_CONTROL_ENABLED') == '1':
+            try:
+                from agent_control_adapters import start_control
+                control = start_control(self.config.node, 'codex', self, globals())
+            except ImportError:
+                log('CONTROL', 'optional control module unavailable; bridge preserved')
         try:
             self.telegram_loop()
         finally:
+            if control:
+                control.close()
             self.stop_event.set()
             self.release_lock()
 

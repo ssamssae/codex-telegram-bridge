@@ -26,7 +26,7 @@ class ClearAcknowledgementTest(unittest.TestCase):
         env = mock.patch.dict(os.environ, {
             "HOME": str(self.root), "USERPROFILE": str(self.root),
             "CODEX_HOME": str(self.root / ".codex"),
-            "CRB_CHAT_ID": "1234", "CRB_FLOW_MIRROR": "0",
+            "CRB_CHAT_ID": "1234", "CRB_FLOW_MIRROR": "0", "CRB_LANGUAGE": "ko",
         })
         env.start()
         self.addCleanup(env.stop)

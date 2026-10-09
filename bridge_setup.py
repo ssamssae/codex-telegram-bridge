@@ -21,6 +21,7 @@ import xml.etree.ElementTree as ET
 from dataclasses import dataclass
 from pathlib import Path, PureWindowsPath
 from typing import Any, Callable
+from bridge_i18n import translate
 
 
 APP_NAME = "telegram-agent-bridge"
@@ -378,17 +379,15 @@ def send_test_message(
     *,
     service_status_text: str | None = None,
     start_command: str | None = None,
+    language: str = "en",
 ) -> bool:
     if service_status_text and service_is_running(service_status_text):
-        text = "telegram-agent-bridge setup complete. Background service is running. Send /ping to test the bridge."
+        text = translate("telegram-agent-bridge setup complete. Background service is running. Send /ping to test the bridge.", language)
     elif start_command:
         status = service_status_text or "unknown"
-        text = (
-            "telegram-agent-bridge setup complete. Background service is not running "
-            f"({status}). Start it with: {start_command}. Then send /ping to test the bridge."
-        )
+        text = translate("telegram-agent-bridge setup complete. Background service is not running ({status}). Start it with: {command}. Then send /ping to test the bridge.", language, status=status, command=start_command)
     else:
-        text = "telegram-agent-bridge setup complete. Send /ping to test the bridge."
+        text = translate("telegram-agent-bridge setup complete. Send /ping to test the bridge.", language)
     payload = api_call(
         token,
         "sendMessage",
@@ -417,15 +416,19 @@ def write_env_config(
     tmux_session: str,
     submit_key: str,
     audio_transcribe_cmd: str,
+    language: str = "en",
 ) -> None:
     if agent != "codex":
         raise SetupError("agent supports only codex")
+    if language not in {"en", "ko"}:
+        raise SetupError("language must be en or ko")
     local_input_value = "off" if is_windows_platform() else str(local_input)
     codex_extra_args = "--skip-git-repo-check" if mode == "exec" else ""
     lines = [
         "# telegram-agent-bridge private config",
         "# Keep this file out of git. It contains your Telegram bot token.",
         f"TAB_BRIDGE_MODE={shell_quote(mode)}",
+        f"TAB_LANGUAGE={shell_quote(language)}",
         f"TAB_BOT_TOKEN={shell_quote(token)}",
         f"TAB_CHAT_ID={shell_quote(chat_id)}",
         f"TAB_AGENT={shell_quote(agent)}",
@@ -1364,6 +1367,7 @@ class SetupOptions:
     send_test: bool
     non_interactive: bool
     yes: bool
+    language: str = "en"
 
 
 def setup_bridge(options: SetupOptions, api_call: ApiCall = telegram_call) -> int:
@@ -1481,6 +1485,7 @@ def setup_bridge(options: SetupOptions, api_call: ApiCall = telegram_call) -> in
         tmux_session=options.tmux_session,
         submit_key=options.submit_key,
         audio_transcribe_cmd=audio_transcribe_cmd,
+        language=options.language,
     )
     ok(f"wrote private config: {options.config_file}")
     setup_note("The config file is chmod 600 and should stay out of git.")
@@ -1527,6 +1532,7 @@ def setup_bridge(options: SetupOptions, api_call: ApiCall = telegram_call) -> in
             api_call=api_call,
             service_status_text=service_state,
             start_command=None if service_is_running(service_state) else start_command,
+            language=options.language,
         ):
             ok("sent setup-complete test message")
         else:
@@ -1744,6 +1750,7 @@ def build_parser() -> argparse.ArgumentParser:
     setup_parser.add_argument("--state-dir", type=expand_path, default=default_state_dir())
     setup_parser.add_argument("--dangerous-bypass", action="store_true")
     setup_parser.add_argument("--tmux-socket", default="codex")
+    setup_parser.add_argument("--language", choices=("en", "ko"), default="en", help="language for bridge messages and buttons")
     setup_parser.add_argument("--tmux-session", default="codex")
     setup_parser.add_argument("--submit-key", default="Tab")
     setup_parser.add_argument(
@@ -1800,6 +1807,7 @@ def main(argv: list[str] | None = None) -> int:
                     send_test=not args.no_test_message,
                     non_interactive=args.non_interactive,
                     yes=args.yes,
+                    language=args.language,
                 )
             )
         if args.command == "doctor":
