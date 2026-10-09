@@ -17,7 +17,7 @@ class CompletedTurnBusyTest(unittest.TestCase):
         self.tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)
         self.root = Path(self.tmp.name)
-        environment = mock.patch.dict(os.environ, {"CRB_CHAT_ID": "1234", "CRB_FLOW_MIRROR": "0"})
+        environment = mock.patch.dict(os.environ, {"CRB_CHAT_ID": "1234", "CRB_FLOW_MIRROR": "0", "CRB_LANGUAGE": "ko"})
         environment.start()
         self.addCleanup(environment.stop)
         scripts = Path(__file__).resolve().parents[1]

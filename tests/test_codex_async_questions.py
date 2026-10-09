@@ -270,7 +270,7 @@ class FreeformBridgeIntegrationTest(unittest.TestCase):
         from contextlib import nullcontext
         from unittest.mock import patch
         self.tmp = tempfile.TemporaryDirectory(); self.addCleanup(self.tmp.cleanup)
-        self.env = patch.dict(os.environ, {'CRB_CHAT_ID':'123'}); self.env.start(); self.addCleanup(self.env.stop)
+        self.env = patch.dict(os.environ, {'CRB_CHAT_ID':'123', 'CRB_LANGUAGE':'ko'}); self.env.start(); self.addCleanup(self.env.stop)
         self.sleep = patch.object(self.m.time, 'sleep'); self.sleep.start(); self.addCleanup(self.sleep.stop)
         cfg = self.m.replace(self.m.Config.from_env(), state_path=Path(self.tmp.name)/'bridge.json', bridge_kill=False)
         tg = SimpleNamespace(chat_id='123', call=Mock(return_value={'ok':True,'result':{'message_id':55}}), send=Mock())
@@ -413,6 +413,37 @@ class FreeformBridgeIntegrationTest(unittest.TestCase):
         self.b.process_telegram_update({'update_id':1, 'message': {'message_id':77, 'text':'ㅇㅋ',
             'chat':{'id':123}, 'from':{'id':123}, 'reply_to_message':{'message_id':55}}})
         self.assertEqual(self.item['status'], 'open')
+        self.repl.send_choice_text.assert_not_called()
+
+    def test_choice_card_free_text_reports_unsupported_answer_before_navigation(self):
+        self.item.update(status='open', options=['먼저 조사', '전체 진행'])
+        self.b.prompt_from_telegram_message = Mock()
+        self.repl.capture_visible_screen.return_value = '? 1 question\nshift + ← to answer'
+        self.b.process_telegram_update({'update_id':1, 'message': {'message_id':77,
+            'text':'추가 의견을 전달합니다', 'chat':{'id':123}, 'from':{'id':123},
+            'reply_to_message':{'message_id':55}}})
+        self.assertEqual(self.item['status'], 'open')
+        self.b.telegram.send.assert_called_once()
+        self.assertIn('표시된 선택지', self.b.telegram.send.call_args.args[0])
+        self.assertIn('새 메시지', self.b.telegram.send.call_args.args[0])
+        self.assertNotIn('터미널의 해당 질문을 확인하지 못해', self.b.telegram.send.call_args.args[0])
+        self.repl.capture_visible_screen.assert_not_called()
+        self.repl.focus_pending_question.assert_not_called()
+        self.repl.send_choice.assert_not_called()
+        self.repl.send_choice_text.assert_not_called()
+        self.b.prompt_from_telegram_message.assert_not_called()
+
+    def test_ordinary_free_text_with_open_card_uses_normal_message_path(self):
+        self.item.update(status='open', options=['먼저 조사', '전체 진행'])
+        self.b.handle_choice_reply = Mock(return_value=False)
+        self.b.prompt_from_telegram_message = Mock(return_value=SimpleNamespace(text=''))
+        message = {'message_id':77, 'text':'추가 의견을 전달합니다',
+                   'chat':{'id':123}, 'from':{'id':123}}
+        self.b.process_telegram_update({'update_id':1, 'message':message})
+        self.b.prompt_from_telegram_message.assert_called_once_with(message, 1)
+        self.assertEqual(self.item['status'], 'open')
+        self.b.telegram.send.assert_not_called()
+        self.repl.send_choice.assert_not_called()
         self.repl.send_choice_text.assert_not_called()
 
     def test_same_title_ambiguity_blocks_before_input(self):

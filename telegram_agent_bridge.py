@@ -26,6 +26,7 @@ from pathlib import Path
 from typing import Any
 
 from agent_runtime import WorkdirLock, WorkdirLockError
+from bridge_i18n import Language
 
 
 HOME = Path.home()
@@ -391,6 +392,7 @@ class Bridge:
         self.config = config
         self.backend = backend
         self.telegram = telegram
+        self.language = Language(config.state_dir)
         self.lock = threading.Lock()
         self.jobs: queue.Queue[BridgeJob] = queue.Queue()
         self.offset_file = config.state_dir / "telegram-agent-bridge.offset"
@@ -452,7 +454,7 @@ class Bridge:
 
     def mirror_prompt(self, job: BridgeJob) -> None:
         if job.source == "local":
-            self.send(f"local input:\n{job.text}")
+            self.send(self.language.text("local input:\n{text}", text=job.text))
         else:
             self.print_local(f"telegram input:\n{job.text}")
 
@@ -461,7 +463,7 @@ class Bridge:
         self.send(text)
 
     def mirror_error(self, job: BridgeJob, text: str) -> None:
-        message = f"codex failed: {text}"
+        message = self.language.text("codex failed: {detail}", detail=text)
         self.print_local(f"{message} ({job.source})")
         self.send(message)
 
@@ -602,8 +604,14 @@ class Bridge:
         if not text:
             return
 
+        if source == "telegram":
+            language_reply = self.language.command(text)
+            if language_reply is not None:
+                self.send(language_reply)
+                return
+
         if text.lower() in {"/start", "/ping"}:
-            status = f"codex-telegram-bridge running (backend={self.backend.name})"
+            status = self.language.text("codex-telegram-bridge running (backend={backend})", backend=self.backend.name)
             self.print_local(status)
             self.send(status)
             return

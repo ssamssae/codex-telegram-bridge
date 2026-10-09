@@ -17,12 +17,17 @@ class QuestionNotSubmitted(RuntimeError):
     """Preflight rejected the answer before any answer key or text was sent."""
 
 
+class UnsupportedChoiceAnswer(QuestionNotSubmitted):
+    """A reply to a choice card does not match any supported option."""
+
+
 class AsyncQuestions:
-    def __init__(self, path, telegram, submit, clock=time.time, recover=None):
+    def __init__(self, path, telegram, submit, clock=time.time, recover=None, translate=None):
         self.path = Path(path)
         self.telegram = telegram
         self.submit = submit
         self.recover = recover
+        self.translate = translate
         self.clock = clock
         self.lock = threading.RLock()
         if self.path.exists():
@@ -31,6 +36,11 @@ class AsyncQuestions:
                 raise ValueError('Invalid question state')
         else:
             self.items = {}
+
+    def tr(self, source, **values):
+        if self.translate is not None:
+            return self.translate(source, **values)
+        return source.format(**values) if values else source
 
     def save(self):
         self.path.parent.mkdir(parents=True, exist_ok=True)
@@ -68,7 +78,7 @@ class AsyncQuestions:
                          'callback_data': f'{PREFIX}:{key}:{i}'}]
                        for i, label in enumerate(item['options'])]
         elif item['status'] == 'uncertain':
-            buttons = [[{'text': '터미널 질문 확인 · 선택지 복구',
+            buttons = [[{'text': self.tr('터미널 질문 확인 · 선택지 복구'),
                          'callback_data': f'{PREFIX}:{key}:recover'}]]
         else:
             buttons = []
@@ -92,9 +102,12 @@ class AsyncQuestions:
         self.save()
         self.refresh_buttons(key, item)
         if item['status'] == 'open':
-            self.telegram.send('터미널의 해당 질문을 확인하지 못해 답변을 입력하지 않았습니다. 질문 화면을 연 뒤 다시 선택하거나 답장해 주세요.')
+            if isinstance(error, UnsupportedChoiceAnswer):
+                self.telegram.send(self.tr('이 질문 카드는 표시된 선택지만 답변할 수 있습니다. 이번 카드 답변은 입력하지 않았습니다. 버튼을 선택하거나, 추가 의견은 카드에 답장하지 않고 새 메시지로 보내주세요.'))
+            else:
+                self.telegram.send(self.tr('이 질문 카드의 답변을 제출할 수 있는 터미널 상태를 확인하지 못했습니다. 이번 카드 답변은 입력하지 않았습니다. 질문 화면과 기존 입력을 확인한 뒤 다시 선택하거나 답장해 주세요.'))
         elif item['status'] == 'uncertain':
-            self.telegram.send('선택 답변의 전달 여부를 확인하지 못했습니다. 자동 재전송하지 않습니다. 아래 질문 확인 버튼으로 선택지를 복구할 수 있습니다.')
+            self.telegram.send(self.tr('선택 답변의 전달 여부를 확인하지 못했습니다. 자동 재전송하지 않습니다. 아래 질문 확인 버튼으로 선택지를 복구할 수 있습니다.'))
 
     def observe(self, record, session):
         if not session or record.get('type') != 'response_item':
@@ -147,9 +160,9 @@ class AsyncQuestions:
                                  'callback_data': f'{PREFIX}:{key}:{i}'}]
                                for i, label in enumerate(item['options'])]
                     labels = '\n'.join(f'{i+1}. {o}' for i, o in enumerate(item['options']))
-                    text = ('확인이 필요한 질문\n\n' + item['title'] + '\n\n' + labels)[:3600]
-                    text += ('\n\n버튼으로 선택해 주세요. 직접 입력은 표시된 선택지와 같은 답만 지원합니다.' if buttons else '\n\n이 질문 메시지에 Telegram 답장으로 답변해 주세요.')
-                    text += ' 질문은 1시간 동안 유효합니다.'
+                    text = (self.tr('확인이 필요한 질문\n\n') + item['title'] + '\n\n' + labels)[:3600]
+                    text += (self.tr('\n\n버튼으로 선택해 주세요. 직접 입력은 표시된 선택지와 같은 답만 지원합니다.') if buttons else self.tr('\n\n이 질문 메시지에 Telegram 답장으로 답변해 주세요.'))
+                    text += self.tr(' 질문은 1시간 동안 유효합니다.')
                     try:
                         result = self.telegram.call('sendMessage', chat_id=self.telegram.chat_id,
                                                     text=text, reply_markup=json.dumps({'inline_keyboard': buttons}, ensure_ascii=False))
@@ -179,21 +192,21 @@ class AsyncQuestions:
         with self.lock:
             parts = data.split(':')
             if len(parts) != 3 or not (parts[2].isdigit() or parts[2] == 'recover'):
-                ack('유효하지 않은 선택입니다.')
+                ack(self.tr('유효하지 않은 선택입니다.'))
                 return True
             item = self.items.get(parts[1])
             if not item or item.get('message_id') != message.get('message_id') or item['session'] != session:
-                ack('현재 대화의 질문이 아닙니다.')
+                ack(self.tr('현재 대화의 질문이 아닙니다.'))
                 return True
             if self.clock() - item['created'] >= TTL:
                 item['status'] = 'expired'
                 self.save()
                 self.clear_buttons(item)
-                ack('만료된 질문입니다. 메시지로 다시 알려주세요.')
+                ack(self.tr('만료된 질문입니다. 메시지로 다시 알려주세요.'))
                 return True
             if parts[2] == 'recover':
                 if item['status'] != 'uncertain' or not callable(self.recover):
-                    ack('복구할 수 없는 질문입니다.')
+                    ack(self.tr('복구할 수 없는 질문입니다.'))
                     return True
                 try:
                     ready = self.recover(item) is True
@@ -203,18 +216,18 @@ class AsyncQuestions:
                     item['status'] = 'open'
                     self.save()
                     self.refresh_buttons(parts[1], item)
-                    ack('같은 질문을 확인했습니다. 답변을 다시 선택하거나 답장해 주세요.')
+                    ack(self.tr('같은 질문을 확인했습니다. 답변을 다시 선택하거나 답장해 주세요.'))
                 else:
-                    ack('터미널에서 같은 질문을 확인하지 못했습니다. 답변은 전송하지 않았습니다.')
+                    ack(self.tr('터미널에서 같은 질문을 확인하지 못했습니다. 답변은 전송하지 않았습니다.'))
                 return True
             index = int(parts[2])
             if item['status'] != 'open' or index >= len(item['options']):
-                ack('이미 선택했거나 더 이상 사용할 수 없는 질문입니다.')
+                ack(self.tr('이미 선택했거나 더 이상 사용할 수 없는 질문입니다.'))
                 return True
             text = '> ' + item['title'].replace('\n', '\n> ') + '\n\n' + item['options'][index]
             item.update(status='submitting', selected=index)
             self.save()  # Crash or ambiguous input failure must never repeat submission.
-            ack('선택한 답변을 Codex에 전달합니다.')
+            ack(self.tr('선택한 답변을 Codex에 전달합니다.'))
             confirmed, error = False, None
             try:
                 confirmed = self.submit(text, item['message_id'])
