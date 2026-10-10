@@ -25,12 +25,12 @@ original language. Terminal setup/diagnostic output and advanced operator flow
 reports are currently unchanged. Read the [language reference and verification
 paths](docs/i18n.md) or the [한국어 시작 안내](README.ko.md).
 
-## GitHub release 0.9.16
+## GitHub release 0.9.17
 
 Install this GitHub release with:
 
 ```bash
-pipx install "git+https://github.com/ssamssae/codex-telegram-bridge.git@v0.9.16"
+pipx install "git+https://github.com/ssamssae/codex-telegram-bridge.git@v0.9.17"
 ```
 
 This source release does not update the PyPI package.

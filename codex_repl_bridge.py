@@ -5549,6 +5549,14 @@ def select_choice_option_block(
 
 
 def extract_choice_title(lines: list[str], option_start: int) -> str:
+    # Native async questions have an explicit panel boundary. Keep the full
+    # visible title, including wrapped rows and blank paragraphs; a row limit
+    # can discard the approval target before the exact event/title comparison.
+    queued = [i for i, line in enumerate(lines[:option_start])
+              if re.fullmatch(r'(?:[•●]\s*)?Queued follow-up inputs', line.strip())]
+    if queued and any(re.search(r'\benter\s+submit\b.*\bskip\b', line, re.IGNORECASE)
+                      for line in lines[option_start:]):
+        return ' '.join(normalize_choice_line(line) for line in lines[queued[-1] + 1:option_start]).strip()
     parts: list[str] = []
     for raw_line in reversed(lines[:option_start]):
         if any(char in raw_line for char in CHOICE_BOX_TOP_CHARS):
@@ -5672,7 +5680,7 @@ def parse_choice_prompt(screen: str) -> ChoicePrompt | None:
         return None
 
     lines = clean_pane_lines(screen)
-    tail = lines[max(0, len(lines) - 40) :]
+    tail = lines[max(0, len(lines) - 40):]
     yes_no = parse_yes_no_choice_prompt(tail)
     if yes_no:
         return yes_no
@@ -5717,6 +5725,23 @@ EMPTY_ANSWER_HINT_RE = re.compile(
 )
 # 긴 주관식 제목이 TUI에서 잘려도 같은 카드로 인정할 최소 canonical 접두.
 _TITLE_PREFIX_MIN = 24
+
+
+def empty_main_composer_for_question_focus(screen: str) -> bool:
+    """Recognize the live empty composer when the pending-question hint is hidden."""
+    lines = clean_pane_lines(screen)
+    prompts = [i for i, line in enumerate(lines) if line.lstrip().startswith(("›", "»"))]
+    if not prompts or not re.fullmatch(
+        r"[›»] Ask (?:Codex to do anything|a follow-up question)",
+        lines[prompts[-1]].strip(),
+    ):
+        return False
+    footer = [line.strip() for line in lines[prompts[-1] + 1:] if line.strip()]
+    # Additional input lines or unknown/modal chrome are not an empty composer.
+    return (len(footer) == 2 and bool(re.fullmatch(
+                r"\? for shortcuts(?:\s+⚠\ufe0f?\s*\d+\s+warnings?\s*·\s*f2 to view)?",
+                footer[-1]))
+            and bool(parse_codex_footer_status(footer[0])))
 
 
 def question_title_matches_visible_text(title: str, visible: str) -> bool:
@@ -6176,7 +6201,7 @@ class Bridge:
             if item['status'] == 'submitting' and item.get('message_id') == message_id and text.startswith(prefix):
                 candidates.append((item, text[len(prefix):]))
         if len(candidates) != 1 or self.config.bridge_kill:
-            raise QuestionNotSubmitted('No unique active question')
+            raise QuestionNotSubmitted('No unique active question', reason='question_ambiguous')
         item, answer = candidates[0]
         normalize = canonical_choice_signature_text
         if item['options'] and not any(normalize(answer) == normalize(label) for label in item['options']):
@@ -6187,29 +6212,34 @@ class Bridge:
                if other['session'] == item['session']
                and other['status'] in {'open', 'submitting', 'uncertain'}
                and normalize(other['title']) == normalize(item['title'])) != 1:
-            raise QuestionNotSubmitted('Native question title is ambiguous')
+            raise QuestionNotSubmitted('Native question title is ambiguous', reason='question_ambiguous')
         with self.repl.composer_lock():
             if str(self.repl.session_file()) != item['session']:
-                raise QuestionNotSubmitted('Question session changed')
+                raise QuestionNotSubmitted('Question session changed', reason='session_changed')
             screen = self.repl.capture_visible_screen()
             if parse_approval_prompt(screen):
-                raise QuestionNotSubmitted('Approval panel is open')
+                raise QuestionNotSubmitted('Approval panel is open', reason='approval_open')
             prompt = parse_choice_prompt(screen)
             type_answer = empty_type_answer_editor(screen, item['title'])
             if prompt is None and freeform_editor(screen, item['title']) is None and not type_answer:
                 # This live TUI has no shared app-server response connection.
-                # Navigate only when its own pending-question hint is visible.
-                if not re.search(r'shift\s*\+\s*←\s*to answer', screen, re.IGNORECASE):
-                    raise QuestionNotSubmitted('No pending native question hint')
+                # An accepted, current-session card may outlive the footer hint.
+                # Empty main input permits navigation only; the native title and
+                # options/editor below must still match before sending an answer.
+                if (not re.search(r'shift\s*\+\s*←\s*to answer', screen, re.IGNORECASE)
+                        and not empty_main_composer_for_question_focus(screen)):
+                    raise QuestionNotSubmitted('No pending native question hint', reason='question_hidden')
                 focus = getattr(self.repl, 'focus_pending_question', None)
                 if not callable(focus):
-                    raise QuestionNotSubmitted('Native question navigation unavailable')
+                    raise QuestionNotSubmitted('Native question navigation unavailable', reason='question_hidden')
                 focus()
                 for _ in range(10):
                     time.sleep(0.1)
                     screen = self.repl.capture_visible_screen()
+                    if str(self.repl.session_file()) != item['session']:
+                        raise QuestionNotSubmitted('Question session changed', reason='session_changed')
                     if parse_approval_prompt(screen):
-                        raise QuestionNotSubmitted('Approval panel appeared')
+                        raise QuestionNotSubmitted('Approval panel appeared', reason='approval_open')
                     prompt = parse_choice_prompt(screen)
                     type_answer = empty_type_answer_editor(screen, item['title'])
                     if prompt or freeform_editor(screen, item['title']) is not None or type_answer:
@@ -6218,7 +6248,7 @@ class Bridge:
             type_answer = empty_type_answer_editor(screen, item['title'])
             if not item['options'] and prompt is None and (editor is not None or type_answer):
                 if not answer.strip() or any(ord(c) < 32 and c != '\n' for c in answer) or '\x7f' in answer:
-                    raise QuestionNotSubmitted('Unsafe or empty question answer')
+                    raise QuestionNotSubmitted('Unsafe or empty question answer', reason='invalid_answer')
                 if type_answer:
                     self.repl.send_choice_text(answer)
                 elif editor == answer:
@@ -6226,20 +6256,22 @@ class Bridge:
                 elif not editor:
                     self.repl.send_choice_text(answer)
                 else:
-                    raise QuestionNotSubmitted('Existing question input differs; preserved')
+                    raise QuestionNotSubmitted('Existing question input differs; preserved', reason='input_conflict')
             else:
                 # Full title and all supplied labels must survive wrapping. Never
                 # guess a choice by index on an unrelated or truncated panel.
-                if (prompt is None or normalize(item['title']) != normalize(prompt.title)
-                        or any(normalize(label) not in normalize(screen) for label in item['options'])):
-                    raise QuestionNotSubmitted('Native question does not match event')
+                if prompt is None or normalize(item['title']) != normalize(prompt.title):
+                    raise QuestionNotSubmitted('Native question does not match event', reason='question_mismatch')
+                if ([normalize(o.label) for o in prompt.options[:len(item['options'])]]
+                        != [normalize(label) for label in item['options']]):
+                    raise QuestionNotSubmitted('Native options do not match event', reason='options_mismatch')
                 matches = [option for option in prompt.options
                            if normalize(option.label) == normalize(answer)]
                 if len(matches) != 1:
-                    raise QuestionNotSubmitted('Native answer option not verified; no text fallback')
+                    raise QuestionNotSubmitted('Native answer option not verified; no text fallback', reason='options_mismatch')
                 selected = prompt.selected_option()
                 if selected is None:
-                    raise QuestionNotSubmitted('Native selected option unavailable')
+                    raise QuestionNotSubmitted('Native selected option unavailable', reason='selection_unknown')
                 option = matches[0]
                 self.repl.send_choice(TransportChoice(value=option.value, key='',
                     index=option.index, selected_index=selected.index))
@@ -6257,7 +6289,9 @@ class Bridge:
                 if parse_approval_prompt(screen) or str(self.repl.session_file()) != item['session']:
                     raise RuntimeError('Question completion context changed')
                 if screen.strip() and not old_panel and not re.search(r'shift\s*\+\s*←\s*to answer', screen, re.IGNORECASE) and (
-                        screen_has_repl_busy_marker(screen) or any(line.lstrip().startswith('›') for line in screen.splitlines())):
+                        screen_has_repl_busy_marker(screen)
+                        or empty_main_composer_for_question_focus(screen)
+                        or any(line.lstrip().startswith('›') for line in screen.splitlines())):
                     clear_reads += 1
                     if clear_reads >= 2:
                         item['status'] = 'answered'
