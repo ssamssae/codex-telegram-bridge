@@ -1,6 +1,6 @@
 # Codex Telegram Bridge
 
-[English](README.md) · [한국어](README.ko.md) · [Web guide · 웹 설명서](https://ssamssae.github.io/codex-telegram-bridge/) · [Web verification](docs/feature-map.md)
+[English](README.md) · [한국어](README.ko.md) · [Web guide · 웹 설명서](https://product.kangdaejong.com/codex-telegram-bridge/) · [Web verification](docs/feature-map.md)
 
 [![Release](https://img.shields.io/github/v/release/ssamssae/codex-telegram-bridge)](https://github.com/ssamssae/codex-telegram-bridge/releases)
 [![License: MIT](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)

@@ -1,6 +1,6 @@
 # Codex Telegram Bridge
 
-[English](README.md) · [한국어](README.ko.md) · [Web guide · 웹 설명서](https://ssamssae.github.io/codex-telegram-bridge/) · [Web verification](docs/feature-map.md)
+[English](README.md) · [한국어](README.ko.md) · [Web guide · 웹 설명서](https://product.kangdaejong.com/codex-telegram-bridge/) · [Web verification](docs/feature-map.md)
 
 이번 GitHub 릴리스 `0.9.16`은 아래 명령으로 설치합니다. PyPI 패키지 버전은
 이번 발행에서 변경하지 않습니다.
