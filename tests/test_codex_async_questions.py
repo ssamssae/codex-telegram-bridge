@@ -761,7 +761,7 @@ class NativeQuestionReceiptTest(unittest.TestCase):
         key = self.open(); item = self.q.items[key]
         self.q.finish_submission(key, item, False, QuestionNotSubmitted('private text', reason='question_mismatch'))
         self.assertEqual(item['failure_reason'], 'question_mismatch')
-        self.assertNotIn('private text', self.path.read_text())
+        self.assertNotIn('private text', self.path.read_text(encoding='utf-8'))
         self.assertNotIn('private text', str(self.telegram.send.call_args_list))
 
 
