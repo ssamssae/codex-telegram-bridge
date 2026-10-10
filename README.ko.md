@@ -2,11 +2,11 @@
 
 [English](README.md) · [한국어](README.ko.md) · [Web guide · 웹 설명서](https://product.kangdaejong.com/codex-telegram-bridge/) · [Web verification](docs/feature-map.md)
 
-이번 GitHub 릴리스 `0.9.16`은 아래 명령으로 설치합니다. PyPI 패키지 버전은
+이번 GitHub 릴리스 `0.9.17`은 아래 명령으로 설치합니다. PyPI 패키지 버전은
 이번 발행에서 변경하지 않습니다.
 
 ```bash
-pipx install "git+https://github.com/ssamssae/codex-telegram-bridge.git@v0.9.16"
+pipx install "git+https://github.com/ssamssae/codex-telegram-bridge.git@v0.9.17"
 ```
 
 컴퓨터에서 실행 중인 Codex CLI를 텔레그램으로 조작하는 브릿지입니다.

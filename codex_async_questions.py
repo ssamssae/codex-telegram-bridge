@@ -11,10 +11,26 @@ from pathlib import Path
 
 PREFIX = 'crb_asyncq'
 TTL = 3600
+FAILURE_REASONS = {
+    'unknown': '터미널 질문 상태를 확인하지 못했습니다.',
+    'question_ambiguous': '같은 질문을 하나로 확인하지 못했습니다.',
+    'session_changed': '질문의 대화가 현재 대화와 다릅니다.',
+    'approval_open': '다른 실행 승인 화면이 열려 있습니다.',
+    'question_hidden': '답변할 질문 화면을 찾지 못했습니다.',
+    'input_conflict': '터미널에 작성 중인 다른 답변이 있습니다.',
+    'question_mismatch': '화면의 질문이 카드의 질문과 다릅니다.',
+    'options_mismatch': '화면의 선택지가 카드의 선택지와 다릅니다.',
+    'selection_unknown': '현재 선택 위치를 확인하지 못했습니다.',
+    'invalid_answer': '이 질문에 제출할 수 없는 답변입니다.',
+}
 
 
 class QuestionNotSubmitted(RuntimeError):
     """Preflight rejected the answer before any answer key or text was sent."""
+
+    def __init__(self, message='', *, reason='unknown'):
+        super().__init__(message)
+        self.reason = reason if reason in FAILURE_REASONS else 'unknown'
 
 
 class UnsupportedChoiceAnswer(QuestionNotSubmitted):
@@ -90,11 +106,14 @@ class AsyncQuestions:
             pass  # Persisted state remains authoritative; never resend an answer.
 
     def finish_submission(self, key, item, confirmed, error=None):
-        if confirmed is True:
+        if confirmed is True or item['status'] == 'answered':
             item['status'] = 'answered'
+            item.pop('failure_stage', None)
+            item.pop('failure_reason', None)
         elif isinstance(error, QuestionNotSubmitted):
             item['status'] = 'open'
             item['failure_stage'] = 'before_input'
+            item['failure_reason'] = error.reason
         else:
             item['status'] = 'uncertain'
             item['failure_stage'] = 'delivery_unconfirmed'
@@ -105,7 +124,10 @@ class AsyncQuestions:
             if isinstance(error, UnsupportedChoiceAnswer):
                 self.telegram.send(self.tr('이 질문 카드는 표시된 선택지만 답변할 수 있습니다. 이번 카드 답변은 입력하지 않았습니다. 버튼을 선택하거나, 추가 의견은 카드에 답장하지 않고 새 메시지로 보내주세요.'))
             else:
-                self.telegram.send(self.tr('이 질문 카드의 답변을 제출할 수 있는 터미널 상태를 확인하지 못했습니다. 이번 카드 답변은 입력하지 않았습니다. 질문 화면과 기존 입력을 확인한 뒤 다시 선택하거나 답장해 주세요.'))
+                notice = self.tr('이 질문 카드의 답변을 제출할 수 있는 터미널 상태를 확인하지 못했습니다. 이번 카드 답변은 입력하지 않았습니다. 질문 화면과 기존 입력을 확인한 뒤 다시 선택하거나 답장해 주세요.')
+                if item.get('failure_reason', 'unknown') != 'unknown':
+                    notice += '\n\n' + self.tr(FAILURE_REASONS[item['failure_reason']])
+                self.telegram.send(notice)
         elif item['status'] == 'uncertain':
             self.telegram.send(self.tr('선택 답변의 전달 여부를 확인하지 못했습니다. 자동 재전송하지 않습니다. 아래 질문 확인 버튼으로 선택지를 복구할 수 있습니다.'))
 
@@ -117,6 +139,9 @@ class AsyncQuestions:
             return
         with self.lock:
             now = self.clock()
+            if p.get('type') == 'message' and p.get('role') == 'user':
+                self.observe_native_reply(record, session)
+                return
             if p.get('type') == 'function_call' and str(p.get('name') or '').split('.')[-1] == 'request_user_input_async':
                 try:
                     args = json.loads(p['arguments'])
@@ -172,6 +197,56 @@ class AsyncQuestions:
                     item['message_id'] = mid
                     item['status'] = 'open' if isinstance(mid, int) else 'uncertain'
                     self.save()
+
+    def observe_native_reply(self, record, session):
+        """Consume the native question receipt by call/index, never a quoted reply."""
+        p = record['payload']
+        content = p.get('content')
+        metadata = p.get('internal_chat_message_metadata_passthrough')
+        if (not isinstance(content, list) or len(content) != 1
+                or not isinstance(content[0], dict) or content[0].get('type') != 'input_text'
+                or not isinstance(metadata, dict) or not metadata.get('turn_id')):
+            return
+        text = content[0].get('text')
+        if not isinstance(text, str):
+            return
+        match = re.fullmatch(r'<send_user_message_question_reply>\s*(\[.*\])\s*</send_user_message_question_reply>', text, re.DOTALL)
+        if not match:
+            return
+        try:
+            replies = json.loads(match[1])
+            received = datetime.fromisoformat(record['timestamp'].replace('Z', '+00:00')).timestamp()
+        except (ValueError, KeyError, TypeError):
+            return
+        if not isinstance(replies, list) or len(replies) > 10:
+            return
+        for reply in replies:
+            if not isinstance(reply, dict):
+                continue
+            try:
+                identity = json.loads(reply.get('questionItemId', ''))
+            except (TypeError, ValueError):
+                continue
+            if (not isinstance(identity, list) or len(identity) != 3
+                    or identity[0] != 'request_user_input_async'
+                    or not isinstance(identity[1], str)
+                    or type(identity[2]) is not int or not 0 <= identity[2] < 10):
+                continue
+            key = hashlib.sha256(f'{session}:{identity[1]}:{identity[2]}'.encode()).hexdigest()[:24]
+            item = self.items.get(key)
+            if (not item or item['session'] != session or item['call_id'] != identity[1]
+                    or item['status'] not in {'open', 'submitting', 'uncertain'}
+                    or received < item['created'] or reply.get('question') != item['title']
+                    or not isinstance(reply.get('answer'), str)
+                    or (item['options'] and reply['answer'] not in item['options'])):
+                continue
+            item.update(status='answered', answered_at=received, answered_via='native_receipt')
+            if item['options']:
+                item['selected'] = item['options'].index(reply['answer'])
+            item.pop('failure_stage', None)
+            item.pop('failure_reason', None)
+            self.save()
+            self.clear_buttons(item)
 
     def callback(self, callback, session):
         data = callback.get('data', '')

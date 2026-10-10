@@ -1,5 +1,9 @@
 # @mutate-why 화면 위쪽의 오래된 제목만 일치해도 다른 주관식 에디터에 답을 넣는 오작동이 되살아난다
 # @mutate scripts/codex_repl_bridge.py | question_title_matches_visible_text(title, "\n".join(title_lines[start:])) | canonical_choice_signature_text(title) in canonical_choice_signature_text(screen)
+# @mutate-why 긴 질문의 첫 부분을 버리는 기존 판독으로 돌아가면 같은 질문의 정상 승인이 거절된다
+# @mutate scripts/codex_repl_bridge.py | if queued and any( | if False and any(
+# @mutate-why 실제 질문 응답 기록을 무시하면 터미널에서 직접 답한 카드가 열린 채 남는다
+# @mutate scripts/codex_async_questions.py | self.observe_native_reply(record, session) | pass
 
 import importlib.util
 import json
@@ -340,6 +344,87 @@ class FreeformBridgeIntegrationTest(unittest.TestCase):
         self.repl.send_choice_text.assert_called_once_with('ㅇㅋ')
         self.assertEqual(self.item['status'], 'answered')
 
+    def test_pending_choice_focuses_from_live_empty_composer_without_hint(self):
+        # The observed narrow 0.162.0 pane has this footer but no
+        # "shift + left to answer" hint while the agent is working.
+        screen = ('• Working (6m 37s • esc to interrupt)\n\n'
+                  '› Ask Codex to do anything\n\n'
+                  '  GPT-6-Astra max · / · Context 54% used · weekly 19% …\n'
+                  '  ? for shortcuts\n')
+        self.item['options'] = ['첫 번째', '둘 다']
+        panel = '설명해 주세요\n› 1. 첫 번째\n  2. 둘 다\nEnter to select'
+        self.repl.capture_visible_screen.side_effect = [screen, panel, screen, screen]
+        self.assertTrue(self.submit('둘 다'))
+        self.repl.focus_pending_question.assert_called_once_with()
+        self.repl.send_choice.assert_called_once()
+        self.assertEqual(self.repl.send_choice.call_args.args[0].index, 1)
+        self.repl.send_choice_text.assert_not_called()
+        self.repl.paste_prompt.assert_not_called()
+        self.assertEqual(self.item['status'], 'answered')
+
+    def test_pending_freeform_focuses_without_hint_then_verifies_editor(self):
+        screen = ('› Ask Codex to do anything\n\n'
+                  'GPT-6-Sol high · / · Context 20% used\n? for shortcuts')
+        self.repl.capture_visible_screen.side_effect = [screen, editor_screen(), screen, screen]
+        self.assertTrue(self.submit())
+        self.repl.focus_pending_question.assert_called_once_with()
+        self.repl.send_choice_text.assert_called_once_with('ㅇㅋ')
+
+    def test_double_chevron_composer_with_warning_can_focus_and_close(self):
+        # Athena's current composer uses » and may show a warning beside shortcuts.
+        screen = ('» Ask Codex to do anything\n\n'
+                  'GPT-6-Astra ultra · / · Context 23% used · weekly …\n'
+                  '? for shortcuts           ⚠ 1 warning · f2 to view')
+        self.item['options'] = ['첫 번째', '둘 다']
+        panel = '설명해 주세요\n› 1. 첫 번째\n  2. 둘 다\nEnter to select'
+        self.repl.capture_visible_screen.side_effect = [screen, panel, screen, screen]
+        self.assertTrue(self.submit('둘 다'))
+        self.repl.focus_pending_question.assert_called_once_with()
+        self.repl.send_choice.assert_called_once()
+        self.repl.send_choice_text.assert_not_called()
+        self.assertEqual(self.item['status'], 'answered')
+
+    def test_no_hint_preserves_draft_and_rejects_unknown_or_stale_composer(self):
+        empty = ('› Ask Codex to do anything\n\n'
+                 'GPT-6-Sol high · / · Context 20% used\n? for shortcuts')
+        for screen in (empty.replace('Ask Codex to do anything', '아직 작성 중'),
+                       empty + '\n› 새로 작성 중',
+                       empty + '\n» 새로 작성 중',
+                       empty.replace('? for shortcuts', '? for shortcuts\n작성 중인 초안'),
+                       empty.replace('\n\nGPT-', '\n초안의 다음 줄\n\nGPT-'),
+                       '› Ask Codex to do anything', '', 'unrecognized panel'):
+            with self.subTest(screen=screen):
+                self.repl.capture_visible_screen.return_value = screen
+                with self.assertRaises(self.m.QuestionNotSubmitted):
+                    self.submit()
+                self.repl.focus_pending_question.assert_not_called()
+                self.repl.send_choice_text.assert_not_called()
+                self.repl.send_choice.assert_not_called()
+
+    def test_focus_readback_session_change_rejects_before_answer_input(self):
+        self.repl.capture_visible_screen.side_effect = [
+            '? 1 question\nshift + ← to answer', editor_screen(), '› Ask Codex']
+        self.repl.session_file.side_effect = [Path(SESSION), Path('/other')]
+        with self.assertRaises(self.m.QuestionNotSubmitted) as caught:
+            self.submit()
+        self.assertEqual(caught.exception.reason, 'session_changed')
+        self.repl.focus_pending_question.assert_called_once_with()
+        self.repl.send_choice_text.assert_not_called()
+        self.repl.send_choice.assert_not_called()
+
+    def test_missing_hint_focus_does_not_submit_another_native_question(self):
+        screen = ('› Ask Codex to do anything\n\n'
+                  'GPT-6-Sol high · / · Context 20% used\n? for shortcuts')
+        self.item['options'] = ['첫 번째', '둘 다']
+        panel = '다른 질문입니다\n› 1. 첫 번째\n  2. 둘 다\nEnter to select'
+        self.repl.capture_visible_screen.side_effect = [screen, panel]
+        with self.assertRaises(self.m.QuestionNotSubmitted) as caught:
+            self.submit('둘 다')
+        self.assertEqual(caught.exception.reason, 'question_mismatch')
+        self.repl.focus_pending_question.assert_called_once_with()
+        self.repl.send_choice.assert_not_called()
+        self.repl.send_choice_text.assert_not_called()
+
     def test_type_your_answer_without_question_title_is_not_the_editor(self):
         self.repl.capture_visible_screen.return_value = '다른 질문\nType your answer\nenter submit'
         with self.assertRaises(RuntimeError):
@@ -592,6 +677,92 @@ class NativeRecoveryTest(unittest.TestCase):
         with self.assertRaises(self.m.QuestionNotSubmitted):
             self.b.submit_async_answer('> 설명해 주세요\n\n첫 번째', 55)
         self.assert_no_input()
+
+    def test_long_queued_question_keeps_all_title_rows_and_submits_once(self):
+        title = '\n'.join(f'질문 내용 {i}' for i in range(12))
+        screen = self.panel(title)
+        self.item['title'] = title
+        self.repl.capture_visible_screen.side_effect = [screen, '› Ask Codex', '› Ask Codex']
+        payload = '> ' + title.replace('\n', '\n> ') + '\n\n첫 번째'
+        self.assertTrue(self.b.submit_async_answer(payload, 55))
+        self.repl.send_choice.assert_called_once()
+        self.assertEqual(self.item['status'], 'answered')
+
+    def test_queued_question_with_paragraphs_recovers_without_input(self):
+        title = '첫 문단의 승인 대상입니다.\n\n둘째 문단의 승인 조건입니다.'
+        self.repl.capture_visible_screen.return_value = self.panel(title)
+        self.item['title'] = title
+        self.assertTrue(self.b.recover_async_question(self.item))
+        self.assert_no_input()
+
+    def test_changed_first_row_of_long_question_is_never_submitted(self):
+        title = '\n'.join(f'질문 내용 {i}' for i in range(12))
+        screen = self.panel(title.replace('내용 0', '다른 대상 0'))
+        self.item['title'] = title
+        self.repl.capture_visible_screen.return_value = screen
+        with self.assertRaises(self.m.QuestionNotSubmitted):
+            self.b.submit_async_answer('> ' + title.replace('\n', '\n> ') + '\n\n첫 번째', 55)
+        self.assert_no_input()
+
+    def test_old_queued_header_does_not_change_a_regular_choice_title(self):
+        screen = ('• Queued follow-up inputs\nold question\n\n'
+                  'Choose a mode?\n\n› 1. Safe\n  2. Fast\n\nUse arrows to select')
+        self.assertEqual(self.m.parse_choice_prompt(screen).title, 'Choose a mode?')
+
+
+class NativeQuestionReceiptTest(unittest.TestCase):
+    setUp = QuestionsTest.setUp
+    open = QuestionsTest.open
+
+    def receipt(self, item, *, call_id=None, index=0, title=None, answer=None):
+        from datetime import datetime, timezone
+        reply = {'questionItemId': json.dumps(['request_user_input_async', call_id or item['call_id'], index]),
+                 'question': title or item['title'], 'answer': answer or item['options'][0]}
+        text = '<send_user_message_question_reply>\n' + json.dumps([reply], ensure_ascii=False) + '\n</send_user_message_question_reply>'
+        return {'type': 'response_item', 'timestamp': datetime.fromtimestamp(NOW, timezone.utc).isoformat(),
+                'payload': {'type': 'message', 'role': 'user', 'content': [{'type': 'input_text', 'text': text}],
+                            'internal_chat_message_metadata_passthrough': {'turn_id': 'native-turn', 'create_time': NOW, 'content_item_kinds': ['user.text']}}}
+
+    def test_manual_native_answer_closes_exact_card_once_after_restart(self):
+        key = self.open(); item = self.q.items[key]
+        item['failure_stage'] = 'before_input'; self.q.save()
+        self.q = AsyncQuestions(self.path, self.telegram, self.submit, clock=lambda: self.now)
+        self.telegram.call.reset_mock()
+        record = self.receipt(item)
+        self.q.observe(record, SESSION); self.q.observe(record, SESSION)
+        self.assertEqual(self.q.items[key]['status'], 'answered')
+        edits = [c for c in self.telegram.call.call_args_list if c.args[0] == 'editMessageReplyMarkup']
+        self.assertEqual(len(edits), 1)
+        self.assertEqual(json.loads(edits[0].kwargs['reply_markup']), {'inline_keyboard': []})
+        self.submit.assert_not_called()
+
+    def test_wrong_receipts_do_not_close_or_submit(self):
+        key = self.open(); item = self.q.items[key]
+        for changes in [{'call_id': 'other'}, {'index': 1}, {'title': '다른 질문'}, {'answer': '미지원 답변'}]:
+            self.q.observe(self.receipt(item, **changes), SESSION)
+            self.assertEqual(item['status'], 'open')
+        self.q.observe(self.receipt(item), '/other/session')
+        self.assertEqual(item['status'], 'open')
+        self.submit.assert_not_called()
+
+    def test_old_or_non_native_receipt_does_not_close(self):
+        key = self.open(); item = self.q.items[key]
+        record = self.receipt(item)
+        record['timestamp'] = '2020-01-01T00:00:00Z'
+        self.q.observe(record, SESSION)
+        record = self.receipt(item)
+        record['payload'].pop('internal_chat_message_metadata_passthrough')
+        self.q.observe(record, SESSION)
+        self.assertEqual(item['status'], 'open')
+        self.submit.assert_not_called()
+
+    def test_preflight_reason_is_safe_and_distinct(self):
+        from codex_async_questions import QuestionNotSubmitted
+        key = self.open(); item = self.q.items[key]
+        self.q.finish_submission(key, item, False, QuestionNotSubmitted('private text', reason='question_mismatch'))
+        self.assertEqual(item['failure_reason'], 'question_mismatch')
+        self.assertNotIn('private text', self.path.read_text(encoding='utf-8'))
+        self.assertNotIn('private text', str(self.telegram.send.call_args_list))
 
 
 class CallbackAckTest(unittest.TestCase):

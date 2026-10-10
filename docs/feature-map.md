@@ -47,3 +47,8 @@ Release preparation on 2026-10-09: the sanitized export passed 285 tests on
 macOS/Python 3.14. Source control and typing regressions passed another 50 tests.
 These checks use fake Telegram/terminal clients. This release task did not
 restart an installed bridge or perform a live Telegram round trip.
+
+## Release 0.9.17 verification
+
+Public export and regression suite: 299 tests. Run `python3 -m unittest discover -s tests` in a clean checkout. Tests use isolated state and captured senders; they do not send Telegram messages or reset a live session. Source assets are verified against the release tag, and release downloads are checked against `SHA256SUMS`.
+GitHub Pages rebuilds the existing `main:/docs` guide after merge. This static publication does not run a bridge service.

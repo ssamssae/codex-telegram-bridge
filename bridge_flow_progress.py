@@ -10,6 +10,49 @@ from __future__ import annotations
 import os
 import re
 
+
+def public_progress_text(text: str) -> str:
+    """Keep up to two sentences of already-vetted public assistant prose.
+
+    Callers must select public text events and apply their existing privacy
+    sanitizer first. This function never turns tool output or reasoning into
+    a progress report, and must not be used for final answers.
+    """
+    if not isinstance(text, str):
+        return ""
+    # A progress message is prose; a copied code fence is not a useful step.
+    text = re.sub(r"(?ms)^\s*(`{3,}|~{3,})[^\n]*\n.*?^\s*\1\s*$", "", text)
+    text = re.sub(r"(?ms)^\s*(?:`{3,}|~{3,})[^\n]*\n.*\Z", "", text)
+    sentences: list[str] = []
+    for raw in text.splitlines():
+        line = re.sub(r"^\s*(?:[-*•]|\d+[.)])\s+", "", raw).strip()
+        if not line or line.startswith("#"):
+            continue
+        line = " ".join(line.split())
+        # Requiring whitespace leaves decimals, versions, paths and URLs intact.
+        pieces = re.split(r"(?<=[.!?。！？])\s+", line)
+        for piece in pieces:
+            if piece:
+                sentences.append(piece)
+            if len(sentences) == 2:
+                break
+        if len(sentences) == 2:
+            break
+    if not sentences:
+        return ""
+    result = " ".join(sentences)
+    if len(result) <= 500:
+        return result
+    if len(sentences[0]) <= 500:
+        return sentences[0]
+    prefix = sentences[0][:499]
+    # Keep whole words when there is a reasonable boundary near the cap.
+    boundary = prefix.rfind(" ")
+    if boundary >= 350:
+        prefix = prefix[:boundary]
+    return prefix.rstrip() + "…"
+
+
 FLOW_STAGE_READ = "관련 내용 확인 중"
 FLOW_STAGE_EDIT = "수정 중"
 FLOW_STAGE_TEST = "테스트로 동작 확인 중"

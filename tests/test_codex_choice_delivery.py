@@ -269,11 +269,12 @@ class ChoiceAcknowledgementTests(unittest.TestCase):
         b = self.bridge([SCREEN] * 50)
         with patch.object(m.time, 'sleep'):
             b.handle_choice_choice('1', callback_query_id='cb')
+        self.sent_at = next(iter(b.choice_confirmations.values()))['sent_at']
         return b
 
     def answer(self, title=None, answer='승인 — 머지·배포'):
         title = title or m.parse_choice_prompt(SCREEN).title
-        return {'type':'response_item','timestamp':m.datetime.now(m.timezone.utc).isoformat(),'payload':{'type':'message','role':'user',
+        return {'type':'response_item','timestamp':m.datetime.fromtimestamp(self.sent_at + 1, m.timezone.utc).isoformat(),'payload':{'type':'message','role':'user',
             'content':[{'type':'input_text','text':f'> {title}\n\n{answer}'}],
             'internal_chat_message_metadata_passthrough':{'content_item_kinds':['user.text']}}}
 
