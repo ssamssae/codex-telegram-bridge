@@ -5755,6 +5755,34 @@ def question_title_matches_visible_text(title: str, visible: str) -> bool:
     return len(shown) >= _TITLE_PREFIX_MIN and expected.startswith(shown)
 
 
+def empty_inline_other_editor(screen: str, title: str, options: list[str]) -> bool:
+    """Recognize the observed Codex 0.154 empty, selected Other input panel."""
+    prompt = parse_choice_prompt(screen)
+    normalize = canonical_choice_signature_text
+    if (not options or prompt is None or normalize(prompt.title) != normalize(title)
+            or len(prompt.options) != len(options) + 1
+            or [normalize(o.label) for o in prompt.options[:-1]] != [normalize(o) for o in options]):
+        return False
+    other = prompt.options[-1]
+    if (other.label.casefold() not in {'other', '기타', '직접 입력'} or not other.selected
+            or sum(o.selected for o in prompt.options) != 1):
+        return False
+    lines = clean_pane_lines(screen)
+    heads = [i for i, line in enumerate(lines)
+             if re.fullmatch(r'(?:[•●]\s*)?Queued follow-up inputs', line.strip())]
+    feet = [i for i, line in enumerate(lines) if re.fullmatch(
+        r'enter submit\s+ctrl \+ \] skip\s+(?:alt|⌥|⎇) \+ ↓ main prompt', line.strip(), re.I)]
+    rows = [i for i, line in enumerate(lines) if re.fullmatch(
+        rf'› {re.escape(other.value)}\. {re.escape(other.label)}', line.strip())]
+    if len(heads) != 1 or len(feet) != 1 or len(rows) != 1:
+        return False
+    # The native panel has exactly one empty spacer below Other. Any draft,
+    # extra row, or later main composer means that this is not the empty input.
+    return (heads[0] < rows[0] and feet[0] == rows[0] + 2
+            and not lines[rows[0] + 1].strip()
+            and not any(line.strip() for line in lines[feet[0] + 1:]))
+
+
 def empty_type_answer_editor(screen: str, title: str) -> bool:
     """True for the empty freeform editor used by choice Other.
 
@@ -6198,16 +6226,26 @@ class Bridge:
         candidates = []
         for item in questions.items.values():
             prefix = '> ' + item['title'].replace('\n', '\n> ') + '\n\n'
-            if item['status'] == 'submitting' and item.get('message_id') == message_id and text.startswith(prefix):
+            if item['status'] == 'submitting' and questions.owns_message(item, message_id) and text.startswith(prefix):
                 candidates.append((item, text[len(prefix):]))
         if len(candidates) != 1 or self.config.bridge_kill:
             raise QuestionNotSubmitted('No unique active question', reason='question_ambiguous')
         item, answer = candidates[0]
         normalize = canonical_choice_signature_text
-        if item['options'] and not any(normalize(answer) == normalize(label) for label in item['options']):
-            # Reject unsupported card replies before opening or touching the TUI.
-            # An ordinary message is routed separately and must not be retried here.
-            raise UnsupportedChoiceAnswer('Reply does not match a supplied option')
+        if not answer.strip() or any(ord(c) < 32 and c != '\n' for c in answer) or '\x7f' in answer:
+            raise QuestionNotSubmitted('Unsafe or empty question answer', reason='invalid_answer')
+        other_answer = bool(item['options']) and (item.get('answer_mode') == 'other' or not any(
+            normalize(answer) == normalize(label) for label in item['options']))
+        if other_answer:
+            item['answer_mode'] = 'other'
+            item.pop('selected', None)
+
+        def verify_options(prompt):
+            if prompt is None or normalize(item['title']) != normalize(prompt.title):
+                raise QuestionNotSubmitted('Native question does not match event', reason='question_mismatch')
+            if ([normalize(o.label) for o in prompt.options[:len(item['options'])]]
+                    != [normalize(label) for label in item['options']]):
+                raise QuestionNotSubmitted('Native options do not match event', reason='options_mismatch')
         if sum(1 for other in questions.items.values()
                if other['session'] == item['session']
                and other['status'] in {'open', 'submitting', 'uncertain'}
@@ -6244,11 +6282,47 @@ class Bridge:
                     type_answer = empty_type_answer_editor(screen, item['title'])
                     if prompt or freeform_editor(screen, item['title']) is not None or type_answer:
                         break
+            inline_other = other_answer and empty_inline_other_editor(screen, item['title'], item['options'])
+            if other_answer and prompt is not None and not inline_other:
+                verify_options(prompt)
+                others = prompt.options[len(item['options']):]
+                if len(others) != 1 or others[0].label.strip().casefold() not in {'other', '기타', '직접 입력'}:
+                    raise QuestionNotSubmitted('Native Other option not verified', reason='options_mismatch')
+                selected = prompt.selected_option()
+                if selected is None:
+                    raise QuestionNotSubmitted('Native selected option unavailable', reason='selection_unknown')
+                option = others[0]
+                # Other opens an editor or selects the inline input on older TUI.
+                # This navigation never contains the answer.
+                self.repl.send_choice(TransportChoice(value=option.value, key='',
+                    index=option.index, selected_index=selected.index))
+                for _ in range(10):
+                    time.sleep(0.1)
+                    screen = self.repl.capture_visible_screen()
+                    if str(self.repl.session_file()) != item['session']:
+                        raise QuestionNotSubmitted('Question session changed', reason='session_changed')
+                    if parse_approval_prompt(screen):
+                        raise QuestionNotSubmitted('Approval panel appeared', reason='approval_open')
+                    prompt = parse_choice_prompt(screen)
+                    inline_other = empty_inline_other_editor(screen, item['title'], item['options'])
+                    if inline_other or (prompt is None and (freeform_editor(screen, item['title']) is not None
+                            or empty_type_answer_editor(screen, item['title']))):
+                        break
+                else:
+                    raise QuestionNotSubmitted('Other editor not verified; answer preserved', reason='question_hidden')
             editor = freeform_editor(screen, item['title'])
             type_answer = empty_type_answer_editor(screen, item['title'])
-            if not item['options'] and prompt is None and (editor is not None or type_answer):
-                if not answer.strip() or any(ord(c) < 32 and c != '\n' for c in answer) or '\x7f' in answer:
-                    raise QuestionNotSubmitted('Unsafe or empty question answer', reason='invalid_answer')
+            if inline_other:
+                # Recheck the complete, empty panel under the composer lock.
+                # Do not overwrite a draft or type into a panel that changed.
+                time.sleep(0.1)
+                screen = self.repl.capture_visible_screen()
+                if str(self.repl.session_file()) != item['session']:
+                    raise QuestionNotSubmitted('Question session changed', reason='session_changed')
+                if not empty_inline_other_editor(screen, item['title'], item['options']):
+                    raise QuestionNotSubmitted('Inline Other input changed; preserved', reason='input_conflict')
+                self.repl.send_choice_text(answer)
+            elif (not item['options'] or other_answer) and prompt is None and (editor is not None or type_answer):
                 if type_answer:
                     self.repl.send_choice_text(answer)
                 elif editor == answer:
@@ -6260,11 +6334,7 @@ class Bridge:
             else:
                 # Full title and all supplied labels must survive wrapping. Never
                 # guess a choice by index on an unrelated or truncated panel.
-                if prompt is None or normalize(item['title']) != normalize(prompt.title):
-                    raise QuestionNotSubmitted('Native question does not match event', reason='question_mismatch')
-                if ([normalize(o.label) for o in prompt.options[:len(item['options'])]]
-                        != [normalize(label) for label in item['options']]):
-                    raise QuestionNotSubmitted('Native options do not match event', reason='options_mismatch')
+                verify_options(prompt)
                 matches = [option for option in prompt.options
                            if normalize(option.label) == normalize(answer)]
                 if len(matches) != 1:
@@ -6273,6 +6343,8 @@ class Bridge:
                 if selected is None:
                     raise QuestionNotSubmitted('Native selected option unavailable', reason='selection_unknown')
                 option = matches[0]
+                item['selected'] = option.index
+                item.pop('answer_mode', None)
                 self.repl.send_choice(TransportChoice(value=option.value, key='',
                     index=option.index, selected_index=selected.index))
             # A key ACK or an ordinary quoted user message is not completion.
@@ -11006,7 +11078,7 @@ class Bridge:
         if getattr(self, "async_questions_lock", None) is not None:
             answer = self.get_async_questions().reply_text(message, str(self.repl.session_file()))
             if answer is not None:
-                if not answer or self.config.bridge_kill:
+                if not answer:
                     self.telegram.send(self.tr('이미 처리됐거나 만료된 질문, 또는 제출할 수 없는 답변입니다. 일반 대화로 보내지 않았습니다.'))
                     return
                 confirmed, error = False, None

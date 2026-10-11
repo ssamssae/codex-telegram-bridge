@@ -88,11 +88,61 @@ class AsyncQuestions:
             except Exception:
                 pass  # Durable state, not a stale Telegram keyboard, controls admission.
 
+    @staticmethod
+    def owns_message(item, message_id):
+        return (item.get('message_id') == message_id
+                or message_id in item.get('input_message_ids', []))
+
+    def choice_buttons(self, key, item):
+        buttons = [[{'text': f'{i+1}. {label.strip()}'[:64],
+                     'callback_data': f'{PREFIX}:{key}:{i}'}]
+                   for i, label in enumerate(item['options'])]
+        if item['options']:
+            buttons.append([{'text': f'{len(item["options"])+1}. Other',
+                             'callback_data': f'{PREFIX}:{key}:other'}])
+        if item.get('input_message_id'):
+            buttons.append([{'text': self.tr('직접 입력 취소'),
+                             'callback_data': f'{PREFIX}:{key}:cancel'}])
+        return buttons
+
+    def card_text(self, item):
+        answered = item['status'] == 'answered'
+        labels = []
+        for i, option in enumerate(item['options']):
+            mark = '✅ ' if answered and item.get('selected') == i else ''
+            labels.append(f'{mark}{i+1}. {option}')
+        if item['options']:
+            mark = '✅ ' if answered and item.get('answer_mode') == 'other' else ''
+            labels.append(f'{mark}{len(item["options"])+1}. Other')
+        heading = self.tr('✅ 응답 완료\n\n') if answered else self.tr('확인이 필요한 질문\n\n')
+        text = (heading + item['title'] + '\n\n' + '\n'.join(labels))[:3600]
+        if answered:
+            return text + self.tr('\n\n답변을 Codex에 전달했습니다.')
+        text += (self.tr('\n\n선택지를 누르거나 Other를 눌러 답변을 직접 입력해 주세요. 이 카드에 답장으로 입력해도 됩니다.')
+                 if item['options'] else self.tr('\n\n이 질문 메시지에 Telegram 답장으로 답변해 주세요.'))
+        return text + self.tr(' 질문은 1시간 동안 유효합니다.')
+
+    def complete_card(self, item):
+        if item['status'] != 'answered' or not item.get('message_id') or item.get('completion_displayed'):
+            return
+        try:
+            result = self.telegram.call('editMessageText', chat_id=self.telegram.chat_id,
+                message_id=item['message_id'], text=self.card_text(item),
+                reply_markup=json.dumps({'inline_keyboard': []}))
+        except Exception:
+            result = None
+        if isinstance(result, dict) and result.get('ok') is True:
+            item['completion_displayed'] = True
+            self.save()
+        else:
+            self.clear_buttons(item)  # UI failure must never reopen or resend an answer.
+
     def refresh_buttons(self, key, item):
+        if item['status'] == 'answered':
+            self.complete_card(item)
+            return
         if item['status'] == 'open':
-            buttons = [[{'text': f'{i+1}. {label.strip()}'[:64],
-                         'callback_data': f'{PREFIX}:{key}:{i}'}]
-                       for i, label in enumerate(item['options'])]
+            buttons = self.choice_buttons(key, item)
         elif item['status'] == 'uncertain':
             buttons = [[{'text': self.tr('터미널 질문 확인 · 선택지 복구'),
                          'callback_data': f'{PREFIX}:{key}:recover'}]]
@@ -108,6 +158,7 @@ class AsyncQuestions:
     def finish_submission(self, key, item, confirmed, error=None):
         if confirmed is True or item['status'] == 'answered':
             item['status'] = 'answered'
+            item.pop('input_message_id', None)
             item.pop('failure_stage', None)
             item.pop('failure_reason', None)
         elif isinstance(error, QuestionNotSubmitted):
@@ -181,13 +232,8 @@ class AsyncQuestions:
                     # A crash after send might have delivered; never blindly replay.
                     item['status'] = 'sending'
                     self.save()
-                    buttons = [[{'text': f'{i+1}. {label.strip()}'[:64],
-                                 'callback_data': f'{PREFIX}:{key}:{i}'}]
-                               for i, label in enumerate(item['options'])]
-                    labels = '\n'.join(f'{i+1}. {o}' for i, o in enumerate(item['options']))
-                    text = (self.tr('확인이 필요한 질문\n\n') + item['title'] + '\n\n' + labels)[:3600]
-                    text += (self.tr('\n\n버튼으로 선택해 주세요. 직접 입력은 표시된 선택지와 같은 답만 지원합니다.') if buttons else self.tr('\n\n이 질문 메시지에 Telegram 답장으로 답변해 주세요.'))
-                    text += self.tr(' 질문은 1시간 동안 유효합니다.')
+                    buttons = self.choice_buttons(key, item)
+                    text = self.card_text(item)
                     try:
                         result = self.telegram.call('sendMessage', chat_id=self.telegram.chat_id,
                                                     text=text, reply_markup=json.dumps({'inline_keyboard': buttons}, ensure_ascii=False))
@@ -195,7 +241,7 @@ class AsyncQuestions:
                     except Exception:
                         mid = None
                     item['message_id'] = mid
-                    item['status'] = 'open' if isinstance(mid, int) else 'uncertain'
+                    item['status'] = 'open' if type(mid) is int and mid > 0 else 'uncertain'
                     self.save()
 
     def observe_native_reply(self, record, session):
@@ -235,18 +281,25 @@ class AsyncQuestions:
             key = hashlib.sha256(f'{session}:{identity[1]}:{identity[2]}'.encode()).hexdigest()[:24]
             item = self.items.get(key)
             if (not item or item['session'] != session or item['call_id'] != identity[1]
-                    or item['status'] not in {'open', 'submitting', 'uncertain'}
+                    or item['status'] not in {'open', 'submitting', 'uncertain', 'answered'}
+                    or item.get('completion_displayed')
                     or received < item['created'] or reply.get('question') != item['title']
-                    or not isinstance(reply.get('answer'), str)
-                    or (item['options'] and reply['answer'] not in item['options'])):
+                    or not isinstance(reply.get('answer'), str) or not reply['answer'].strip()
+                    or any(ord(c) < 32 and c != '\n' for c in reply['answer'])
+                    or '\x7f' in reply['answer']):
                 continue
             item.update(status='answered', answered_at=received, answered_via='native_receipt')
-            if item['options']:
+            if reply['answer'] in item['options']:
                 item['selected'] = item['options'].index(reply['answer'])
+                item.pop('answer_mode', None)
+            else:
+                item.pop('selected', None)
+                item['answer_mode'] = 'other'
+            item.pop('input_message_id', None)
             item.pop('failure_stage', None)
             item.pop('failure_reason', None)
             self.save()
-            self.clear_buttons(item)
+            self.complete_card(item)
 
     def callback(self, callback, session):
         data = callback.get('data', '')
@@ -266,7 +319,7 @@ class AsyncQuestions:
                     pass  # An expired callback notification must not strand submitting state.
         with self.lock:
             parts = data.split(':')
-            if len(parts) != 3 or not (parts[2].isdigit() or parts[2] == 'recover'):
+            if len(parts) != 3 or not (parts[2].isdigit() or parts[2] in {'recover', 'other', 'cancel'}):
                 ack(self.tr('유효하지 않은 선택입니다.'))
                 return True
             item = self.items.get(parts[1])
@@ -295,12 +348,48 @@ class AsyncQuestions:
                 else:
                     ack(self.tr('터미널에서 같은 질문을 확인하지 못했습니다. 답변은 전송하지 않았습니다.'))
                 return True
+            if item['status'] != 'open':
+                if item['status'] == 'answered':
+                    self.complete_card(item)
+                ack(self.tr('이미 선택했거나 더 이상 사용할 수 없는 질문입니다.'))
+                return True
+            if parts[2] == 'cancel':
+                item.pop('input_message_id', None)
+                self.save()
+                self.refresh_buttons(parts[1], item)
+                ack(self.tr('직접 입력을 취소했습니다. 다른 선택지를 고를 수 있습니다.'))
+                return True
+            if parts[2] == 'other':
+                if not item['options']:
+                    ack(self.tr('유효하지 않은 선택입니다.'))
+                    return True
+                if item.get('input_message_id'):
+                    ack(self.tr('답변 입력 요청 메시지에 답장해 주세요.'))
+                    return True
+                ack(self.tr('직접 입력할 답변을 요청합니다.'))
+                try:
+                    result = self.telegram.call('sendMessage', chat_id=self.telegram.chat_id,
+                        text=self.tr('직접 입력 · Other\n\n{title}\n\n이 메시지에 답장으로 내용을 보내주세요. 입력을 그만두려면 원래 카드에서 직접 입력 취소를 누르세요.', title=item['title'][:3000]),
+                        reply_markup=json.dumps({'force_reply': True, 'selective': True}))
+                    mid = ((result or {}).get('result') or {}).get('message_id')
+                except Exception:
+                    mid = None
+                if type(mid) is int and mid > 0 and mid != item.get('message_id'):
+                    item.setdefault('input_message_ids', []).append(mid)
+                    item['input_message_id'] = mid
+                    self.save()
+                    self.refresh_buttons(parts[1], item)
+                else:
+                    self.telegram.send(self.tr('답변 입력 요청을 확인하지 못했습니다. 원래 질문 카드에 답장으로 내용을 보내주세요.'))
+                return True
             index = int(parts[2])
-            if item['status'] != 'open' or index >= len(item['options']):
+            if index >= len(item['options']):
                 ack(self.tr('이미 선택했거나 더 이상 사용할 수 없는 질문입니다.'))
                 return True
             text = '> ' + item['title'].replace('\n', '\n> ') + '\n\n' + item['options'][index]
             item.update(status='submitting', selected=index)
+            item.pop('input_message_id', None)
+            item.pop('answer_mode', None)
             self.save()  # Crash or ambiguous input failure must never repeat submission.
             ack(self.tr('선택한 답변을 Codex에 전달합니다.'))
             confirmed, error = False, None
@@ -323,7 +412,7 @@ class AsyncQuestions:
     def finish_reply(self, message_id, confirmed, error=None):
         with self.lock:
             for key, item in self.items.items():
-                if item.get('message_id') == message_id and item['status'] in {'submitting', 'uncertain'}:
+                if self.owns_message(item, message_id) and item['status'] in {'submitting', 'uncertain', 'answered'}:
                     self.finish_submission(key, item, confirmed, error)
 
     def reply_text(self, message, session):
@@ -337,7 +426,7 @@ class AsyncQuestions:
             return None
         with self.lock:
             owned = [item for item in self.items.values()
-                     if item.get('message_id') == reply['message_id']]
+                     if self.owns_message(item, reply['message_id'])]
             if not owned:
                 return None
             sender = message.get('from') or {}
@@ -349,6 +438,9 @@ class AsyncQuestions:
             item = owned[0]
             if item['session'] != session or item['status'] != 'open':
                 return ''
+            if (reply['message_id'] != item.get('message_id')
+                    and reply['message_id'] != item.get('input_message_id')):
+                return ''  # Cancelled/replaced input requests remain owned, never normal prompts.
             if self.clock() - item['created'] >= TTL:
                 item['status'] = 'expired'
                 self.save()
@@ -359,6 +451,10 @@ class AsyncQuestions:
                     or any(ord(c) < 32 and c != '\n' for c in answer) or '\x7f' in answer):
                 return ''
             item['status'] = 'submitting'
+            if reply['message_id'] == item.get('input_message_id'):
+                item['answer_mode'] = 'other'
+            else:
+                item.pop('answer_mode', None)
             self.save()
             self.clear_buttons(item)
             return '> ' + item['title'].replace('\n', '\n> ') + '\n\n' + answer

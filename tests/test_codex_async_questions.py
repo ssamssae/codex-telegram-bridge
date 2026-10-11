@@ -61,7 +61,8 @@ class QuestionsTest(unittest.TestCase):
         self.q.observe(accepted(), SESSION)
         kwargs = self.telegram.call.call_args.kwargs
         keys = json.loads(kwargs['reply_markup'])['inline_keyboard']
-        self.assertEqual(len(keys), 2)
+        self.assertEqual(len(keys), 3)
+        self.assertEqual(keys[-1][0]['text'], '3. Other')
         self.assertIn('어느 PR인가요?', kwargs['text'])
         self.assertLess(len(keys[0][0]['callback_data'].encode()), 64)
 
@@ -500,19 +501,17 @@ class FreeformBridgeIntegrationTest(unittest.TestCase):
         self.assertEqual(self.item['status'], 'open')
         self.repl.send_choice_text.assert_not_called()
 
-    def test_choice_card_free_text_reports_unsupported_answer_before_navigation(self):
+    def test_choice_card_free_text_requires_a_verified_native_other_option(self):
         self.item.update(status='open', options=['먼저 조사', '전체 진행'])
         self.b.prompt_from_telegram_message = Mock()
-        self.repl.capture_visible_screen.return_value = '? 1 question\nshift + ← to answer'
+        self.repl.capture_visible_screen.return_value = '설명해 주세요\n› 1. 먼저 조사\n  2. 전체 진행\nEnter to select'
         self.b.process_telegram_update({'update_id':1, 'message': {'message_id':77,
             'text':'추가 의견을 전달합니다', 'chat':{'id':123}, 'from':{'id':123},
             'reply_to_message':{'message_id':55}}})
         self.assertEqual(self.item['status'], 'open')
         self.b.telegram.send.assert_called_once()
-        self.assertIn('표시된 선택지', self.b.telegram.send.call_args.args[0])
-        self.assertIn('새 메시지', self.b.telegram.send.call_args.args[0])
-        self.assertNotIn('터미널의 해당 질문을 확인하지 못해', self.b.telegram.send.call_args.args[0])
-        self.repl.capture_visible_screen.assert_not_called()
+        self.assertEqual(self.item['failure_reason'], 'options_mismatch')
+        self.repl.capture_visible_screen.assert_called_once()
         self.repl.focus_pending_question.assert_not_called()
         self.repl.send_choice.assert_not_called()
         self.repl.send_choice_text.assert_not_called()
@@ -731,18 +730,28 @@ class NativeQuestionReceiptTest(unittest.TestCase):
         record = self.receipt(item)
         self.q.observe(record, SESSION); self.q.observe(record, SESSION)
         self.assertEqual(self.q.items[key]['status'], 'answered')
-        edits = [c for c in self.telegram.call.call_args_list if c.args[0] == 'editMessageReplyMarkup']
+        edits = [c for c in self.telegram.call.call_args_list if c.args[0] == 'editMessageText']
         self.assertEqual(len(edits), 1)
         self.assertEqual(json.loads(edits[0].kwargs['reply_markup']), {'inline_keyboard': []})
+        self.assertIn('✅ 응답 완료', edits[0].kwargs['text'])
+        self.assertIn('✅ 1. 첫 번째', edits[0].kwargs['text'])
         self.submit.assert_not_called()
 
     def test_wrong_receipts_do_not_close_or_submit(self):
         key = self.open(); item = self.q.items[key]
-        for changes in [{'call_id': 'other'}, {'index': 1}, {'title': '다른 질문'}, {'answer': '미지원 답변'}]:
+        for changes in [{'call_id': 'other'}, {'index': 1}, {'title': '다른 질문'}, {'answer': ' \n'}, {'answer': '\x1bunsafe'}]:
             self.q.observe(self.receipt(item, **changes), SESSION)
             self.assertEqual(item['status'], 'open')
         self.q.observe(self.receipt(item), '/other/session')
         self.assertEqual(item['status'], 'open')
+        self.submit.assert_not_called()
+
+    def test_native_other_answer_closes_the_exact_card_after_restart(self):
+        key = self.open(); item = self.q.items[key]
+        self.q = AsyncQuestions(self.path, self.telegram, self.submit, clock=lambda: self.now)
+        self.q.observe(self.receipt(item, answer='  직접 쓴 답변\n둘째 줄  '), SESSION)
+        self.assertEqual(self.q.items[key]['status'], 'answered')
+        self.assertEqual(self.q.items[key]['answer_mode'], 'other')
         self.submit.assert_not_called()
 
     def test_old_or_non_native_receipt_does_not_close(self):

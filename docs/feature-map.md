@@ -52,3 +52,8 @@ restart an installed bridge or perform a live Telegram round trip.
 
 Public export and regression suite: 299 tests. Run `python3 -m unittest discover -s tests` in a clean checkout. Tests use isolated state and captured senders; they do not send Telegram messages or reset a live session. Source assets are verified against the release tag, and release downloads are checked against `SHA256SUMS`.
 GitHub Pages rebuilds the existing `main:/docs` guide after merge. This static publication does not run a bridge service.
+
+## Release 0.9.18 verification
+
+Public export and regression suite: 328 tests. Run `python3 -m unittest discover -s tests` in a clean checkout. Tests use isolated state and captured senders; they do not send Telegram messages or reset a live session. Source assets are verified against the release tag, and release downloads are checked against `SHA256SUMS`.
+GitHub Pages rebuilds the existing `main:/docs` guide after merge. This static publication does not run a bridge service.
