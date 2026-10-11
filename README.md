@@ -5,6 +5,10 @@
 [![Release](https://img.shields.io/github/v/release/ssamssae/codex-telegram-bridge)](https://github.com/ssamssae/codex-telegram-bridge/releases)
 [![License: MIT](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
 
+![2x2 card of four Telegram bridges by ssamssae: Claude, Codex, Grok, and Cursor](https://raw.githubusercontent.com/ssamssae/codex-telegram-bridge/main/docs/assets/tgbridges_card.jpg)
+
+Four Telegram bridges, one family: [Claude](https://github.com/ssamssae/claude-telegram-bridge) · [Codex](https://github.com/ssamssae/codex-telegram-bridge) · [Grok](https://github.com/ssamssae/grok-telegram-bridge) · [Cursor](https://github.com/ssamssae/cursor-telegram-bridge).
+
 Control your live Codex CLI session from Telegram. Only Codex is supported.
 Other AI CLIs are intentionally out of scope; a Claude bridge should be a
 separate Claude-specific program, not a shared mode in this repository.

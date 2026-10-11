@@ -2,6 +2,10 @@
 
 [English](README.md) · [한국어](README.ko.md) · [Web guide · 웹 설명서](https://product.kangdaejong.com/codex-telegram-bridge/) · [Web verification](docs/feature-map.md)
 
+![ssamssae의 텔레그램 브릿지 네 가지를 담은 2x2 카드: Claude, Codex, Grok, Cursor](https://raw.githubusercontent.com/ssamssae/codex-telegram-bridge/main/docs/assets/tgbridges_card.jpg)
+
+텔레그램 브릿지 네 가지, 한 가족: [Claude](https://github.com/ssamssae/claude-telegram-bridge) · [Codex](https://github.com/ssamssae/codex-telegram-bridge) · [Grok](https://github.com/ssamssae/grok-telegram-bridge) · [Cursor](https://github.com/ssamssae/cursor-telegram-bridge).
+
 이번 GitHub 릴리스 `0.9.18`은 아래 명령으로 설치합니다. PyPI 패키지 버전은
 이번 발행에서 변경하지 않습니다.
 
