@@ -2,13 +2,6 @@
 
 [English](README.md) · [한국어](README.ko.md) · [Web guide · 웹 설명서](https://product.kangdaejong.com/codex-telegram-bridge/) · [Web verification](docs/feature-map.md)
 
-이번 GitHub 릴리스 `0.9.18`은 아래 명령으로 설치합니다. PyPI 패키지 버전은
-이번 발행에서 변경하지 않습니다.
-
-```bash
-pipx install "git+https://github.com/ssamssae/codex-telegram-bridge.git@v0.9.18"
-```
-
 컴퓨터에서 실행 중인 Codex CLI를 텔레그램으로 조작하는 브릿지입니다.
 휴대폰에서 질문·이미지·영상·음성·파일을 보내고, 같은 Codex 대화의 답변을
 텔레그램으로 받습니다. Codex 전용이며 별도 AI 대화를 만들지 않습니다.
@@ -91,16 +84,6 @@ codex-telegram-bridge setup --mode exec --language ko
 | 승인·선택 답변 | 현재 질문 카드의 버튼 선택 |
 | 직접 답변 | 카드가 직접 입력을 요청한 경우 해당 메시지에 답장 |
 | 이미지·음성·파일 | `repl` 모드에서 봇으로 전송 |
-
-POSIX `tmux` 연결에서 `CRB_FLOW_MIRROR=1`을 설정하면 진행 카드에 **중지**
-버튼이 표시될 수 있습니다. 버튼은 현재 세션과 작업을 다시 확인한 뒤 중단을
-요청합니다. 오래된 카드, 입력 중인 초안, 승인 대기 화면에서는 실행하지 않습니다.
-
-Codex가 대기 입력과 `press esc to interrupt and send immediately` 안내를
-10초 이상 표시하면 **지금 반영** 버튼을 제공합니다. 이 버튼은 Codex의 기본
-동작으로 해당 대기 입력을 반영합니다. 일반 Tab 대기열에는 적용하지 않습니다.
-이 버튼들은 기본 Windows와 일회성 `exec` 모드에서 제공하지 않습니다.
-WSL과 `tmux` 연결에서는 사용할 수 있습니다.
 
 질문 카드에서 지원하지 않는 자유 답변이나 만료된 질문에 대한 답장을 보내도
 일반 Codex 입력으로 자동 전환하지 않습니다. 제출 여부가 불명확할 때도

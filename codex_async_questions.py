@@ -9,6 +9,34 @@ import time
 from datetime import datetime
 from pathlib import Path
 
+# ─ Codex question panel vocabulary (T-261015-010) ─────────────────────────────
+# One place for the native wording of Codex's queued-input / Other / Type-your-
+# answer panels. Before 2026-10-15 the header and footer were spelled separately
+# here and in codex-repl-telegram-bridge.py and had already drifted: the bridge
+# accepted the ● bullet and the Linux "alt" key, this module accepted the · bullet
+# and only ⌥/⎇. Both readers now share the union below.
+# scripts/tests/test_codex_bridge_question_panel_vocabulary.py fails when a new
+# inline copy appears outside this block in either file.
+QUEUED_INPUTS_TITLE = 'Queued follow-up inputs'
+QUEUED_INPUTS_LEGACY_TITLE = 'Messages to be submitted'
+# Header row; the bullet varies by version/terminal (• · ●) or is absent.
+QUEUED_INPUTS_HEADER_RE = re.compile(r'\s*(?:[•·●]\s*)?Queued follow-up inputs\s*')
+# Footer row; the modifier renders as alt (Linux) or ⌥/⎇ (mac).
+QUEUED_INPUTS_FOOTER_RE = re.compile(
+    r'\s*enter submit\s+ctrl \+ \] skip\s+(?:alt|⌥|⎇) \+ ↓ main prompt\s*', re.IGNORECASE)
+EDITOR_SUBMIT_HINT_RE = re.compile(r'\benter\s+submit\b', re.IGNORECASE)
+EDITOR_SUBMIT_SKIP_HINT_RE = re.compile(r'\benter\s+submit\b.*\bskip\b', re.IGNORECASE)
+# Placeholder of the empty Type-your-answer editor (English and Korean builds).
+EMPTY_ANSWER_HINT_RE = re.compile(r'type (?:your |an? )?answer|type something|답변을 입력', re.IGNORECASE)
+OTHER_LABEL = 'Other'
+OTHER_LABELS = frozenset({'other', '기타', '직접 입력'})
+
+
+def is_other_label(label) -> bool:
+    """True for the native free-text option label in any observed language."""
+    return (label or '').strip().casefold() in OTHER_LABELS
+# ─ end Codex question panel vocabulary ────────────────────────────────────────
+
 PREFIX = 'crb_asyncq'
 TTL = 3600
 FAILURE_REASONS = {
@@ -23,6 +51,35 @@ FAILURE_REASONS = {
     'selection_unknown': '현재 선택 위치를 확인하지 못했습니다.',
     'invalid_answer': '이 질문에 제출할 수 없는 답변입니다.',
 }
+# Codex 0.162 drops every pending async question when the live turn ends or a
+# new prompt is submitted (tui bottom_pane/async_questions/state.rs
+# take_pending_drafts -> clear_pending). Such a card can never be submitted.
+CLOSE_REASONS = {
+    'turn_ended': 'Codex 작업이 끝나 이 질문은 닫혔습니다.',
+    'new_prompt': '새 메시지가 들어와 Codex가 이 질문을 닫았습니다.',
+}
+# Injected user-role rows that the user did not submit as a prompt.
+CONTEXT_PREFIXES = ('<environment_context>', '# AGENTS.md instructions', '<turn_aborted>',
+                    '<user_instructions>', '<hook_prompt', '<send_user_message_question_reply>')
+
+
+def record_time(record):
+    try:
+        return datetime.fromisoformat(record['timestamp'].replace('Z', '+00:00')).timestamp()
+    except (ValueError, KeyError, TypeError, AttributeError):
+        return None
+
+
+def submitted_prompt(payload):
+    content = payload.get('content')
+    if not isinstance(content, list):
+        return False
+    text = ''.join(part.get('text', '') for part in content
+                   if isinstance(part, dict) and part.get('type') == 'input_text'
+                   and isinstance(part.get('text'), str))
+    if text.strip():
+        return not text.lstrip().startswith(CONTEXT_PREFIXES)
+    return any(isinstance(part, dict) and part.get('type') == 'input_image' for part in content)
 
 
 class QuestionNotSubmitted(RuntimeError):
@@ -98,7 +155,7 @@ class AsyncQuestions:
                      'callback_data': f'{PREFIX}:{key}:{i}'}]
                    for i, label in enumerate(item['options'])]
         if item['options']:
-            buttons.append([{'text': f'{len(item["options"])+1}. Other',
+            buttons.append([{'text': f'{len(item["options"])+1}. {OTHER_LABEL}',
                              'callback_data': f'{PREFIX}:{key}:other'}])
         if item.get('input_message_id'):
             buttons.append([{'text': self.tr('직접 입력 취소'),
@@ -107,17 +164,22 @@ class AsyncQuestions:
 
     def card_text(self, item):
         answered = item['status'] == 'answered'
+        closed = item['status'] == 'closed'
         labels = []
         for i, option in enumerate(item['options']):
             mark = '✅ ' if answered and item.get('selected') == i else ''
             labels.append(f'{mark}{i+1}. {option}')
         if item['options']:
             mark = '✅ ' if answered and item.get('answer_mode') == 'other' else ''
-            labels.append(f'{mark}{len(item["options"])+1}. Other')
-        heading = self.tr('✅ 응답 완료\n\n') if answered else self.tr('확인이 필요한 질문\n\n')
+            labels.append(f'{mark}{len(item["options"])+1}. {OTHER_LABEL}')
+        heading = (self.tr('✅ 응답 완료\n\n') if answered else
+                   self.tr('닫힌 질문\n\n') if closed else self.tr('확인이 필요한 질문\n\n'))
         text = (heading + item['title'] + '\n\n' + '\n'.join(labels))[:3600]
         if answered:
             return text + self.tr('\n\n답변을 Codex에 전달했습니다.')
+        if closed:
+            reason = CLOSE_REASONS.get(item.get('closed_reason'), CLOSE_REASONS['turn_ended'])
+            return text + '\n\n' + self.tr(reason) + self.tr(' 답은 새 메시지로 보내 주세요.')
         text += (self.tr('\n\n선택지를 누르거나 Other를 눌러 답변을 직접 입력해 주세요. 이 카드에 답장으로 입력해도 됩니다.')
                  if item['options'] else self.tr('\n\n이 질문 메시지에 Telegram 답장으로 답변해 주세요.'))
         return text + self.tr(' 질문은 1시간 동안 유효합니다.')
@@ -136,6 +198,34 @@ class AsyncQuestions:
             self.save()
         else:
             self.clear_buttons(item)  # UI failure must never reopen or resend an answer.
+
+    def display_closed(self, item):
+        if item['status'] != 'closed' or not item.get('message_id') or item.get('closed_displayed'):
+            return
+        try:
+            result = self.telegram.call('editMessageText', chat_id=self.telegram.chat_id,
+                message_id=item['message_id'], text=self.card_text(item),
+                reply_markup=json.dumps({'inline_keyboard': []}))
+        except Exception:
+            result = None
+        if isinstance(result, dict) and result.get('ok') is True:
+            item['closed_displayed'] = True
+            self.save()
+        else:
+            self.clear_buttons(item)  # A dead native question must never look answerable.
+
+    def close_open_cards(self, session, at, reason):
+        """Close cards whose native question Codex already dropped; never submit."""
+        closed = []
+        for item in self.items.values():
+            if item['session'] == session and item['status'] == 'open' and item['created'] < at:
+                item.update(status='closed', closed_reason=reason)
+                item.pop('input_message_id', None)
+                closed.append(item)
+        if closed:
+            self.save()
+            for item in closed:
+                self.display_closed(item)
 
     def refresh_buttons(self, key, item):
         if item['status'] == 'answered':
@@ -183,15 +273,23 @@ class AsyncQuestions:
             self.telegram.send(self.tr('선택 답변의 전달 여부를 확인하지 못했습니다. 자동 재전송하지 않습니다. 아래 질문 확인 버튼으로 선택지를 복구할 수 있습니다.'))
 
     def observe(self, record, session):
-        if not session or record.get('type') != 'response_item':
+        if not session or record.get('type') not in {'response_item', 'event_msg'}:
             return
         p = record.get('payload') or {}
         if not isinstance(p, dict):
             return
         with self.lock:
             now = self.clock()
+            if record['type'] == 'event_msg':
+                ended = record_time(record)
+                if p.get('type') in {'task_complete', 'turn_aborted'} and ended is not None:
+                    self.close_open_cards(session, ended, 'turn_ended')
+                return
             if p.get('type') == 'message' and p.get('role') == 'user':
                 self.observe_native_reply(record, session)
+                received = record_time(record)
+                if submitted_prompt(p) and received is not None:
+                    self.close_open_cards(session, received, 'new_prompt')
                 return
             if p.get('type') == 'function_call' and str(p.get('name') or '').split('.')[-1] == 'request_user_input_async':
                 try:
@@ -325,6 +423,10 @@ class AsyncQuestions:
             item = self.items.get(parts[1])
             if not item or item.get('message_id') != message.get('message_id') or item['session'] != session:
                 ack(self.tr('현재 대화의 질문이 아닙니다.'))
+                return True
+            if item['status'] == 'closed':
+                self.display_closed(item)
+                ack(self.tr('닫힌 질문입니다. 답은 새 메시지로 보내 주세요.'))
                 return True
             if self.clock() - item['created'] >= TTL:
                 item['status'] = 'expired'
@@ -467,10 +569,8 @@ def freeform_editor(screen, title):
     multiple panels are ambiguous. Preserve answer contents, including newlines.
     """
     lines = screen.splitlines()
-    heads = [i for i, line in enumerate(lines)
-             if re.fullmatch(r'\s*[•·]?\s*Queued follow-up inputs\s*', line)]
-    feet = [i for i, line in enumerate(lines) if re.fullmatch(
-        r'\s*enter submit\s+ctrl \+ \] skip\s+[⌥⎇] \+ ↓ main prompt\s*', line, re.I)]
+    heads = [i for i, line in enumerate(lines) if QUEUED_INPUTS_HEADER_RE.fullmatch(line)]
+    feet = [i for i, line in enumerate(lines) if QUEUED_INPUTS_FOOTER_RE.fullmatch(line)]
     if len(heads) != 1 or len(feet) != 1 or feet[0] <= heads[0]:
         return None
     body = lines[heads[0] + 1:feet[0]]

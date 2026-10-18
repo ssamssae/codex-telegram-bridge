@@ -47,7 +47,11 @@ if _SCRIPTS_DIR not in sys.path:
 import bridge_flow_progress as _flow_progress  # noqa: E402
 from bridge_public_text import strip_memory_citation  # noqa: E402
 from bridge_i18n import Language, translate  # noqa: E402
-from codex_async_questions import AsyncQuestions, QuestionNotSubmitted, UnsupportedChoiceAnswer, freeform_editor, PREFIX as ASYNC_QUESTION_PREFIX
+from codex_async_questions import (
+    AsyncQuestions, QuestionNotSubmitted, UnsupportedChoiceAnswer, freeform_editor, PREFIX as ASYNC_QUESTION_PREFIX,
+    QUEUED_INPUTS_TITLE, QUEUED_INPUTS_LEGACY_TITLE, QUEUED_INPUTS_HEADER_RE, QUEUED_INPUTS_FOOTER_RE,
+    EDITOR_SUBMIT_HINT_RE, EDITOR_SUBMIT_SKIP_HINT_RE, EMPTY_ANSWER_HINT_RE, is_other_label,
+)
 from codex_side_reply import SideReplyMirror, latest_completed_side_reply, is_side_screen, prompt_key  # noqa: E402
 
 try:
@@ -333,9 +337,43 @@ CLEAR_SLASH_DELIVERED = "클리어 요청을 전달했습니다. 세션 전환�
 CLEAR_SLASH_BUSY = "지금 다른 작업 중이라 클리어는 실행하지 않았습니다. 작업이 끝난 뒤 다시 요청해 주세요."
 CLEAR_SLASH_SIDE_UNAVAILABLE = "이전 /clear는 보조 대화에서 거부돼 세션을 비우지 않았어. 이제 텔레그램에서 /clear를 다시 보내면 메인 대화 전환부터 처리할게."
 CLEAR_SLASH_SWITCH_FAILED = "메인 대화로 전환된 것을 확인하지 못해 초기화하지 않았어. 잠시 뒤 텔레그램에서 /clear를 다시 보내줘."
-CLEAR_SLASH_TIMEOUT = "세션 전환을 확인하지 못했습니다. 완료로 표시하지 않습니다."
+CLEAR_SLASH_TIMEOUT = "세션 전환 확인이 지연됐습니다. 초기화 실패로 단정하지 않으며, 완료로 표시하지 않습니다."
 CLEAR_WATCH_TIMEOUT_SEC = 90
-CLEAR_IDLE_COMPOSER_RE = re.compile(r"Ask Codex to do anything", re.IGNORECASE)
+# ─ Codex screen vocabulary — the ONE place these TUI markers are spelled (T-261015-010) ──
+# Every reader of the visible Codex pane (clear identity probe, pending-clear
+# confirm, question focus, suggestion confirm, status text) must go through the
+# names below. 2026-10-11~14 the same /clear screen symptom was patched 12 times
+# because the same wording lived in eight inline copies; one TUI change now
+# lands here once. scripts/tests/test_codex_bridge_screen_vocabulary.py fails
+# when a new inline copy appears outside this block.
+CODEX_PRODUCT_NAME = "OpenAI Codex"
+CODEX_COMPOSER_PLACEHOLDERS = ("Ask Codex to do anything", "Ask a follow-up question")
+CODEX_COMPOSER_PLACEHOLDER_PATTERN = r"Ask (?:Codex to do anything|a follow-up question)"
+# Stripped prompt line of an empty composer (main or follow-up).
+CODEX_EMPTY_COMPOSER_RE = re.compile(r"[›»] " + CODEX_COMPOSER_PLACEHOLDER_PATTERN)
+# Stripped prompt line of the empty MAIN composer only (a fresh thread).
+CODEX_EMPTY_MAIN_COMPOSER_RE = re.compile(r"[›»] " + CODEX_COMPOSER_PLACEHOLDERS[0])
+CODEX_FOOTER_WARNINGS_PATTERN = r"(?:\s+⚠\ufe0f?\s*\d+\s+warnings?\s*·\s*f2 to view)?"
+# Last footer line: "? for shortcuts", optionally with the warnings tail …
+CODEX_FOOTER_SHORTCUTS_RE = re.compile(r"\? for shortcuts" + CODEX_FOOTER_WARNINGS_PATTERN)
+# … and optionally the 0.162 "← for agents ·" prefix.
+CODEX_FOOTER_SHORTCUTS_OR_AGENTS_RE = re.compile(
+    r"(?:← for agents\s*·\s*)?\? for shortcuts" + CODEX_FOOTER_WARNINGS_PATTERN)
+CODEX_TITLE_RE = re.compile(r">_ OpenAI Codex \(v[^)]+\)")
+CODEX_TITLE_LINE_RE = re.compile(r"\s*" + CODEX_TITLE_RE.pattern + r"\s*")
+CODEX_SESSION_FIELD_RE = re.compile(r"Session(?: ID)?:")
+CODEX_SESSION_FIELD_VALUE_RE = re.compile(CODEX_SESSION_FIELD_RE.pattern + r"\s*(.*)")
+CODEX_BRAILLE_RE = re.compile(r"[\u2800-\u28ff]")
+CODEX_BRAILLE_ONLY_RE = re.compile(r"[ \u2800-\u28ff]+")
+# Inside a fresh /status reply nothing but the command echo and an empty
+# composer may precede the card: another command, a draft or foreign input
+# means the reply is not ours.
+CLEAR_PROBE_FOREIGN_INPUT_RE = re.compile(
+    r"(?m)^\s*(?:/(?!status\s*$)\w+|[›»] (?!" + CODEX_COMPOSER_PLACEHOLDER_PATTERN + r"\s*$|/status\s*$)\S)")
+# A Session row inside a bordered or borderless card.
+CLEAR_STATUS_SESSION_ROW_RE = re.compile(r"(?m)^\s*(?:│\s*)?" + CODEX_SESSION_FIELD_RE.pattern)
+# ─ end Codex screen vocabulary ────────────────────────────────────────────────
+CLEAR_IDLE_COMPOSER_RE = re.compile(CODEX_COMPOSER_PLACEHOLDERS[0], re.IGNORECASE)
 CLEAR_RESUME_HINT_RE = re.compile(
     r"To continue this session,\s*run\s+codex resume.*?([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})",
     re.IGNORECASE | re.DOTALL,
@@ -361,6 +399,142 @@ CLEAR_RESUME_UUID_INCOMPLETE_OPEN_RE = re.compile(
 # (capture-pane -J does not join that wrap). Blank line ends the block.
 CLEAR_RESUME_HINT_WRAP_LINES = 5
 CLEAR_DISABLED_RE = re.compile(r"'/clear' is disabled while a task is in progress", re.IGNORECASE)
+# Codex 0.162.1 /status fields above Session, in render order, and whether
+# the card always renders them (tui/src/status/card.rs).
+CLEAR_STATUS_IDENTITY_FIELDS = (
+    ("Model", True), ("Model provider", False), ("Directory", True),
+    ("Permissions", True), ("Agents.md", True), ("Account", False),
+    ("Thread name", False), ("Collaboration mode", False),
+)
+# A field row keeps the card's two-column indent; value continuations are deeper.
+CLEAR_STATUS_FIELD_ROW_RE = re.compile(r" {0,2}([^\s:][^:]*):(?:\s.*)?")
+# ─ /clear probe screen sidecar (T-261015-010) ───────────────────────────────
+# The identity probe logs stage codes only (never terminal text). When a stage
+# fails because the screen was not recognised, keep a MASKED copy of that screen
+# under <state_dir>/clear-screen-sidecar so the next fix starts from the real
+# capture instead of a hand-rebuilt one (2026-10-11~14: the same symptom was
+# patched 12 times while only 2 of ~21 test screens were real captures).
+# Masking keeps every line's length and columns so wraps and crops survive:
+# hex ids → 0, e-mail/home user → u/x, thread name → x. Files are 0600, newest
+# CLEAR_SIDECAR_KEEP groups only. CRB_CLEAR_SIDECAR=0 turns it off.
+CLEAR_SIDECAR_SCHEMA = "codex-repl-bridge-clear-screen-sidecar/v1"
+CLEAR_SIDECAR_DIRNAME = "clear-screen-sidecar"
+CLEAR_SIDECAR_KEEP = 20
+CLEAR_SIDECAR_MAX_CHARS = 65536
+CLEAR_SIDECAR_REASONS = frozenset({
+    "composer_not_idle", "composer_changed_after_view_clear",
+    "reset_view_unrecognized", "fresh_status_unrecognized",
+})
+_CLEAR_SIDECAR_EMAIL_RE = re.compile(r"([A-Za-z0-9._%+-]+)@([A-Za-z0-9.-]+\.[A-Za-z]{2,})")
+_CLEAR_SIDECAR_HOME_RE = re.compile(r"((?:^|[\s/\\])(?:Users|home)[/\\])([^/\\\s]+)")
+_CLEAR_SIDECAR_HEX_TOKEN_RE = re.compile(
+    r"(?<![0-9A-Za-z_.])(?=[0-9a-fA-F-]*[0-9a-fA-F])[0-9a-fA-F-]{8,}(?![0-9A-Za-z_.])")
+_CLEAR_SIDECAR_HEX_TAIL_RE = re.compile(r"^(\s*)((?=[0-9a-fA-F-]*[0-9a-fA-F])[0-9a-fA-F-]{4,})(\s*)$")
+_CLEAR_SIDECAR_THREAD_RE = re.compile(r"^(\s*Thread name:\s*)(.*)$")
+_CLEAR_SIDECAR_FIELD_RE = re.compile(r"^\s{0,2}[A-Za-z][A-Za-z. ]*:")
+
+
+def _clear_sidecar_zero_hex(match: "re.Match[str]") -> str:
+    return re.sub(r"[0-9a-fA-F]", "0", match.group(0))
+
+
+def mask_clear_screen(text: str) -> str:
+    """Mask identities in a pane capture while keeping each line's length."""
+    out = []
+    thread_value = False
+    for line in text.splitlines():
+        thread = _CLEAR_SIDECAR_THREAD_RE.match(line)
+        if thread:
+            line = thread.group(1) + re.sub(r"\S", "x", thread.group(2))
+            thread_value = True
+        elif thread_value and re.match(r"^\s{10,}\S", line) and not _CLEAR_SIDECAR_FIELD_RE.match(line):
+            line = re.sub(r"\S", "x", line)
+        else:
+            thread_value = False
+        line = _CLEAR_SIDECAR_EMAIL_RE.sub(
+            lambda m: "u" * len(m.group(1)) + "@" + re.sub(r"[^.]", "x", m.group(2)), line)
+        line = _CLEAR_SIDECAR_HOME_RE.sub(lambda m: m.group(1) + "u" * len(m.group(2)), line)
+        line = _CLEAR_SIDECAR_HEX_TOKEN_RE.sub(_clear_sidecar_zero_hex, line)
+        line = _CLEAR_SIDECAR_HEX_TAIL_RE.sub(
+            lambda m: m.group(1) + re.sub(r"[0-9a-fA-F]", "0", m.group(2)) + m.group(3), line)
+        out.append(line)
+    return "\n".join(out) + ("\n" if text.endswith("\n") else "")
+
+
+def _write_private_text(path: Path, text: str) -> None:
+    fd, tmp = tempfile.mkstemp(prefix=path.name + ".", dir=str(path.parent))
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            fh.write(text)
+        os.chmod(tmp, 0o600)
+        os.replace(tmp, path)
+    except Exception:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+
+
+def prune_clear_probe_sidecar(directory: Path, keep: int = CLEAR_SIDECAR_KEEP) -> int:
+    """Drop the oldest capture groups (.txt/.reply.txt/.json) beyond ``keep``."""
+    groups = sorted(
+        p for p in directory.glob("*.txt") if not p.name.endswith(".reply.txt"))
+    removed = 0
+    for stale in groups[:-keep] if keep > 0 else groups:
+        for sibling in (stale, stale.with_suffix(".reply.txt"), stale.with_suffix(".json")):
+            try:
+                sibling.unlink()
+                removed += 1
+            except OSError:
+                pass
+    return removed
+
+
+def write_clear_probe_sidecar(state_dir, reason: str, visible: str, reply: str = "",
+                              alternate=None):
+    """Keep a masked copy of a screen the /clear probe could not recognise."""
+    if os.environ.get("CRB_CLEAR_SIDECAR", "1").strip().lower() in {"0", "off", "false", "no"}:
+        return None
+    if reason not in CLEAR_SIDECAR_REASONS or not state_dir or not (visible or reply):
+        return None
+    try:
+        directory = Path(state_dir) / CLEAR_SIDECAR_DIRNAME
+        directory.mkdir(parents=True, exist_ok=True)
+        try:
+            os.chmod(directory, 0o700)
+        except OSError:
+            pass
+        base = f"{time.strftime('%Y%m%dT%H%M%S', time.localtime())}-{reason}"
+        path = directory / f"{base}.txt"
+        serial = 1
+        while path.exists():
+            serial += 1
+            path = directory / f"{base}-{serial}.txt"
+        screen = mask_clear_screen(visible or "")[:CLEAR_SIDECAR_MAX_CHARS]
+        extra = ""
+        if reply and reply != visible:
+            extra = mask_clear_screen(reply)[:CLEAR_SIDECAR_MAX_CHARS]
+        rows = screen.splitlines()
+        meta = {
+            "schema": CLEAR_SIDECAR_SCHEMA, "reason": reason, "recorded_at": now_ts(),
+            "alternate": alternate, "rows": len(rows),
+            "cols": max((len(row) for row in rows), default=0), "masked": True,
+            "screen_file": path.name,
+            "reply_file": path.with_suffix(".reply.txt").name if extra else None,
+        }
+        _write_private_text(path, screen)
+        if extra:
+            _write_private_text(path.with_suffix(".reply.txt"), extra)
+        _write_private_text(path.with_suffix(".json"), json.dumps(meta, ensure_ascii=False, indent=1) + "\n")
+        prune_clear_probe_sidecar(directory)
+        log("CLEAR", f"probe screen sidecar: {reason} -> {path.name}")
+        return path
+    except Exception as exc:  # the sidecar must never break the probe
+        log("CLEAR", f"probe screen sidecar skipped: {type(exc).__name__}")
+        return None
+
+
 ROLLOUT_SESSION_ID_RE = re.compile(
     r"([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})(?:\.jsonl)?$",
     re.IGNORECASE,
@@ -382,7 +556,7 @@ REPL_WORKING_STATUS_RE = re.compile(
     r"^(?:[•◦*]\s*)?Working(?:\s*\([^)]*\)?(?:\s*[·•].*)?)?$",
     re.IGNORECASE,
 )
-REPL_QUEUED_RE = re.compile(r"\bQueued follow-up inputs\b", re.IGNORECASE)
+REPL_QUEUED_RE = re.compile(r"\b" + re.escape(QUEUED_INPUTS_TITLE) + r"\b", re.IGNORECASE)
 REPL_IDLE_DONE_RE = re.compile(r"\bGoal achieved\b", re.IGNORECASE)
 REPL_PROMPT_READY_RE = re.compile(r"^[›>]\s*(?:$|.+)")
 FOOTER_CONTEXT_RE = re.compile(r"\bContext\s+(?P<used>\d{1,3})%\s+used\b", re.IGNORECASE)
@@ -1123,7 +1297,7 @@ def extract_codex_status_text(screen: str) -> str:
     lines = (screen or "").splitlines()
     header_index = None
     for index in range(len(lines) - 1, -1, -1):
-        if "OpenAI Codex" in lines[index]:
+        if CODEX_PRODUCT_NAME in lines[index]:
             header_index = index
             break
     if header_index is None:
@@ -1173,7 +1347,7 @@ def normalize_codex_status_box_lines(lines: list[str]) -> list[str]:
         if STATUS_BOX_LIMIT_RE.search(stripped):
             normalized.append(stripped)
             continue
-        if stripped == "OpenAI Codex" or stripped.startswith(("Model:", "Path:", "Context window:")):
+        if stripped == CODEX_PRODUCT_NAME or stripped.startswith(("Model:", "Path:", "Context window:")):
             normalized.append(stripped)
             continue
         if STATUS_BOX_FRAGMENT_RE.fullmatch(stripped):
@@ -1382,6 +1556,135 @@ def extract_unrecognized_slash_error(screen: str, command: str) -> str:
 def rollout_session_id(path: str) -> str:
     match = ROLLOUT_SESSION_ID_RE.search(str(path or "").replace("\\", "/"))
     return match.group(1).lower() if match else ""
+
+
+def clear_identity_probe_ready(screen: str) -> bool:
+    """Only probe a visibly idle main composer, preserving drafts and questions."""
+    if (is_side_screen(screen) or screen_has_repl_busy_marker(screen)
+            or parse_approval_prompt(screen) or parse_choice_prompt(screen)):
+        return False
+    lines = clean_pane_lines(screen)
+    prompts = [i for i, line in enumerate(lines) if line.lstrip().startswith(("›", "»"))]
+    if not prompts or not CODEX_EMPTY_COMPOSER_RE.fullmatch(lines[prompts[-1]].strip()):
+        return False
+    footer = [line.strip() for line in lines[prompts[-1] + 1:] if line.strip()]
+    return (len(footer) in (1, 2) and bool(parse_codex_footer_status(footer[0]))
+            and (len(footer) == 1 or bool(CODEX_FOOTER_SHORTCUTS_OR_AGENTS_RE.fullmatch(footer[1]))))
+
+
+def clear_probe_view_is_reset(screen: str) -> bool:
+    """Recognize the empty view after Ctrl+L, before requesting fresh status."""
+    if not clear_identity_probe_ready(screen):
+        return False
+    lines = clean_pane_lines(screen)
+    prompt = max(i for i, line in enumerate(lines) if line.lstrip().startswith(("›", "»")))
+    prefix = [line.strip() for line in lines[:prompt] if line.strip()]
+    if not prefix:
+        return True
+    # Codex 0.162 keeps its title/cwd and, when space permits, a braille logo.
+    # Only that decorative alphabet may follow the banner. Status fields,
+    # transcript text and unknown chrome must still prevent a fresh probe.
+    footer = parse_codex_footer_status("\n".join(lines[prompt + 1:]))
+    if not (len(prefix) >= 2
+            and CODEX_TITLE_RE.fullmatch(prefix[0])
+            and prefix[1] == footer.get("path")):
+        return False
+    # With approvals and the sandbox both off, the 0.162 session header adds
+    # exactly one "permissions: YOLO mode" line (tui history_cell/session.rs)
+    # that survives Ctrl+L like the title/cwd. Other wording, the capitalized
+    # status-card field and a repeated line stay unrecognized.
+    logo = prefix[2:]
+    if logo and logo[0] == "permissions: YOLO mode":
+        logo = logo[1:]
+    return all(CODEX_BRAILLE_ONLY_RE.fullmatch(line) for line in logo)
+
+
+def clear_cropped_status_fields(screen: str) -> list[str]:
+    """Recognize the native status layout when the screen top crops its start.
+
+    A tall card (a wrapped thread name or session value) on a 55x23 alternate
+    screen loses its title, then Model and later fields. Above the sole Session
+    field only field rows and their indented value continuations may appear,
+    up to Model or the first screen row, with the native identity fields in
+    render order. A field the card always renders may be missing only above
+    the first visible one, where only the cut-off continuation of an earlier
+    value can remain.
+    """
+    rows = [line.rstrip() for line in ANSI_RE.sub("", screen).splitlines()]
+    fields = [line.strip() for line in rows]
+    sessions = [i for i, line in enumerate(fields) if CODEX_SESSION_FIELD_RE.match(line)]
+    if len(sessions) != 1:
+        return []
+    order = [label for label, _ in CLEAR_STATUS_IDENTITY_FIELDS]
+    seen: list[int] = []
+    for row in reversed(rows[:sessions[0]]):
+        if row.startswith("   "):
+            continue
+        match = CLEAR_STATUS_FIELD_ROW_RE.fullmatch(row)
+        # Blank rows, transcript and other chrome do not belong to this part.
+        if not match:
+            return []
+        # Newer Codex releases add fields; only the known ones carry evidence.
+        if match[1] not in order:
+            continue
+        index = order.index(match[1])
+        if seen and index >= seen[-1]:
+            return []
+        seen.append(index)
+        if index == 0:
+            break
+    if len(seen) < 2 or any(always and index > seen[-1] and index not in seen
+                            for index, (_, always) in enumerate(CLEAR_STATUS_IDENTITY_FIELDS)):
+        return []
+    if any((match := CLEAR_STATUS_FIELD_ROW_RE.fullmatch(row)) and match[1] in order
+           for row in rows[sessions[0] + 1:]):
+        return []
+    # Preserve blank rows: they must not join unrelated UUID fragments.
+    return fields
+
+
+def clear_status_session_id(screen: str, *, allow_cropped: bool = False) -> str:
+    """Read one native status field, including narrow TUI hard wraps."""
+    lines = ANSI_RE.sub("", screen).splitlines()
+    starts = [i for i, line in enumerate(lines) if line.strip().startswith("╭")]
+    if not starts:
+        headers = [i for i, line in enumerate(lines)
+                   if CODEX_TITLE_LINE_RE.fullmatch(line)]
+        if len(headers) == 1:
+            fields = [line.strip() for line in lines[headers[0] + 1:]]
+        elif not headers and allow_cropped:
+            # 55x23 alternate screens crop the command and title. This path
+            # is allowed only after observing the empty Ctrl+L view locally.
+            fields = clear_cropped_status_fields(screen)
+            if not fields:
+                return ""
+        else:
+            return ""
+    else:
+        box = lines[starts[-1]:]
+        ends = [i for i, line in enumerate(box) if line.strip().startswith("╰")]
+        if not ends:
+            return ""
+        box = box[:ends[0] + 1]
+        if not any(CODEX_PRODUCT_NAME in line for line in box):
+            return ""
+        fields = [match[1].strip() if (match := re.fullmatch(r"\s*│(.*)│\s*", line))
+                  else "" for line in box]
+    sessions = [(i, match[1]) for i, line in enumerate(fields)
+                if (match := CODEX_SESSION_FIELD_VALUE_RE.fullmatch(line))]
+    if len(sessions) != 1:
+        return ""
+    index, value = sessions[0]
+    for continuation in fields[index + 1:index + 4]:
+        if len(value) >= 36:
+            break
+        # Only adjacent UUID fragments belong to this field. A blank line,
+        # another label, a prompt or prose must never supply a missing suffix.
+        if not re.fullmatch(r"[0-9a-fA-F-]+", continuation):
+            break
+        value += continuation
+    return value.lower() if re.fullmatch(
+        r"[0-9a-fA-F]{8}(?:-[0-9a-fA-F]{4}){3}-[0-9a-fA-F]{12}", value) else ""
 
 
 def _incomplete_resume_uuid_open(line: str) -> bool:
@@ -4285,6 +4588,119 @@ class TmuxTransport:
     # Compatibility aliases for external callers during the transport rename.
     capture_pane = capture_screen
 
+    def _clear_status_id_unlocked(self) -> str:
+        # /status is a native, non-model command. Never clear somebody's draft
+        # to issue it, and do not accept an unchanged/stale status in history.
+        seen = {"visible": "", "reply": "", "alternate": None}
+
+        def blocked(reason: str) -> str:
+            # Stage codes only: never log terminal text, account or session IDs.
+            # The unrecognised screen itself goes to the masked local sidecar
+            # (T-261015-010) so the next fix starts from a real capture.
+            log("CLEAR", f"native identity probe blocked: {reason}")
+            write_clear_probe_sidecar(
+                getattr(getattr(self, "config", None), "state_dir", None), reason,
+                seen["visible"], reply=seen["reply"], alternate=seen["alternate"])
+            return ""
+
+        seen["visible"] = self.capture_visible_screen()
+        if not clear_identity_probe_ready(seen["visible"]):
+            return blocked("composer_not_idle")
+        alternate = self.tmux(
+            "display-message", "-p", "-t", self.config.pane_target, "#{alternate_on}",
+        ).stdout.strip() == "1"
+        seen["alternate"] = alternate
+        if alternate:
+            # Alternate screens crop command/title without retaining history.
+            # Inline mode keeps its command-echo freshness check unchanged.
+            self.tmux("send-keys", "-t", self.config.pane_target, "C-l")
+            for _ in range(10):
+                time.sleep(0.1)
+                visible = self.capture_visible_screen()
+                seen["visible"] = visible
+                if not clear_identity_probe_ready(visible):
+                    return blocked("composer_changed_after_view_clear")
+                if clear_probe_view_is_reset(visible):
+                    break
+            else:
+                return blocked("reset_view_unrecognized")
+        command_re = r"(?m)^\s*(?:[›»] )?/status\s*$"
+        before = self.capture_screen(2000)
+        before_count = len(list(re.finditer(command_re, before)))
+
+        def fresh_reply() -> str:
+            visible = self.capture_visible_screen()
+            seen["visible"] = visible
+            if not clear_identity_probe_ready(visible):
+                return ""
+            after = self.capture_screen(2000)
+            commands = list(re.finditer(command_re, after))
+            if len(commands) > before_count:
+                reply = after[commands[-1].end():]
+            elif alternate:
+                reply = visible
+            else:
+                return ""
+            if CLEAR_PROBE_FOREIGN_INPUT_RE.search(reply):
+                return ""
+            return reply
+
+        self._paste_prompt_unlocked("/status")
+        try:
+            for _ in range(10):
+                time.sleep(0.1)
+                reply = fresh_reply()
+                seen["reply"] = reply
+                sid = clear_status_session_id(reply, allow_cropped=alternate)
+                if sid:
+                    return sid
+            return blocked("fresh_status_unrecognized")
+        finally:
+            # Ctrl+L clears only the terminal view, not the conversation. Leave
+            # another command, a new draft, a question or a working turn alone.
+            reply = fresh_reply()
+            if (CLEAR_STATUS_SESSION_ROW_RE.search(reply)
+                    and (CODEX_PRODUCT_NAME in reply
+                         or clear_cropped_status_fields(reply))):
+                self.tmux("send-keys", "-t", self.config.pane_target, "C-l")
+
+    def submit_clear_with_identity(self, text: str) -> dict[str, Any]:
+        with self.composer_lock():
+            before_id = self._clear_status_id_unlocked()
+            cursor = self.clear_log_cursor()
+            if not before_id or not cursor:
+                log("CLEAR", f"preflight failed: status={bool(before_id)} process={bool(cursor)}")
+                raise RuntimeError("현재 세션 ID와 실행 프로세스를 확인하지 못해 /clear를 실행하지 않았습니다.")
+            if not clear_identity_probe_ready(self.capture_visible_screen()):
+                raise RuntimeError("입력창이 바뀌어 /clear를 실행하지 않았습니다.")
+            cursor["before_session_id"] = before_id
+            cursor["identity_required"] = True
+            self._paste_prompt_unlocked(text)
+            return cursor
+
+    def clear_identity_confirms_reset(self, cursor: dict[str, Any]) -> bool:
+        # Keep confirmation local to the submitted request and original process.
+        # Repeated Telegram /clear messages only observe this watch.
+        with self.composer_lock():
+            if not self.clear_log_confirms_reset(cursor):
+                return False
+            now = time.monotonic()
+            if now < getattr(self, "_clear_identity_probe_after", 0):
+                return False
+            self._clear_identity_probe_after = now + 5
+            active_id = self._clear_status_id_unlocked()
+            if (not active_id or active_id == cursor.get("before_session_id")
+                    or not self.clear_log_confirms_reset(cursor)):
+                return False
+            # Newer receipts may carry an explicit thread ID. Match it too;
+            # older in-process receipts have no ID, so the locked native status
+            # binds the sole fresh start event to the active conversation.
+            event_id = cursor.get("started_session_id")
+            if event_id and active_id != event_id:
+                return False
+            cursor["after_session_id"] = active_id
+            return True
+
     def clear_log_cursor(self) -> dict[str, Any] | None:
         """Read-only watermark, bound to the TUI process in this pane."""
         try:
@@ -4292,10 +4708,13 @@ class TmuxTransport:
             path = Path(os.environ.get("CODEX_HOME") or Path.home() / ".codex") / "logs_2.sqlite"
             with closing(sqlite3.connect(path.as_uri() + "?mode=ro", uri=True, timeout=0.2)) as db:
                 top = int(db.execute("SELECT coalesce(max(id), 0) FROM logs").fetchone()[0])
-                rows = db.execute(
-                    "SELECT DISTINCT process_uuid FROM logs WHERE id > ? AND target LIKE 'codex_tui::%'",
-                    (max(0, top - 20000),),
-                )
+                # Global log volume is unrelated to an idle pane's identity.
+                # Other panes can emit >20k rows since this TUI last logged.
+                rows = []
+                for pid in pids:
+                    rows.extend(db.execute(
+                        "SELECT DISTINCT process_uuid FROM logs WHERE process_uuid LIKE ? "
+                        "AND target LIKE 'codex_tui::%'", (f"pid:{pid}:%",)).fetchall())
                 owners = []
                 for (owner,) in rows:
                     match = re.fullmatch(r"pid:(\d+):[0-9a-f-]{36}", owner or "")
@@ -4303,8 +4722,55 @@ class TmuxTransport:
                         owners.append((owner, int(match[1])))
                 if len(owners) != 1:
                     return None
+                # Newer TUIs use a descendant app-server daemon. Snapshot its
+                # process UUID before submission; never adopt a new/restarted
+                # server or another pane's server while waiting for /clear.
+                tui_owner, tui_pid = owners[0]
+                servers = []
+                embedded_server = db.execute(
+                    "SELECT 1 FROM logs WHERE process_uuid = ? "
+                    "AND target LIKE 'codex_app_server::%' LIMIT 1", (tui_owner,),
+                ).fetchone()
+                if not embedded_server:
+                    # An older TUI runs its own server. Apps launched by that
+                    # session can also be descendants, but cannot own its reset.
+                    owned_pids = descendants(tui_pid)
+                    server_rows = []
+                    for pid in owned_pids:
+                        server_rows.extend(db.execute(
+                            "SELECT DISTINCT process_uuid FROM logs WHERE process_uuid LIKE ? "
+                            "AND target LIKE 'codex_app_server::%'", (f"pid:{pid}:%",)).fetchall())
+                    for (owner,) in server_rows:
+                        match = re.fullmatch(r"pid:(\d+):[0-9a-f-]{36}", owner or "")
+                        if match and int(match[1]) in owned_pids and owner != tui_owner:
+                            servers.append((owner, int(match[1])))
+                if len(servers) > 1:
+                    return None
+                receipt_owner, receipt_pid = servers[0] if servers else owners[0]
+                connection_id = None
+                if servers:
+                    # A daemon can serve more than one client. Only bind an
+                    # unambiguous connection and require its ID on the receipt.
+                    connections = set()
+                    for (body,) in db.execute(
+                        "SELECT feedback_log_body FROM logs WHERE process_uuid = ? "
+                        "AND id <= ? AND target = 'codex_app_server::message_processor'",
+                        (receipt_owner, top),
+                    ):
+                        # Health/discovery clients can connect only to initialize.
+                        # They have not driven a session and must not make the
+                        # existing TUI connection ambiguous. A later receipt still
+                        # has to match the connection pinned here.
+                        if re.match(r"app-server request: initialize\s", body or ""):
+                            continue
+                        connections.update(re.findall(r"\bconnection_id=ConnectionId\((\d+)\)", body or ""))
+                    if len(connections) != 1:
+                        return None
+                    connection_id = connections.pop()
                 return {"path": str(path), "after_id": top,
-                        "process_uuid": owners[0][0], "pid": owners[0][1],
+                        "process_uuid": tui_owner, "pid": tui_pid,
+                        "receipt_process_uuid": receipt_owner, "receipt_pid": receipt_pid,
+                        "receipt_connection_id": connection_id,
                         "at_ns": time.time_ns()}
         except (OSError, ValueError, sqlite3.Error, subprocess.SubprocessError, RuntimeError):
             return None
@@ -4319,15 +4785,39 @@ class TmuxTransport:
         try:
             if int(cursor["pid"]) not in descendants(self.pane_pid()):
                 return False
+            # Older persisted watches have no separate receipt owner.
+            receipt_pid = int(cursor.get("receipt_pid", cursor["pid"]))
+            receipt_owner = str(cursor.get("receipt_process_uuid", cursor["process_uuid"]))
+            if receipt_pid not in descendants(int(cursor["pid"])):
+                return False
             path = Path(cursor["path"])
             with closing(sqlite3.connect(path.as_uri() + "?mode=ro", uri=True, timeout=0.2)) as db:
+                if cursor.get("identity_required"):
+                    # A physical keyboard does not take the bridge's lock.
+                    # Resume/fork can select C after /clear started B, without
+                    # emitting another thread/started on some CLI versions.
+                    switches = db.execute(
+                        "SELECT feedback_log_body FROM logs WHERE id > ? AND process_uuid = ? "
+                        "AND target LIKE 'codex_app_server::%' "
+                        "AND (feedback_log_body LIKE '%thread/resume%' "
+                        "OR feedback_log_body LIKE '%thread/fork%')",
+                        (int(cursor["after_id"]), receipt_owner),
+                    )
+                    for (body,) in switches:
+                        if not re.search(r'(?:rpc.method="|app-server request: )thread/(?:resume|fork)(?:"|\s)', body or ""):
+                            continue
+                        connection = cursor.get("receipt_connection_id")
+                        if connection is None or re.search(
+                                r'(?:app_server.connection_id=' + re.escape(str(connection)) + r'(?:\s|})'
+                                r'|connection_id=ConnectionId\(' + re.escape(str(connection)) + r'\))', body):
+                            return False
                 rows = db.execute(
                     "SELECT feedback_log_body FROM logs WHERE id > ? AND process_uuid = ? "
                     "AND (ts > ? OR (ts = ? AND ts_nanos >= ?)) "
                     "AND target = 'codex_app_server::outgoing_message' "
                     "AND feedback_log_body LIKE '%app-server event: thread/started%' "
                     "ORDER BY id LIMIT 2",
-                    (int(cursor["after_id"]), str(cursor["process_uuid"]),
+                    (int(cursor["after_id"]), receipt_owner,
                      int(cursor["at_ns"]) // 1_000_000_000,
                      int(cursor["at_ns"]) // 1_000_000_000,
                      int(cursor["at_ns"]) % 1_000_000_000),
@@ -4338,8 +4828,19 @@ class TmuxTransport:
                         and 'rpc.method="thread/start"' in body
                         and 'app_server.client_name="codex-tui"' in body
                         and re.search(r'rpc.request_id=\d+(?:\s|})', body)
+                        and (cursor.get("receipt_connection_id") is None or re.search(
+                            r'\bapp_server.connection_id=' + re.escape(str(cursor["receipt_connection_id"])) + r'(?:\s|})', body))
                         and re.search(r'app-server event: thread/started(?:\s|$)', body)]
-            return len(receipts) == 1
+            if len(receipts) != 1:
+                return False
+            ids = re.findall(
+                r'\b(?:thread_id|session_id)="?([0-9a-fA-F]{8}(?:-[0-9a-fA-F]{4}){3}-[0-9a-fA-F]{12})(?:"|\s|}|$)',
+                receipts[0])
+            if len(set(ids)) > 1:
+                return False
+            if ids:
+                cursor["started_session_id"] = ids[0].lower()
+            return True
         except (KeyError, TypeError, OSError, ValueError, sqlite3.Error,
                 subprocess.SubprocessError, RuntimeError):
             return False
@@ -4348,7 +4849,7 @@ class TmuxTransport:
         """Select the parent view without interrupting either conversation."""
         def busy(screen: str) -> bool:
             return bool(parse_approval_prompt(screen) or parse_choice_prompt(screen)) or screen_has_repl_busy_marker(screen) or any(
-                re.match(r"^• (?:Queued follow-up inputs|Messages to be submitted\b)", line)
+                re.match(r"^• (?:" + re.escape(QUEUED_INPUTS_TITLE) + r"|" + re.escape(QUEUED_INPUTS_LEGACY_TITLE) + r"\b)", line)
                 or (line.startswith("• ") and "esc to interru" in line.lower())
                 for line in screen.splitlines())
 
@@ -5553,9 +6054,8 @@ def extract_choice_title(lines: list[str], option_start: int) -> str:
     # visible title, including wrapped rows and blank paragraphs; a row limit
     # can discard the approval target before the exact event/title comparison.
     queued = [i for i, line in enumerate(lines[:option_start])
-              if re.fullmatch(r'(?:[•●]\s*)?Queued follow-up inputs', line.strip())]
-    if queued and any(re.search(r'\benter\s+submit\b.*\bskip\b', line, re.IGNORECASE)
-                      for line in lines[option_start:]):
+              if QUEUED_INPUTS_HEADER_RE.fullmatch(line.strip())]
+    if queued and any(EDITOR_SUBMIT_SKIP_HINT_RE.search(line) for line in lines[option_start:]):
         return ' '.join(normalize_choice_line(line) for line in lines[queued[-1] + 1:option_start]).strip()
     parts: list[str] = []
     for raw_line in reversed(lines[:option_start]):
@@ -5719,10 +6219,7 @@ def parse_choice_prompt(screen: str) -> ChoicePrompt | None:
     return ChoicePrompt(signature=signature, title=title, options=options)
 
 
-EMPTY_ANSWER_HINT_RE = re.compile(
-    r"type (?:your |an? )?answer|type something|답변을 입력",
-    re.IGNORECASE,
-)
+# EMPTY_ANSWER_HINT_RE lives in codex_async_questions (question panel vocabulary) and is imported above.
 # 긴 주관식 제목이 TUI에서 잘려도 같은 카드로 인정할 최소 canonical 접두.
 _TITLE_PREFIX_MIN = 24
 
@@ -5731,16 +6228,11 @@ def empty_main_composer_for_question_focus(screen: str) -> bool:
     """Recognize the live empty composer when the pending-question hint is hidden."""
     lines = clean_pane_lines(screen)
     prompts = [i for i, line in enumerate(lines) if line.lstrip().startswith(("›", "»"))]
-    if not prompts or not re.fullmatch(
-        r"[›»] Ask (?:Codex to do anything|a follow-up question)",
-        lines[prompts[-1]].strip(),
-    ):
+    if not prompts or not CODEX_EMPTY_COMPOSER_RE.fullmatch(lines[prompts[-1]].strip()):
         return False
     footer = [line.strip() for line in lines[prompts[-1] + 1:] if line.strip()]
     # Additional input lines or unknown/modal chrome are not an empty composer.
-    return (len(footer) == 2 and bool(re.fullmatch(
-                r"\? for shortcuts(?:\s+⚠\ufe0f?\s*\d+\s+warnings?\s*·\s*f2 to view)?",
-                footer[-1]))
+    return (len(footer) == 2 and bool(CODEX_FOOTER_SHORTCUTS_RE.fullmatch(footer[-1]))
             and bool(parse_codex_footer_status(footer[0])))
 
 
@@ -5764,14 +6256,12 @@ def empty_inline_other_editor(screen: str, title: str, options: list[str]) -> bo
             or [normalize(o.label) for o in prompt.options[:-1]] != [normalize(o) for o in options]):
         return False
     other = prompt.options[-1]
-    if (other.label.casefold() not in {'other', '기타', '직접 입력'} or not other.selected
+    if (not is_other_label(other.label) or not other.selected
             or sum(o.selected for o in prompt.options) != 1):
         return False
     lines = clean_pane_lines(screen)
-    heads = [i for i, line in enumerate(lines)
-             if re.fullmatch(r'(?:[•●]\s*)?Queued follow-up inputs', line.strip())]
-    feet = [i for i, line in enumerate(lines) if re.fullmatch(
-        r'enter submit\s+ctrl \+ \] skip\s+(?:alt|⌥|⎇) \+ ↓ main prompt', line.strip(), re.I)]
+    heads = [i for i, line in enumerate(lines) if QUEUED_INPUTS_HEADER_RE.fullmatch(line.strip())]
+    feet = [i for i, line in enumerate(lines) if QUEUED_INPUTS_FOOTER_RE.fullmatch(line.strip())]
     rows = [i for i, line in enumerate(lines) if re.fullmatch(
         rf'› {re.escape(other.value)}\. {re.escape(other.label)}', line.strip())]
     if len(heads) != 1 or len(feet) != 1 or len(rows) != 1:
@@ -5799,10 +6289,7 @@ def empty_type_answer_editor(screen: str, title: str) -> bool:
     if len(hint_indexes) != 1:
         return False
     hint_index = hint_indexes[0]
-    if not any(
-        re.search(r'\benter\s+submit\b', line, re.IGNORECASE)
-        for line in lines[hint_index + 1:hint_index + 5]
-    ):
+    if not any(EDITOR_SUBMIT_HINT_RE.search(line) for line in lines[hint_index + 1:hint_index + 5]):
         return False
 
     # Bind the editor to the title immediately above its placeholder. A stale
@@ -6149,6 +6636,12 @@ class Bridge:
         # 1장으로 통합(받은지시/코덱스답 2장 중복 제거). 0 = 열린 앵커 없음. 휘발성(미persist).
         self.ambient_directive_message_id = 0
         self.ambient_directive_body = ""
+        from terminal_turn_mirror import HandoffCard
+        self.handoff_card = HandoffCard(
+            self.config.state_path.with_suffix(".handoff.json"),
+            lambda body: self.telegram.send_message_id(body, viewer=True),
+            lambda mid, body: self.telegram.edit(mid, body, viewer=True),
+        )
         self.flow_last_edit_at = 0.0
         # T-260727-104 하트비트 상태. flow_last_edit_at 을 재사용하지 않는 이유 —
         # 그 필드는 wait_for_flow_edit_budget 의 레이트리밋 기준점이고 최초 send 경로에서는
@@ -6286,7 +6779,7 @@ class Bridge:
             if other_answer and prompt is not None and not inline_other:
                 verify_options(prompt)
                 others = prompt.options[len(item['options']):]
-                if len(others) != 1 or others[0].label.strip().casefold() not in {'other', '기타', '직접 입력'}:
+                if len(others) != 1 or not is_other_label(others[0].label):
                     raise QuestionNotSubmitted('Native Other option not verified', reason='options_mismatch')
                 selected = prompt.selected_option()
                 if selected is None:
@@ -6355,7 +6848,7 @@ class Bridge:
                 current = parse_choice_prompt(screen)
                 old_panel = (
                     current is not None
-                    or 'Queued follow-up inputs' in screen
+                    or QUEUED_INPUTS_TITLE in screen
                     or type_answer_panel_blocking(screen, item['title'], answer)
                 )
                 if parse_approval_prompt(screen) or str(self.repl.session_file()) != item['session']:
@@ -6553,7 +7046,7 @@ class Bridge:
         return last_activity > 0 and time.monotonic() - last_activity <= grace_seconds
 
     def flow_mirror_active(self) -> bool:
-        return flow_mirror_enabled(bool(getattr(self.config, "flow_mirror", False)))
+        return bool(getattr(self, "handoff_card", None) and self.handoff_card.active) or flow_mirror_enabled(bool(getattr(self.config, "flow_mirror", False)))
 
     def prime_flow_screen_snapshot(self) -> bool:
         """Record the current visible steps without emitting them as a new turn."""
@@ -6618,6 +7111,9 @@ class Bridge:
         self.pending_interrupt_notice = None
         self.pending_reasoning_mirror = None
         self.close_flow_card("context_changed")
+        from terminal_turn_mirror import handoff_context
+        if not handoff_context(text, self.config.node, "codex") and getattr(self, "handoff_card", None):
+            self.handoff_card.forget()
         self.current_flow_scope = normalize_prompt(text)
         self.prime_flow_screen_snapshot()
         queued_mid = self.consume_send_now_receipt(text, getattr(self, 'input_event_offset', None))
@@ -6662,7 +7158,18 @@ class Bridge:
                 self.midreport_prompt = normalize_prompt(text)
         self.start_long_running_progress(text)
 
+    def begin_handoff_card(self, text: str) -> bool:
+        from terminal_turn_mirror import handoff_context
+        context = handoff_context(text, self.config.node, "codex")
+        if not context or self.config.bridge_kill:
+            return False
+        key = f"{self.session_path}:{getattr(self, 'input_event_offset', None)}:{text}"
+        self.handoff_card.begin(context, key)
+        return True
+
     def emit_sent_directive_card(self, text: str, *, voice_only: bool = False) -> bool:
+        if not voice_only and self.begin_handoff_card(text):
+            return True
         if self.config.bridge_kill:
             log("SEND", "sent-directive echo blocked by CRB_KILL=1")
             return
@@ -6705,6 +7212,8 @@ class Bridge:
         return True
 
     def emit_received_telegram_directive_card(self, text: str) -> None:
+        if self.begin_handoff_card(text):
+            return
         if self.config.bridge_kill:
             return
         message = format_ambient_directive(text, from_node=None, task=None)
@@ -6813,6 +7322,10 @@ class Bridge:
 
     def _update_flow_card(self, scope: str, summary: str, dedup_key: str) -> None:
         """Called with flow_lock held, including any replacement send and ID save."""
+        if getattr(self, "handoff_card", None) and self.handoff_card.active:
+            self.handoff_card.update(summary)
+            self.persist_state(event_key=dedup_key)
+            return
         if self.flow_scope != scope:
             self.close_flow_card("context_changed")
             self.flow_scope = scope
@@ -6939,6 +7452,8 @@ class Bridge:
     def close_flow_card(self, status: str) -> None:
         """Stamp turn-end footer on the live card, then drop it. Does not claim the user goal is done."""
         with self.flow_lock:
+            if getattr(self, "handoff_card", None) and self.handoff_card.active:
+                self.handoff_card.finish("응답 완료" if status == "sent" else flow_done_label(status))
             self._finish_flow_card(status)
 
     def _finish_flow_card(self, status: str) -> None:
@@ -7305,12 +7820,15 @@ class Bridge:
         # ⚙️ T-260630-48 phase2 — 노드-origin(받은지시 카드 존재) 코덱스 답은 새 카드 대신 받은지시
         # 앵커를 edit 해 받은지시→코덱스답을 1장 통합. 첨부 있으면(편집 불가)/길이 4000 초과/edit 실패
         # 시 폴백 send → 답 1장 보장(0장도 2장폭발도 아님). 텔레그램-origin 답은 영향 없음.
-        anchor = self.ambient_directive_message_id
+        handoff = getattr(self, "handoff_card", None)
+        handoff_anchor = handoff.message_id if handoff and handoff.active else 0
+        anchor = 0 if handoff_anchor else self.ambient_directive_message_id
         telegram_reply_anchor = (
             self.active_telegram_message_id
             if self.current_origin == "telegram" and self.active_telegram_message_id > 0
             else None
         )
+        telegram_reply_anchor = handoff_anchor or telegram_reply_anchor
         sent_via_reply = False
         if self.current_origin != "telegram" and anchor and alt3_narrative_enabled():
             # alt3 (spec v0.2 §6, T-260703-14 — claude PR#358 동형): 받은지시 카드 edit-통합
@@ -7744,6 +8262,8 @@ class Bridge:
                 state["coord_ring"] = ring_values(state)
             self.bridge_state = state or bridge_state_default(identity)
             state_matches_session = self._state_matches_session(self.bridge_state, identity)
+            if (not state or not state_matches_session) and getattr(self, "handoff_card", None):
+                self.handoff_card.forget()
             with self.lock:
                 live_queued = list(self.queued_telegram)
                 live_pending = list(self.pending_telegram)
@@ -8243,8 +8763,10 @@ class Bridge:
     ) -> threading.Event:
         stop_event = threading.Event()
         activity_frames, activity_reply_to = self.eye_activity_context()
+        deadline = time.monotonic() + max_seconds if max_seconds else None
 
         def watch_screen() -> None:
+            nonlocal deadline
             # Screen capture and flow delivery can block on UI/network I/O.
             # Keep them off the sendChatAction clock and stop stale observers.
             interrupt_hits = 0
@@ -8261,6 +8783,10 @@ class Bridge:
                     signal = self.repl_typing_stop_signal()
                     if stop_event.is_set():
                         return
+                    if signal == "alive" and max_seconds:
+                        # Fresh working-screen evidence renews the bounded
+                        # lease without putting screen I/O on the typing clock.
+                        deadline = time.monotonic() + max_seconds
                     abort, interrupt_hits, capture_error_hits = update_typing_watch_hits(
                         signal, interrupt_hits, capture_error_hits,
                     )
@@ -8273,7 +8799,6 @@ class Bridge:
 
         def loop() -> None:
             start_eye_activity_loop(self.telegram, stop_event, activity_frames, activity_reply_to)
-            deadline = time.monotonic() + max_seconds if max_seconds else None
             pulse_count = 0
             last_ok: bool | None = None
             while not stop_event.is_set():
@@ -8338,7 +8863,7 @@ class Bridge:
 
     def has_repl_typing(self) -> bool:
         with self.typing_lock:
-            return self.repl_typing_stop is not None
+            return self.repl_typing_stop is not None and not self.repl_typing_stop.is_set()
 
     def has_long_running_progress(self) -> bool:
         with self.long_running_progress_lock:
@@ -9255,6 +9780,10 @@ class Bridge:
         if str(watch.get("outcome") or "") == "timeout":
             return False
         if getattr(self.repl, "supports_pane_features", False):
+            cursor = watch.get("log_cursor")
+            if isinstance(cursor, dict) and cursor.get("identity_required"):
+                confirm_id = getattr(self.repl, "clear_identity_confirms_reset", None)
+                return bool(callable(confirm_id) and confirm_id(cursor))
             if self._screen_confirms_session_reset(watch):
                 return True
             # Newer TUI versions omit the resume receipt. Require both a fresh,
@@ -9269,9 +9798,18 @@ class Bridge:
                     or "'/clear' is unavailable" in screen
                     or extract_unrecognized_slash_error(screen, "/clear")):
                 return False
-            empty = (CLEAR_IDLE_COMPOSER_RE.search(screen)
-                     and re.search(r"\bContext\s+0%\s+used\b", screen)
-                     and "OpenAI Codex" in screen)
+            # The 0.162 main screen can omit the product banner. Require the
+            # actual empty composer and its zero-context footer instead of a
+            # product title (or matching words inside conversation output).
+            lines = clean_pane_lines(screen)
+            prompts = [i for i, line in enumerate(lines) if line.lstrip().startswith(("›", "»"))]
+            empty = False
+            if prompts and CODEX_EMPTY_MAIN_COMPOSER_RE.fullmatch(lines[prompts[-1]].strip()):
+                footer = [line.strip() for line in lines[prompts[-1] + 1:] if line.strip()]
+                empty = (len(footer) in (1, 2)
+                         and re.search(r"\bContext\s+0%\s+used\b", footer[0])
+                         and (len(footer) == 1
+                              or CODEX_FOOTER_SHORTCUTS_OR_AGENTS_RE.fullmatch(footer[1])))
             return bool(empty and confirm(cursor))
         # ConPTY / pane-less: the host exposes only the bound session_file() this
         # bridge drives. There is no tmux visible receipt, so that file's path/ino
@@ -9518,11 +10056,15 @@ class Bridge:
         # edit that card later; do not reset a newer turn's card.
         before_visible = self._visible_clear_screen()
         get_cursor = getattr(self.repl, "clear_log_cursor", None)
-        log_cursor = get_cursor() if callable(get_cursor) else None
+        submit_with_id = getattr(self.repl, "submit_clear_with_identity", None)
+        log_cursor = get_cursor() if callable(get_cursor) and not callable(submit_with_id) else None
         self.begin_repl_typing()
         self.persist_state()
         try:
-            self.clear_and_paste_prompt(clear_text, "telegram prompt")
+            if callable(submit_with_id):
+                log_cursor = submit_with_id(clear_text)
+            else:
+                self.clear_and_paste_prompt(clear_text, "telegram prompt")
         except Exception as exc:  # noqa: BLE001
             log("REPL", f"paste failed: {exc}")
             self._end_clear_slash_turn()
@@ -10004,9 +10546,9 @@ class Bridge:
         lock = getattr(self.repl, "composer_lock", nullcontext)
         with lock():
             screen = self.choice_visible_screen()
-            clean = re.sub(r"[\u2800-\u28ff]", "", screen)
+            clean = CODEX_BRAILLE_RE.sub("", screen)
             prompts = [re.sub(r"\s+", " ", line.lstrip()[1:].strip()) for line in clean.splitlines() if line.lstrip().startswith("›")]
-            empty = bool(prompts and prompts[-1] in {"Ask Codex to do anything", "Ask a follow-up question"})
+            empty = bool(prompts and prompts[-1] in CODEX_COMPOSER_PLACEHOLDERS)
             if (not empty or parse_approval_prompt(screen) or parse_choice_prompt(screen)
                     or item["session"] != str(self.repl.session_file())):
                 answer(self.tr('입력 중이거나 선택 화면입니다. 입력칸이 비면 다시 눌러주세요.'))
@@ -10204,7 +10746,7 @@ class Bridge:
             option = prompt.option(choice)
             if option is None:
                 return False
-            is_other = option.label.strip().casefold() in {"other", "직접 입력", "기타"}
+            is_other = is_other_label(option.label)
             if is_other and other_text is None:
                 answer(self.tr('직접 입력할 답변을 요청합니다.'))
                 response = self.telegram.call("sendMessage", chat_id=self.config.chat_id,
@@ -10256,7 +10798,7 @@ class Bridge:
                             time.sleep(0.1)
                             editor = self.choice_visible_screen()
                             title_matches = canonical_choice_signature_text(prompt.title) in canonical_choice_signature_text(editor)
-                            empty_hint = re.search(r"type (?:your |an? )?answer|type something|답변을 입력", editor, re.IGNORECASE)
+                            empty_hint = EMPTY_ANSWER_HINT_RE.search(editor)
                             if title_matches and empty_hint and parse_choice_prompt(editor) is None:
                                 editor_ready = True
                                 break

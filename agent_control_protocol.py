@@ -18,6 +18,8 @@ import threading
 import time
 
 NODES = ()
+# Native handoff endpoints. Keep the web/IDE UI's existing two-node scope.
+HANDOFF_NODES = ()
 ENGINES = ('claude', 'codex', 'cursor', 'grok')
 MAX_BODY = 65536
 
