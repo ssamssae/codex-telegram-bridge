@@ -85,6 +85,16 @@ def bind_voice_input_session(receipt, session_path):
             offset += len(line)
 
 
+def _node_key():
+    """A receipt and its bridge may use different routes.json aliases for one node."""
+    try:
+        from bot_token_wiring import DEFAULT_ROUTES, load_routes, resolve_node
+        routes = load_routes(DEFAULT_ROUTES)
+    except (ImportError, OSError, ValueError):
+        return lambda name: name  # Standalone copies keep exact-name matching.
+    return lambda name: resolve_node(routes, name) or name
+
+
 def match_voice_input(text, session_path, event_offset, node, *, directory=None, now=None, details=False, pane_pid=None, resolve_session=None):
     """Bind once to a concrete JSONL event; retries of that event remain valid."""
     if not session_path or not isinstance(event_offset, int) or event_offset < 0:
@@ -92,13 +102,14 @@ def match_voice_input(text, session_path, event_offset, node, *, directory=None,
     directory = Path(directory) if directory is not None else receipt_dir()
     now = time.time() if now is None else now
     expected = hashlib.sha256(text.encode()).hexdigest()
+    node_key = _node_key()
     matches = []
     for path in directory.glob('*.json'):
         try:
             data = json.loads(path.read_text())
             if (data.get('version') != 1 or data.get('program') != 'jarvis'
                     or data.get('origin') != 'microphone' or data.get('engine') != 'codex'
-                    or data.get('node') != node or data.get('sha256') != expected
+                    or node_key(data.get('node')) != node_key(node) or data.get('sha256') != expected
                     or not 0 <= now - data['created_at'] <= TTL
                     or data.get('matched_offset', event_offset) != event_offset):
                 continue

@@ -4,6 +4,12 @@
 # @mutate scripts/codex_repl_bridge.py | if queued and any( | if False and any(
 # @mutate-why 실제 질문 응답 기록을 무시하면 터미널에서 직접 답한 카드가 열린 채 남는다
 # @mutate scripts/codex_async_questions.py | self.observe_native_reply(record, session) | pass
+# @mutate-why 턴이 끝나 Codex 가 지운 질문의 카드가 열린 채 남아 눌러도 절대 제출되지 않는다(T-261009-030)
+# @mutate scripts/codex_async_questions.py | self.close_open_cards(session, ended, 'turn_ended') | pass
+# @mutate-why 새 프롬프트로 Codex 가 지운 질문의 카드가 열린 채 남는다(T-261009-030)
+# @mutate scripts/codex_async_questions.py | self.close_open_cards(session, received, 'new_prompt') | pass
+# @mutate-why 닫힌 카드를 누르면 닫힌 이유 대신 엉뚱한 안내가 나간다(T-261009-030)
+# @mutate scripts/codex_async_questions.py | if item['status'] == 'closed': | if False:
 
 import importlib.util
 import json
@@ -802,3 +808,129 @@ class ReplyTimeoutRecoveryTest(unittest.TestCase):
         edits = [c for c in self.telegram.call.call_args_list if c.args[0] == 'editMessageReplyMarkup']
         self.assertTrue(edits)
         self.assertEqual(json.loads(edits[-1].kwargs['reply_markup'])['inline_keyboard'][0][0]['callback_data'], f'{PREFIX}:{key}:recover')
+
+
+def turn_end(seconds=60, kind='task_complete'):
+    from datetime import datetime, timezone
+    return {'type': 'event_msg', 'timestamp': datetime.fromtimestamp(NOW + seconds, timezone.utc).isoformat(),
+            'payload': {'type': kind, 'turn_id': 'native-turn'}}
+
+
+def user_prompt(text='새 메시지', seconds=60):
+    from datetime import datetime, timezone
+    return {'type': 'response_item', 'timestamp': datetime.fromtimestamp(NOW + seconds, timezone.utc).isoformat(),
+            'payload': {'type': 'message', 'role': 'user', 'content': [{'type': 'input_text', 'text': text}]}}
+
+
+class TurnEndClosesCardTest(unittest.TestCase):
+    """Codex 0.162 clears pending async questions when the live turn ends or a
+    new prompt is submitted (tui async_questions/state.rs take_pending_drafts ->
+    clear_pending). A card left open after that can never be submitted."""
+    setUp = QuestionsTest.setUp
+    open = QuestionsTest.open
+    callback = QuestionsTest.callback
+    receipt = NativeQuestionReceiptTest.receipt
+
+    def edits(self, method='editMessageText'):
+        return [c for c in self.telegram.call.call_args_list if c.args[0] == method]
+
+    def test_turn_end_closes_open_card_and_removes_buttons_once(self):
+        key = self.open()
+        self.telegram.call.reset_mock()
+        self.q.observe(turn_end(), SESSION)
+        self.q.observe(turn_end(), SESSION)
+        item = self.q.items[key]
+        self.assertEqual((item['status'], item['closed_reason']), ('closed', 'turn_ended'))
+        edits = self.edits()
+        self.assertEqual(len(edits), 1)
+        self.assertEqual(json.loads(edits[0].kwargs['reply_markup']), {'inline_keyboard': []})
+        self.assertIn('닫힌 질문', edits[0].kwargs['text'])
+        self.assertIn('어느 PR인가요?', edits[0].kwargs['text'])
+        self.assertIn('Codex 작업이 끝나 이 질문은 닫혔습니다.', edits[0].kwargs['text'])
+        self.assertIn('답은 새 메시지로 보내 주세요.', edits[0].kwargs['text'])
+        self.submit.assert_not_called()
+
+    def test_turn_aborted_also_closes_the_card(self):
+        key = self.open()
+        self.q.observe(turn_end(kind='turn_aborted'), SESSION)
+        self.assertEqual(self.q.items[key]['status'], 'closed')
+
+    def test_press_after_turn_end_never_submits_and_says_why(self):
+        key = self.open()
+        self.q.observe(turn_end(), SESSION)
+        self.telegram.call.reset_mock()
+        self.q.callback(self.callback(key), SESSION)
+        self.submit.assert_not_called()
+        acks = self.edits('answerCallbackQuery')
+        self.assertEqual(len(acks), 1)
+        self.assertIn('닫힌 질문입니다', acks[0].kwargs['text'])
+        self.assertEqual(self.q.items[key]['status'], 'closed')
+        self.telegram.send.assert_not_called()
+
+    def test_reply_to_closed_card_is_owned_but_not_submitted(self):
+        key = self.open()
+        self.q.observe(turn_end(), SESSION)
+        message = {'text': '둘 다', 'reply_to_message': {'message_id': 55}, 'from': {'id': 123}, 'chat': {'id': 123}}
+        self.assertEqual(self.q.reply_text(message, SESSION), '')
+        self.assertEqual(self.q.items[key]['status'], 'closed')
+
+    def test_earlier_turn_end_or_other_session_does_not_close(self):
+        key = self.open()
+        self.q.observe(turn_end(seconds=-5), SESSION)
+        self.q.observe(turn_end(), '/other/session.jsonl')
+        self.assertEqual(self.q.items[key]['status'], 'open')
+
+    def test_turn_end_leaves_inflight_and_answered_cards_alone(self):
+        key = self.open()
+        for status in ('submitting', 'uncertain', 'answered'):
+            self.q.items[key]['status'] = status
+            self.q.observe(turn_end(), SESSION)
+            self.assertEqual(self.q.items[key]['status'], status)
+
+    def test_new_prompt_closes_but_question_reply_and_context_do_not(self):
+        key = self.open(); item = self.q.items[key]
+        self.q.observe(user_prompt('<environment_context>\n  <cwd>/x</cwd>\n</environment_context>'), SESSION)
+        self.q.observe(self.receipt(item, call_id='another-call'), SESSION)
+        self.assertEqual(item['status'], 'open')
+        self.q.observe(user_prompt('1번으로 할게'), SESSION)
+        self.assertEqual((item['status'], item['closed_reason']), ('closed', 'new_prompt'))
+        self.assertIn('새 메시지가 들어와 Codex가 이 질문을 닫았습니다.', self.edits()[-1].kwargs['text'])
+
+    def test_closed_state_survives_restart(self):
+        key = self.open()
+        self.q.observe(turn_end(), SESSION)
+        self.q = AsyncQuestions(self.path, self.telegram, self.submit, clock=lambda: self.now)
+        self.telegram.call.reset_mock()
+        self.q.observe(turn_end(), SESSION)
+        self.q.callback(self.callback(key), SESSION)
+        self.assertEqual(self.q.items[key]['status'], 'closed')
+        self.assertEqual(self.edits(), [])
+        self.submit.assert_not_called()
+
+
+class BridgeTurnEndIntegrationTest(unittest.TestCase):
+    def test_task_complete_line_closes_card_before_a_late_button_press(self):
+        from unittest.mock import patch
+        from contextlib import nullcontext
+        scripts = Path(__file__).resolve().parents[1]
+        spec = importlib.util.spec_from_file_location('async_question_turn_end_test', scripts / 'codex_repl_bridge.py')
+        m = importlib.util.module_from_spec(spec); sys.modules[spec.name] = m; spec.loader.exec_module(m)
+        with tempfile.TemporaryDirectory() as tmp, patch.dict(os.environ, {'CRB_CHAT_ID': '123'}):
+            cfg = m.replace(m.Config.from_env(), state_path=Path(tmp)/'bridge.json', bridge_kill=False)
+            tg = SimpleNamespace(chat_id='123', call=Mock(return_value={'ok': True, 'result': {'message_id': 55}}), send=Mock())
+            repl = Mock(); repl.session_file.return_value = Path(SESSION)
+            repl.composer_lock = nullcontext
+            b = m.Bridge(cfg, tg, repl)
+            b.session_path = Path(SESSION)
+            b.handle_flow_event = Mock(); b.persist_state = Mock()
+            b.get_async_questions().clock = lambda: NOW
+            b.process_line(json.dumps(request()), 0, 100)
+            b.process_line(json.dumps(accepted()), 100, 200)
+            b.process_line(json.dumps(turn_end()), 200, 300)
+            key = next(iter(b.get_async_questions().items))
+            self.assertEqual(b.get_async_questions().items[key]['status'], 'closed')
+            callback = {'id': 'q1', 'data': f'{PREFIX}:{key}:0', 'message': {'message_id': 55, 'chat': {'id': 123}}, 'from': {'id': 123}}
+            self.assertTrue(b.handle_callback_query(callback))
+            repl.focus_pending_question.assert_not_called()
+            repl.send_choice.assert_not_called()
+            repl.send_choice_text.assert_not_called()

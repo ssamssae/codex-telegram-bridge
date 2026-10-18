@@ -220,7 +220,8 @@ class ClearAcknowledgementTest(unittest.TestCase):
         self.native()
         self.transport = object.__new__(self.mod.TmuxTransport)
         self.transport.pane_pid = mock.Mock(return_value=120)
-        patch = mock.patch.object(self.mod, "descendants", return_value={120, 121})
+        self.process_tree = {120: {120, 121}, 121: {121}}
+        patch = mock.patch.object(self.mod, "descendants", side_effect=lambda pid: self.process_tree.get(pid, {pid}))
         patch.start()
         self.addCleanup(patch.stop)
         self.log_path = self.root / ".codex" / "logs_2.sqlite"
@@ -235,13 +236,594 @@ class ClearAcknowledgementTest(unittest.TestCase):
         self.repl.clear_log_confirms_reset = self.transport.clear_log_confirms_reset
         self.screen = "OpenAI Codex (v0.155.1)\n› Ask Codex to do anything\nContext 0% used\n"
 
-    def start_receipt(self, owner=None, method="thread/start", client="codex-tui", at_ns=None, request_id="7"):
+    def start_receipt(self, owner=None, method="thread/start", client="codex-tui", at_ns=None, request_id="7", connection_id="1"):
         now = time.time_ns() if at_ns is None else at_ns
         self.db.execute("INSERT INTO logs (target, process_uuid, feedback_log_body, ts, ts_nanos) VALUES (?, ?, ?, ?, ?)", (
             "codex_app_server::outgoing_message", owner or self.owner,
-            f'app_server.request{{rpc.method="{method}" app_server.client_name="{client}" rpc.request_id={request_id}}}: '
+            f'app_server.request{{rpc.method="{method}" app_server.client_name="{client}" rpc.request_id={request_id} app_server.connection_id={connection_id}}}: '
             'app-server event: thread/started targeted_connections=0', now // 1_000_000_000, now % 1_000_000_000))
         self.db.commit()
+
+    NEW_SID = '01a08f32-bc04-75b3-ada9-d7f87e484d6c'
+
+    def identity_transport(self):
+        from contextlib import nullcontext
+        self.log_transport()
+        self.transport.composer_lock = lambda: nullcontext()
+        self.active_id = self.SID
+        self.status_count = 0
+        self.history = ''
+        self.screen = '› Ask Codex to do anything\nGPT-6-Astra max · ~ · Context 0% used\n? for shortcuts\n'
+        self.transport.capture_visible_screen = lambda: self.screen
+        self.transport.capture_screen = lambda *_: self.history + self.screen
+        self.commands = []
+        self.keys = []
+        self.transport.config = self.config
+        self.alternate = False
+
+        def tmux(*args, **kwargs):
+            if args[0] == 'display-message':
+                return mock.Mock(stdout='1' if self.alternate else '0')
+            self.keys.append(args[-1])
+            if args[-1] == 'C-l':
+                self.history = ''
+        self.transport.tmux = tmux
+        self.emit_start = True
+        self.explicit_receipt_id = ''
+
+        def paste(text):
+            self.commands.append(text)
+            if text == '/status':
+                self.status_count += 1
+                self.history += ('› /status\n╭────────────────────╮\n'
+                                 '│ OpenAI Codex (v0.162.1) │\n'
+                                 f'│ Session: {self.active_id} │\n'
+                                 '╰────────────────────╯\n')
+            elif text.startswith('/clear'):
+                self.active_id = self.NEW_SID
+                self.history = ''
+                if self.emit_start:
+                    self.start_receipt()
+                    if self.explicit_receipt_id:
+                        self.db.execute("UPDATE logs SET feedback_log_body=feedback_log_body || ? WHERE id=(SELECT max(id) FROM logs)",
+                                        (f' thread_id="{self.explicit_receipt_id}"',))
+                        self.db.commit()
+        self.transport._paste_prompt_unlocked = paste
+        self.repl.submit_clear_with_identity = self.transport.submit_clear_with_identity
+        self.repl.clear_identity_confirms_reset = self.transport.clear_identity_confirms_reset
+
+    def test_identity_clear_matches_live_status_without_rollout_creation(self):
+        self.identity_transport()
+        self.request()
+        self.assertEqual(self.commands, ['/status', '/clear', '/status'])
+        self.assertEqual(self.sent(), [self.mod.CLEAR_SLASH_COMPLETE])
+        self.assertEqual(self.repl.session_file(), self.old)
+
+    def cropped_status_transport(self):
+        self.identity_transport()
+        self.alternate = True
+        self.transport.capture_visible_screen = lambda: self.history + self.screen
+        paste = self.transport._paste_prompt_unlocked
+
+        def cropped(text):
+            paste(text)
+            if text == '/status':
+                # Observed 55x23 alternate screen: no command/title/scrollback.
+                # Codex 0.162.1 always renders Agents.md (tui/src/status/card.rs).
+                self.history = ('  Model: GPT-6-Astra (reasoning max)\n'
+                                '  Directory: /\n  Permissions: read only\n'
+                                '  Agents.md: <none>\n'
+                                f'  Session:\n    {self.active_id[:32]}\n'
+                                f'    {self.active_id[32:]}\n\n'
+                                '  Context window: 96% left\n')
+                if self.active_id == self.NEW_SID:
+                    # Empty threads omit context usage, exposing the end of
+                    # the native usage-link introduction above Model.
+                    self.history = ('  settings/usage for up-to-date\n'
+                                    '  information on rate limits and credits\n' + self.history)
+        self.transport._paste_prompt_unlocked = cropped
+
+    def test_cropped_alternate_status_completes_without_command_echo(self):
+        self.cropped_status_transport()
+        self.request()
+        self.assertEqual(self.sent(), [self.mod.CLEAR_SLASH_COMPLETE])
+        self.assertEqual(self.commands, ['/status', '/clear', '/status'])
+        self.assertEqual(self.history, '')
+
+    def test_ineffective_view_clear_cannot_adopt_old_cropped_status(self):
+        self.cropped_status_transport()
+        self.transport._paste_prompt_unlocked('/status')
+        tmux = self.transport.tmux
+        self.transport.tmux = lambda *args, **kwargs: (
+            self.keys.append('C-l') if args[-1] == 'C-l' else tmux(*args, **kwargs))
+        self.transport._paste_prompt_unlocked = self.commands.append
+        self.commands.clear()
+        self.request()
+        self.assertEqual(self.commands, [])
+        self.assertNotIn(self.mod.CLEAR_SLASH_COMPLETE, self.sent())
+
+    def test_cropped_status_requires_fresh_probe_and_unambiguous_native_fields(self):
+        self.cropped_status_transport()
+        self.transport._paste_prompt_unlocked('/status')
+        valid = self.history
+        self.assertEqual(self.mod.clear_status_session_id(valid), '')
+        self.assertEqual(self.mod.clear_status_session_id(valid, allow_cropped=True), self.SID)
+        for invalid in (
+            valid.replace('  Directory: /\n', ''),
+            valid.replace('  Model: GPT-6-Astra (reasoning max)\n', 'some prose\n'),
+            valid.replace('  Session:\n', '  Session:\n\n'),
+            valid + f'  Session: {self.NEW_SID}\n',
+        ):
+            with self.subTest(invalid=invalid):
+                self.assertEqual(self.mod.clear_status_session_id(invalid, allow_cropped=True), '')
+
+    def test_cropped_invalid_id_cleans_own_display_without_submitting_clear(self):
+        self.cropped_status_transport()
+        paste = self.transport._paste_prompt_unlocked
+
+        def invalid(text):
+            paste(text)
+            self.history = self.history.replace(self.active_id[:32], 'unavailable')
+        self.transport._paste_prompt_unlocked = invalid
+        self.request()
+        self.assertEqual(self.commands, ['/status'])
+        self.assertEqual(self.history, '')
+        self.assertEqual(self.keys, ['C-l', 'C-l'])
+        self.assertNotIn(self.mod.CLEAR_SLASH_COMPLETE, self.sent())
+
+    # Exact live pane capture (55x23, alternate_on=1) after the probe's /status
+    # on 2026-10-14 03:48 KST. A wrapped thread name and session value made the
+    # native card taller than the screen: the title and Model scrolled off and
+    # only Model's value continuation remained on the first row. Account,
+    # thread name and IDs are replaced; columns and wraps are unchanged.
+    LIVE_TALL_FOOTER = ('› Ask Codex to do anything\n\n'
+                        '  GPT-6-Astra max · / · Context 71% used · weekly 64% …\n'
+                        '  ? for shortcuts\n')
+
+    def live_tall_status(self, sid):
+        return ('                       summaries auto)\n'
+                '  Model provider:      openai\n'
+                '  Directory:           /\n'
+                '  Permissions:         Full Access\n'
+                '  Agents.md:           Users/user/.codex/AGENTS.md\n'
+                '  Account:             user@example.com (Plus)\n'
+                '  Thread name:         긴 시험 대화 제목이 화면 폭을 넘\n'
+                '                       겨\n'
+                '  Collaboration mode:  Default\n'
+                '  Session:\n'
+                f'                       {sid[:32]}\n'
+                f'                       {sid[32:]}\n'
+                '\n'
+                '  Context window:      29% left (187K used / 258K)\n'
+                '  Weekly limit:        [█████████████░░░░░░░] 64% left\n'
+                '                       (resets 2:04 PM on 20 Oct)\n'
+                '  Credits:             15596 credits\n'
+                '\n\n')
+
+    def test_cropped_status_reads_live_card_after_model_scrolled_off(self):
+        screen = self.live_tall_status(self.SID) + self.LIVE_TALL_FOOTER
+        self.assertEqual(len(screen.splitlines()), 23)
+        self.assertTrue(self.mod.clear_identity_probe_ready(screen))
+        self.assertEqual(self.mod.clear_status_session_id(screen, allow_cropped=True), self.SID)
+        # A cropped card stays untrusted unless the probe saw its own reset view.
+        self.assertEqual(self.mod.clear_status_session_id(screen), '')
+
+    def test_cropped_tall_status_completes_clear_and_cleans_its_display(self):
+        self.cropped_status_transport()
+        paste = self.transport._paste_prompt_unlocked
+
+        def tall(text):
+            paste(text)
+            if text == '/status' and self.active_id == self.SID:
+                self.history = self.live_tall_status(self.active_id)
+        self.transport._paste_prompt_unlocked = tall
+        self.request()
+        self.assertEqual(self.sent(), [self.mod.CLEAR_SLASH_COMPLETE])
+        self.assertEqual(self.commands, ['/status', '/clear', '/status'])
+        # Each probe resets the view, then removes its own status display.
+        self.assertEqual(self.keys, ['C-l', 'C-l', 'C-l', 'C-l'])
+        self.assertEqual(self.history, '')
+
+    def test_cropped_status_reads_every_top_crop_with_two_native_fields(self):
+        rows = self.live_tall_status(self.SID).splitlines(keepends=True)
+        session = rows.index('  Session:\n')
+        for top in range(session + 1):
+            screen = ''.join(rows[top:]) + self.LIVE_TALL_FOOTER
+            fields = sum(1 for row in rows[top:session] if row.strip() and not row.startswith('   '))
+            with self.subTest(top=top, fields=fields):
+                self.assertEqual(self.mod.clear_status_session_id(screen, allow_cropped=True),
+                                 self.SID if fields >= 2 else '')
+
+    def test_cropped_status_rejects_rows_the_screen_top_cannot_explain(self):
+        valid = self.live_tall_status(self.SID) + self.LIVE_TALL_FOOTER
+        remnant = '                       summaries auto)\n'
+        directory = '  Directory:           /\n'
+        agents = '  Agents.md:           Users/user/.codex/AGENTS.md\n'
+        account = '  Account:             user@example.com (Plus)\n'
+        self.assertEqual(self.mod.clear_status_session_id(valid, allow_cropped=True), self.SID)
+        rejected = {
+            # Only the cut-off continuation of an earlier value may sit above
+            # the first visible field. Other rows mean the card start was not
+            # cropped, so nothing explains the missing Model.
+            'prose_at_top': valid.replace(remnant, 'previous reply\n'),
+            'blank_at_top': valid.replace(remnant, remnant + '\n'),
+            # A field the card always renders cannot vanish below a visible one.
+            'missing_always_rendered': valid.replace(agents, ''),
+            # Native fields keep their render order and appear once.
+            'out_of_order': valid.replace(directory, '').replace(account, account + directory),
+            'repeated': valid.replace(account, account + account),
+            'identity_below_session': valid.replace('  Credits:', directory + '  Credits:'),
+            # Nothing but field rows may interrupt the card above Session.
+            'transcript_inside': valid.replace(account, account + 'previous reply\n'),
+            'blank_inside': valid.replace(account, account + '\n'),
+            'second_session': valid.replace('  Credits:', f'  Session: {self.NEW_SID}\n  Credits:'),
+        }
+        for name, screen in rejected.items():
+            with self.subTest(screen=name):
+                self.assertEqual(self.mod.clear_status_session_id(screen, allow_cropped=True), '')
+
+    def test_cropped_status_accepts_other_native_rows_and_newer_fields(self):
+        tall = self.live_tall_status(self.SID)
+        tail = f'                       {self.SID[32:]}\n'
+        # Codex 0.162.1 (tui/src/status/card.rs) renders Forked from below
+        # Session and, for a daemon connection, Server plus a blank row above
+        # Model. The short card is the empty-thread layout without thread name
+        # and context usage.
+        forked = tall.replace(tail, tail + '  Forked from:\n'
+                              f'                       {self.NEW_SID[:32]}\n'
+                              f'                       {self.NEW_SID[32:]}\n')
+        short = ('  Server:              Local background server\n\n'
+                 '  Model:               GPT-6-Astra (reasoning max,\n'
+                 + tall.replace('  Thread name:         긴 시험 대화 제목이 화면 폭을 넘\n'
+                                '                       겨\n', '')
+                 .replace('  Context window:      29% left (187K used / 258K)\n', ''))
+        # A field a newer Codex adds above Session must not break /clear again.
+        newer = '  Reasoning:           max\n'
+        screens = {
+            'forked_from_below_session': forked,
+            'server_above_model': short,
+            'newer_field_on_short_card': short.replace('  Directory:', newer + '  Directory:'),
+            'newer_field_on_cropped_card': tall.replace('  Directory:', newer + '  Directory:'),
+        }
+        for name, card in screens.items():
+            with self.subTest(screen=name):
+                self.assertEqual(self.mod.clear_status_session_id(
+                    card + self.LIVE_TALL_FOOTER, allow_cropped=True), self.SID)
+
+    def test_view_reset_rejects_unmatched_directory_and_unknown_transcript(self):
+        self.identity_transport()
+        banner = '  >_ OpenAI Codex (v0.162.1)\n     ~\n'
+        self.assertTrue(self.mod.clear_probe_view_is_reset(banner + self.screen))
+        self.assertFalse(self.mod.clear_probe_view_is_reset(banner.replace('~', '/elsewhere') + self.screen))
+        self.assertFalse(self.mod.clear_probe_view_is_reset('previous reply\n' + self.screen))
+        self.assertFalse(self.mod.clear_probe_view_is_reset(self.screen.replace('Ask Codex to do anything', 'draft')))
+
+    def test_view_reset_accepts_native_braille_logo_but_not_status_or_transcript(self):
+        self.identity_transport()
+        # Observed 119x61 Codex 0.162.1 reset view; narrow panes omit the logo.
+        banner = ('  >_ OpenAI Codex (v0.162.1)\n     ~\n\n'
+                  '                 ⣀⣤⣤⣤⣀⣀\n'
+                  '            ⣾⣿⣿⠃ ⢸⣿⣿⡇ ⢸⣿⣿⠋⠁  ⠈⠙⢻⣿⣿⣿⣶⣤⡀ ⠹⢿⣿⣷⡄\n'
+                  '                    ⠈⠙⠛⠿⠿⠿⠿⠛⠉\n')
+        self.assertTrue(self.mod.clear_probe_view_is_reset(banner + self.screen))
+        for extra in ('previous reply\n', f'Session: {self.SID}\n',
+                      'Model: GPT-6-Astra\n', '› /status\n', '⣿ text ⣿\n'):
+            with self.subTest(extra=extra):
+                self.assertFalse(self.mod.clear_probe_view_is_reset(banner + extra + self.screen))
+        self.assertFalse(self.mod.clear_probe_view_is_reset(
+            banner + self.screen.replace('Ask Codex to do anything', 'unfinished draft')))
+
+    def test_alternate_logo_after_view_clear_allows_fresh_identity_probe(self):
+        self.cropped_status_transport()
+        tmux = self.transport.tmux
+        banner = '  >_ OpenAI Codex (v0.162.1)\n     ~\n\n     ⣾⣿⣿⠃ ⢸⣿⣿⡇\n'
+
+        def reset_with_logo(*args, **kwargs):
+            result = tmux(*args, **kwargs)
+            if args[-1] == 'C-l':
+                self.history = banner
+            return result
+        self.transport.tmux = reset_with_logo
+        self.request()
+        self.assertEqual(self.commands, ['/status', '/clear', '/status'])
+        self.assertEqual(self.sent(), [self.mod.CLEAR_SLASH_COMPLETE])
+        self.assertEqual(self.history, banner)
+
+    def test_view_reset_accepts_yolo_permissions_line_but_not_other_chrome(self):
+        self.identity_transport()
+        # Observed 2026-10-13 on live 55x23 alternate screens: with
+        # approval_policy "never" and sandbox "danger-full-access", Codex
+        # 0.162.1 (tui history_cell/session.rs) keeps one permissions line
+        # under the title/cwd after Ctrl+L. Only that exact line may precede
+        # the optional logo; status fields, drafts and transcript stay rejected.
+        banner = '  >_ OpenAI Codex (v0.162.1)\n     ~\n  permissions: YOLO mode\n'
+        self.assertTrue(self.mod.clear_probe_view_is_reset(banner + self.screen))
+        self.assertTrue(self.mod.clear_probe_view_is_reset(
+            banner + '\n     ⣾⣿⣿⠃ ⢸⣿⣿⡇\n' + self.screen))
+        rejected = {
+            'no_title': '  permissions: YOLO mode\n' + self.screen,
+            'before_cwd': '  >_ OpenAI Codex (v0.162.1)\n  permissions: YOLO mode\n     ~\n' + self.screen,
+            'other_mode': banner.replace('YOLO mode', 'read only') + self.screen,
+            'status_field': banner.replace('permissions:', 'Permissions:') + self.screen,
+            'twice': banner + '  permissions: YOLO mode\n' + self.screen,
+            'transcript': banner + 'previous reply\n' + self.screen,
+            'session': banner + f'Session: {self.SID}\n' + self.screen,
+            'model': banner + 'Model: GPT-6-Astra\n' + self.screen,
+            'command': banner + '› /status\n' + self.screen,
+            'draft': banner + self.screen.replace('Ask Codex to do anything', 'unfinished draft'),
+        }
+        for name, view in rejected.items():
+            with self.subTest(view=name):
+                self.assertFalse(self.mod.clear_probe_view_is_reset(view))
+
+    def test_view_reset_recognizes_observed_yolo_alternate_screen(self):
+        self.identity_transport()
+        # Exact live pane capture (55x23, alternate_on=1) after the probe's
+        # Ctrl+L on 2026-10-13 20:39 KST, cwd "/" and a truncated weekly field.
+        screen = ('\n  >_ OpenAI Codex (v0.162.1)\n     /\n  permissions: YOLO mode\n'
+                  + '\n' * 15
+                  + '› Ask Codex to do anything\n\n'
+                  '  GPT-6-Astra max · / · Context 4% used · weekly 80% l…\n'
+                  '  ? for shortcuts\n')
+        self.assertTrue(self.mod.clear_identity_probe_ready(screen))
+        self.assertTrue(self.mod.clear_probe_view_is_reset(screen))
+
+    def test_alternate_yolo_banner_after_view_clear_allows_fresh_identity_probe(self):
+        self.cropped_status_transport()
+        tmux = self.transport.tmux
+        banner = '  >_ OpenAI Codex (v0.162.1)\n     ~\n  permissions: YOLO mode\n'
+
+        def reset_with_permissions(*args, **kwargs):
+            result = tmux(*args, **kwargs)
+            if args[-1] == 'C-l':
+                self.history = banner
+            return result
+        self.transport.tmux = reset_with_permissions
+        self.request()
+        self.assertEqual(self.commands, ['/status', '/clear', '/status'])
+        self.assertEqual(self.sent(), [self.mod.CLEAR_SLASH_COMPLETE])
+        self.assertEqual(self.history, banner)
+
+    def test_identity_explicit_receipt_must_match_active_id(self):
+        self.identity_transport()
+        self.explicit_receipt_id = self.SID
+        self.request()
+        self.assertNotIn(self.mod.CLEAR_SLASH_COMPLETE, self.sent())
+
+    def test_identity_status_change_without_start_receipt_is_not_complete(self):
+        self.identity_transport()
+        self.emit_start = False
+        self.request()
+        self.assertNotIn(self.mod.CLEAR_SLASH_COMPLETE, self.sent())
+        self.assertEqual(self.commands, ['/status', '/clear'])
+
+    def test_identity_other_process_receipt_is_not_complete(self):
+        self.identity_transport()
+        self.emit_start = False
+        self.request()
+        self.start_receipt(owner='pid:999:55555555-5555-5555-5555-555555555555')
+        self.bridge.maybe_confirm_pending_clear()
+        self.assertNotIn(self.mod.CLEAR_SLASH_COMPLETE, self.sent())
+
+    def test_identity_unchanged_active_id_is_not_complete(self):
+        self.identity_transport()
+        self.NEW_SID = self.SID
+        self.request()
+        self.assertNotIn(self.mod.CLEAR_SLASH_COMPLETE, self.sent())
+
+    def test_identity_duplicate_request_does_not_clear_twice(self):
+        self.identity_transport()
+        self.emit_start = False
+        self.request()
+        self.request()
+        self.assertEqual(self.commands.count('/clear'), 1)
+        self.start_receipt()
+        self.bridge.maybe_confirm_pending_clear()
+        self.assertEqual(self.sent().count(self.mod.CLEAR_SLASH_COMPLETE), 1)
+
+    def test_identity_consecutive_requests_use_latest_status_id(self):
+        self.identity_transport()
+        self.request()
+        self.NEW_SID = '01a08f32-bc05-75b3-ada9-d7f87e484d6c'
+        self.request()
+        self.assertEqual(self.commands.count('/clear'), 2)
+        # Remove per-probe throttle to model a later poll without sleeping.
+        self.transport._clear_identity_probe_after = 0
+        self.bridge.maybe_confirm_pending_clear()
+        self.assertEqual(self.sent().count(self.mod.CLEAR_SLASH_COMPLETE), 2)
+
+    def test_identity_multiple_fresh_starts_are_ambiguous(self):
+        self.identity_transport()
+        self.emit_start = False
+        self.request()
+        self.start_receipt()
+        self.start_receipt(request_id='8')
+        self.bridge.maybe_confirm_pending_clear()
+        self.assertNotIn(self.mod.CLEAR_SLASH_COMPLETE, self.sent())
+
+    def test_identity_resume_or_fork_without_second_start_is_not_complete(self):
+        self.identity_transport()
+        self.emit_start = False
+        self.request()
+        self.start_receipt()
+        for method in ('thread/resume', 'thread/fork'):
+            with self.subTest(method=method):
+                self.db.execute("DELETE FROM logs WHERE target='codex_app_server::message_processor'")
+                self.db.execute("INSERT INTO logs (target,process_uuid,feedback_log_body) VALUES (?, ?, ?)",
+                                ('codex_app_server::message_processor', self.owner,
+                                 f'app-server request: {method} connection_id=ConnectionId(1)'))
+                self.db.commit()
+                self.bridge.maybe_confirm_pending_clear()
+                self.assertNotIn(self.mod.CLEAR_SLASH_COMPLETE, self.sent())
+        self.assertEqual(self.commands, ['/status', '/clear'])
+
+    def test_identity_resume_during_status_query_is_not_complete(self):
+        self.identity_transport()
+        paste = self.transport._paste_prompt_unlocked
+
+        def race(text):
+            paste(text)
+            if text == '/status' and self.active_id == self.NEW_SID:
+                self.db.execute("INSERT INTO logs (target,process_uuid,feedback_log_body) VALUES (?, ?, ?)",
+                                ('codex_app_server::message_processor', self.owner,
+                                 'app-server request: thread/resume connection_id=ConnectionId(1)'))
+                self.db.commit()
+        self.transport._paste_prompt_unlocked = race
+        self.request()
+        self.assertNotIn(self.mod.CLEAR_SLASH_COMPLETE, self.sent())
+
+    def test_identity_persisted_watch_survives_restart(self):
+        self.identity_transport()
+        self.emit_start = False
+        self.request()
+        self.assertEqual(self.state()['pending_clear_watch']['log_cursor']['before_session_id'], self.SID)
+        self.bridge = self.make_bridge()
+        self.start_receipt()
+        self.bridge.maybe_confirm_pending_clear()
+        self.assertEqual(self.sent().count(self.mod.CLEAR_SLASH_COMPLETE), 1)
+
+    def test_identity_draft_blocks_probe_and_clear(self):
+        self.identity_transport()
+        self.screen = self.screen.replace('Ask Codex to do anything', 'user draft')
+        self.request()
+        self.assertEqual(self.commands, [])
+        self.assertNotIn(self.mod.CLEAR_SLASH_COMPLETE, self.sent())
+
+    def test_identity_draft_after_submission_blocks_status_probe(self):
+        self.identity_transport()
+        self.emit_start = False
+        self.request()
+        self.screen = self.screen.replace('Ask Codex to do anything', 'user draft')
+        self.start_receipt()
+        self.bridge.maybe_confirm_pending_clear()
+        self.assertEqual(self.commands, ['/status', '/clear'])
+        self.assertNotIn(self.mod.CLEAR_SLASH_COMPLETE, self.sent())
+
+    def test_identity_stale_status_does_not_submit_clear(self):
+        self.identity_transport()
+        self.transport._paste_prompt_unlocked('/status')
+        self.transport._paste_prompt_unlocked = self.commands.append
+        self.commands.clear()
+        self.request()
+        self.assertEqual(self.commands, ['/status'])
+        self.assertNotIn(self.mod.CLEAR_SLASH_COMPLETE, self.sent())
+
+    def test_identity_old_visible_reset_receipt_cannot_bypass_id_match(self):
+        self.identity_transport()
+        self.emit_start = False
+        self.request()
+        self.screen = self.receipt()
+        self.bridge.maybe_confirm_pending_clear()
+        self.assertNotIn(self.mod.CLEAR_SLASH_COMPLETE, self.sent())
+
+    def test_idle_process_identity_survives_other_panes_log_volume(self):
+        self.log_transport()
+        self.db.execute("INSERT INTO logs (id,target,process_uuid) VALUES (30000, 'other', 'pid:999:55555555-5555-5555-5555-555555555555')")
+        self.db.commit()
+        self.assertEqual(self.transport.clear_log_cursor()['process_uuid'], self.owner)
+
+    def test_status_id_parser_rejects_prose_partial_and_ambiguous_box(self):
+        self.identity_transport()
+        self.transport._paste_prompt_unlocked('/status')
+        self.assertEqual(self.mod.clear_status_session_id(self.history), self.SID)
+        for invalid in (f'Session: {self.SID}', self.history.replace('╰', ''),
+                        self.history.replace('╰', f'│ Session: {self.NEW_SID} │\n╰')):
+            self.assertEqual(self.mod.clear_status_session_id(invalid), '')
+
+    def test_native_0162_unboxed_status_without_prompt_prefix(self):
+        self.identity_transport()
+        paste = self.transport._paste_prompt_unlocked
+
+        def unboxed(text):
+            paste(text)
+            if text == '/status':
+                self.history = self.history.replace('› /status', '/status').replace(
+                    '╭────────────────────╮\n│ OpenAI Codex (v0.162.1) │',
+                    '  >_ OpenAI Codex (v0.162.1)').replace('│ Session:', '  Session:').replace(
+                    ' │\n╰────────────────────╯', '')
+        self.transport._paste_prompt_unlocked = unboxed
+        self.request()
+        self.assertEqual(self.sent(), [self.mod.CLEAR_SLASH_COMPLETE])
+
+    def test_narrow_status_wraps_session_value_and_clears_probe_display(self):
+        self.identity_transport()
+        paste = self.transport._paste_prompt_unlocked
+
+        def wrapped(text):
+            paste(text)
+            if text == '/status':
+                self.history = self.history.replace(
+                    f'│ Session: {self.active_id} │',
+                    f'│ Session: │\n│ {self.active_id[:30]} │\n│ {self.active_id[30:]} │')
+        self.transport._paste_prompt_unlocked = wrapped
+        self.request()
+        self.assertEqual(self.sent(), [self.mod.CLEAR_SLASH_COMPLETE])
+        self.assertEqual(self.commands, ['/status', '/clear', '/status'])
+        self.assertEqual(self.keys, ['C-l', 'C-l'])
+        self.assertEqual(self.history, '')
+
+    def test_wrapped_status_parser_rejects_unrelated_or_ambiguous_uuid(self):
+        header = '  >_ OpenAI Codex (v0.162.1)\n'
+        wrapped = f'  Session:\n    {self.SID[:30]}\n    {self.SID[30:]}\n'
+        self.assertEqual(self.mod.clear_status_session_id(header + wrapped), self.SID)
+        for invalid in (
+            wrapped.replace('Session:\n', 'Session:\n\n'),
+            wrapped + f'  Session: {self.NEW_SID}\n',
+            f'  Session: {self.SID[:30]}\n  Note: {self.SID[30:]}\n',
+            f'  Session: {self.SID}\n  Session: invalid\n',
+        ):
+            with self.subTest(invalid=invalid):
+                self.assertEqual(self.mod.clear_status_session_id(header + invalid), '')
+
+    def test_failed_identity_probe_cleans_only_its_own_idle_status(self):
+        self.identity_transport()
+        paste = self.transport._paste_prompt_unlocked
+
+        def invalid_id(text):
+            paste(text)
+            self.history = self.history.replace(self.active_id, 'unavailable')
+        self.transport._paste_prompt_unlocked = invalid_id
+        self.request()
+        self.assertEqual(self.commands, ['/status'])
+        self.assertEqual(self.keys, ['C-l'])
+        self.assertNotIn(self.mod.CLEAR_SLASH_COMPLETE, self.sent())
+
+    def test_status_cleanup_preserves_a_new_draft(self):
+        self.identity_transport()
+        paste = self.transport._paste_prompt_unlocked
+
+        def draft(text):
+            paste(text)
+            self.screen = self.screen.replace('Ask Codex to do anything', 'unfinished draft')
+        self.transport._paste_prompt_unlocked = draft
+        self.request()
+        self.assertEqual(self.keys, [])
+        self.assertEqual(self.commands, ['/status'])
+
+    def test_status_cleanup_preserves_an_intervening_command(self):
+        self.identity_transport()
+        paste = self.transport._paste_prompt_unlocked
+
+        def another_command(text):
+            paste(text)
+            self.history += '› /help\ncommand help\n'
+        self.transport._paste_prompt_unlocked = another_command
+        self.request()
+        self.assertEqual(self.keys, [])
+        self.assertEqual(self.commands, ['/status'])
+
+    def test_footer_change_cannot_make_old_status_fresh(self):
+        self.identity_transport()
+        self.transport._paste_prompt_unlocked('/status')
+
+        def only_footer(text):
+            self.commands.append(text)
+            self.screen = self.screen.replace('max', 'medium')
+        self.transport._paste_prompt_unlocked = only_footer
+        self.commands.clear()
+        self.request()
+        self.assertEqual(self.commands, ['/status'])
+        self.assertNotIn(self.mod.CLEAR_SLASH_COMPLETE, self.sent())
 
     def test_log_receipt_completes_without_banner_or_new_rollout(self):
         self.log_transport()
@@ -249,6 +831,162 @@ class ClearAcknowledgementTest(unittest.TestCase):
         self.request()
         self.assertEqual(self.sent(), [self.mod.CLEAR_SLASH_COMPLETE])
         self.assertEqual(self.repl.session_file(), self.old)
+
+    def split_server(self):
+        self.log_transport()
+        self.server_owner = "pid:123:33333333-3333-3333-3333-333333333333"
+        self.process_tree = {120: {120, 121, 122, 123}, 121: {121, 122, 123}}
+        self.db.execute("INSERT INTO logs (target,process_uuid,feedback_log_body) VALUES ('codex_app_server::message_processor', ?, 'app-server request: account/rateLimits/read connection_id=ConnectionId(1)')", (self.server_owner,))
+        self.db.commit()
+        self.screen = "› Ask Codex to do anything\n\nGPT-6-Astra medium · ~ · Context 0% used · weekly 69% left\n? for shortcuts\n"
+
+    def test_descendant_server_receipt_without_product_title_completes_once(self):
+        self.split_server()
+        self.repl.paste_prompt.side_effect = lambda *_: self.start_receipt(owner=self.server_owner)
+        self.request()
+        self.bridge.maybe_confirm_pending_clear()
+        self.assertEqual(self.sent(), [self.mod.CLEAR_SLASH_COMPLETE])
+        self.assertEqual(self.repl.session_file(), self.old)
+
+    def test_agent_navigation_footer_completes_once_after_fresh_receipt(self):
+        self.split_server()
+        self.screen = (
+            '  >_ OpenAI Codex (v0.162.0)\n\n'
+            '› Ask Codex to do anything\n\n'
+            '  GPT-6-Astra medium · ~ · Context 0% used · weekly 68% left\n'
+            '  ← for agents · ? for shortcuts\n')
+        self.request()
+        self.assertNotIn(self.mod.CLEAR_SLASH_COMPLETE, self.sent())
+        self.start_receipt(owner=self.server_owner)
+        self.bridge.maybe_confirm_pending_clear()
+        self.bridge.maybe_confirm_pending_clear()
+        self.assertEqual(self.sent().count(self.mod.CLEAR_SLASH_COMPLETE), 1)
+        self.assertNotIn('pending_clear_watch', self.state())
+        self.assertEqual(self.repl.session_file(), self.old)
+
+    def test_agent_navigation_footer_with_warnings_completes(self):
+        self.split_server()
+        self.screen = self.screen.replace(
+            '? for shortcuts', '← for agents · ? for shortcuts ⚠️ 2 warnings · f2 to view')
+        self.repl.paste_prompt.side_effect = lambda *_: self.start_receipt(owner=self.server_owner)
+        self.request()
+        self.assertEqual(self.sent(), [self.mod.CLEAR_SLASH_COMPLETE])
+
+    def test_agent_footer_does_not_accept_arbitrary_prefix_or_suffix(self):
+        self.split_server()
+        self.request()
+        self.start_receipt(owner=self.server_owner)
+        for footer in ('unrecognized modal · ? for shortcuts',
+                       '← for agents · ? for shortcuts · unsent text',
+                       '← for agents · ? for shortcuts\nadditional modal'):
+            with self.subTest(footer=footer):
+                self.screen = ('› Ask Codex to do anything\nContext 0% used\n' + footer)
+                self.assertFalse(self.bridge._pending_clear_reset_confirmed(self.bridge.pending_clear_watch))
+
+    def test_split_server_watermark_survives_bridge_restart(self):
+        self.split_server()
+        self.request()
+        self.bridge = self.make_bridge()
+        self.start_receipt(owner=self.server_owner)
+        self.bridge.maybe_confirm_pending_clear()
+        self.assertEqual(self.sent().count(self.mod.CLEAR_SLASH_COMPLETE), 1)
+
+    def test_sibling_server_is_not_bound_to_this_tui(self):
+        self.split_server()
+        self.process_tree[121] = {121}
+        cursor = self.transport.clear_log_cursor()
+        self.start_receipt(owner=self.server_owner)
+        self.assertFalse(self.transport.clear_log_confirms_reset(cursor))
+
+    def test_restarted_or_reparented_server_does_not_confirm(self):
+        self.split_server()
+        cursor = self.transport.clear_log_cursor()
+        self.start_receipt(owner="pid:123:44444444-4444-4444-4444-444444444444")
+        self.assertFalse(self.transport.clear_log_confirms_reset(cursor))
+        self.start_receipt(owner=self.server_owner)
+        self.process_tree[121] = {121}
+        self.assertFalse(self.transport.clear_log_confirms_reset(cursor))
+
+    def test_embedded_server_is_not_replaced_by_a_descendant_app(self):
+        self.split_server()
+        self.db.execute("INSERT INTO logs (target,process_uuid,feedback_log_body) VALUES ('codex_app_server::outgoing_message', ?, 'app-server event: thread/tokenUsage/updated')", (self.owner,))
+        self.db.execute("INSERT INTO logs (target,process_uuid) VALUES ('codex_app_server::message_processor', 'pid:122:44444444-4444-4444-4444-444444444444')")
+        self.db.commit()
+        cursor = self.transport.clear_log_cursor()
+        self.assertIsNotNone(cursor)
+        self.assertEqual(cursor['receipt_process_uuid'], self.owner)
+        self.start_receipt(owner=self.server_owner)
+        self.assertFalse(self.transport.clear_log_confirms_reset(cursor))
+        self.start_receipt()
+        self.assertTrue(self.transport.clear_log_confirms_reset(cursor))
+
+    def test_ambiguous_descendant_servers_fail_closed(self):
+        self.split_server()
+        self.db.execute("INSERT INTO logs (target,process_uuid) VALUES ('codex_app_server::message_processor', 'pid:122:44444444-4444-4444-4444-444444444444')")
+        self.db.commit()
+        self.assertIsNone(self.transport.clear_log_cursor())
+
+    def test_split_server_ignores_other_sessions_and_temporary_requests(self):
+        self.split_server()
+        cursor = self.transport.clear_log_cursor()
+        self.start_receipt(owner=self.server_owner, request_id="temporary-structured-example")
+        self.start_receipt(owner="pid:999:55555555-5555-5555-5555-555555555555")
+        self.assertFalse(self.transport.clear_log_confirms_reset(cursor))
+
+    def test_other_client_on_same_daemon_is_not_clear_completion(self):
+        self.split_server()
+        cursor = self.transport.clear_log_cursor()
+        self.start_receipt(owner=self.server_owner, connection_id="2")
+        self.assertFalse(self.transport.clear_log_confirms_reset(cursor))
+
+    def test_shared_or_unknown_daemon_connection_fails_closed(self):
+        self.split_server()
+        self.db.execute("INSERT INTO logs (target,process_uuid,feedback_log_body) VALUES ('codex_app_server::message_processor', ?, 'app-server request: account/rateLimits/read connection_id=ConnectionId(2)')", (self.server_owner,))
+        self.db.commit()
+        self.assertIsNone(self.transport.clear_log_cursor())
+        self.db.execute("UPDATE logs SET feedback_log_body='unknown' WHERE target='codex_app_server::message_processor'")
+        self.db.commit()
+        self.assertIsNone(self.transport.clear_log_cursor())
+
+    def test_initialize_only_diagnostic_client_does_not_mask_tui_connection(self):
+        self.split_server()
+        self.db.execute("INSERT INTO logs (target,process_uuid,feedback_log_body) VALUES ('codex_app_server::message_processor', ?, 'app-server request: initialize connection_id=ConnectionId(40) request_id=Integer(1)')", (self.server_owner,))
+        self.db.commit()
+        cursor = self.transport.clear_log_cursor()
+        self.assertEqual(cursor["receipt_connection_id"], "1")
+        self.start_receipt(owner=self.server_owner, connection_id="40")
+        self.assertFalse(self.transport.clear_log_confirms_reset(cursor))
+        cursor = self.transport.clear_log_cursor()
+        self.start_receipt(owner=self.server_owner)
+        self.assertTrue(self.transport.clear_log_confirms_reset(cursor))
+
+    def test_initialize_alone_does_not_establish_tui_connection(self):
+        self.split_server()
+        self.db.execute("UPDATE logs SET feedback_log_body='app-server request: initialize connection_id=ConnectionId(1)' WHERE target='codex_app_server::message_processor'")
+        self.db.commit()
+        self.assertIsNone(self.transport.clear_log_cursor())
+
+    def test_title_free_screen_still_requires_empty_composer_and_zero_context(self):
+        self.split_server()
+        self.request()
+        self.start_receipt(owner=self.server_owner)
+        for screen in ("› existing draft\nContext 0% used\n",
+                       "› Ask Codex to do anything\nContext 12% used\n",
+                       "quoted Ask Codex to do anything\nContext 0% used\n",
+                       "› Ask Codex to do anything\nexisting draft\nContext 0% used\n",
+                       "› Ask Codex to do anything\nContext 0% used\n› unsent user draft\nGPT-6 · Context 12% used\n? for shortcuts\n",
+                       "› Ask Codex to do anything\nContext 0% used\nunknown modal\n"):
+            with self.subTest(screen=screen):
+                self.screen = screen
+                self.assertFalse(self.bridge._pending_clear_reset_confirmed(self.bridge.pending_clear_watch))
+
+    def test_legacy_persisted_log_cursor_remains_supported(self):
+        self.log_transport()
+        cursor = self.transport.clear_log_cursor()
+        cursor.pop("receipt_pid")
+        cursor.pop("receipt_process_uuid")
+        self.start_receipt()
+        self.assertTrue(self.transport.clear_log_confirms_reset(cursor))
 
     def test_log_watermark_survives_bridge_restart_and_ack_is_once(self):
         self.log_transport()
@@ -351,7 +1089,7 @@ class ClearAcknowledgementTest(unittest.TestCase):
         self.request()
         self.clock += 91
         self.bridge.ensure_session_file()
-        self.assertIn('세션 전환을 확인하지 못했습니다. 완료로 표시하지 않습니다.', self.sent())
+        self.assertIn(self.mod.CLEAR_SLASH_TIMEOUT, self.sent())
         self.assertNotIn('pending_clear_watch', self.state())
 
     def test_review_disabled_clear_does_not_wait_for_unrelated_switch(self):
@@ -505,7 +1243,7 @@ class ClearAcknowledgementTest(unittest.TestCase):
         resumed = self.make_bridge()
         with self.assertRaises(RuntimeError):
             resumed.ensure_session_file()
-        self.assertIn('세션 전환을 확인하지 못했습니다. 완료로 표시하지 않습니다.', self.sent())
+        self.assertIn(self.mod.CLEAR_SLASH_TIMEOUT, self.sent())
         self.assertNotIn('pending_clear_watch', self.state())
         self.assertEqual(self.state()['offset'], previous['offset'])
 

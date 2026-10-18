@@ -25,27 +25,6 @@ original language. Terminal setup/diagnostic output and advanced operator flow
 reports are currently unchanged. Read the [language reference and verification
 paths](docs/i18n.md) or the [한국어 시작 안내](README.ko.md).
 
-## GitHub release 0.9.18
-
-Install this GitHub release with:
-
-```bash
-pipx install "git+https://github.com/ssamssae/codex-telegram-bridge.git@v0.9.18"
-```
-
-This source release does not update the PyPI package.
-
-With the POSIX tmux transport and live flow cards enabled (`CRB_FLOW_MIRROR=1`),
-the current progress card can show **Stop**. The bridge checks the same live
-session and turn before sending the interrupt. A stale card, a draft, or a
-pending approval cannot stop another turn.
-
-If Codex shows pending messages with its native “press esc to interrupt and
-send immediately” hint for at least ten seconds, the card can also show
-**Apply now**. It invokes Codex's native action for those pending messages.
-Ordinary Tab queues are not eligible. These controls are unavailable in native
-Windows and one-shot `exec` mode; WSL with tmux supports them.
-
 Codex Telegram Bridge is a phone remote for your already-running Codex TUI. Send
 prompts, screenshots, videos, voice notes, and files from Telegram; the bridge
 pastes them into your visible tmux Codex session, watches Codex's structured
@@ -879,6 +858,7 @@ Required settings are intentionally small and explicit.
 | `CRB_TYPING_MAX_SECONDS` | no | `7200` | Maximum lifetime for repeated Telegram `typing` actions during one visible Codex turn. |
 | `CRB_TELEGRAM_FALLBACK_SECONDS` | no | `90` | One-shot fallback progress reply delay for Telegram-origin REPL prompts when `final_answer` is delayed. Set `0` to disable. |
 | `CRB_FLOW_MIRROR` | no | `0` | Opt in to live Codex tool/stage mirroring. The flag `~/.config/codex-telegram-bridge/flow-mirror.on` is an equivalent runtime gate. |
+| `CRB_CLEAR_SIDECAR` | no | `1` | When the `/clear` identity probe cannot recognise the visible Codex screen, keep a masked copy (ids zeroed, e-mail/home user/thread name replaced, line lengths kept) under `<state_dir>/clear-screen-sidecar/` (0600, newest 20) so the next fix starts from the real capture. Set `0` to disable. The bridge log still records stage codes only. |
 | `SUGGESTED_REPLY_BUBBLE` | no | `0` | Opt in with `1` to show final-line suggestion tags as separate Telegram bubbles. |
 | `CRB_REASONING_MIRROR` | no | `1` | Mirror Codex's public reasoning summary to Telegram with the `🧠 코덱스 사고` header, sent right after the final answer. Only the runtime-public summary is sent (never raw chain-of-thought); copy-payload replies do not emit a reasoning mirror. Set `0` to disable. |
 | `CRB_LONG_RUNNING_PROGRESS_SECONDS` | no | `0` | Legacy periodic progress interval for long-running Telegram-origin REPL prompts. The flow mirror replaces it by default; set a positive second value to re-enable. |
@@ -1156,14 +1136,3 @@ includes `voice_input_provenance` for receiver integrations. Fresh conversations
 and `/clear` transitions retain the first input card and rebind unmatched receipts
 only to the same live pane with an exact body hash and post-injection event time.
 Generic terminal input mirroring stays available when no voice receipt matches.
-
-## Contributing
-
-See [CONTRIBUTING.md](CONTRIBUTING.md).
-
-### Clear acknowledgement on recent Codex versions
-
-When the native resume banner is absent, the tmux bridge checks a fresh
-`thread/started` log event from the attached TUI process and its empty main
-conversation. Old or delayed logs, other processes, and failed clears cannot
-confirm success. Missing log support retains the existing confirmation path.

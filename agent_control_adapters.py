@@ -8,11 +8,13 @@ import os
 from pathlib import Path
 import re
 import secrets
+import shlex
+import subprocess
 import sys
 import threading
 import time
 
-from agent_control_protocol import ControlError, Controller, validate_current, write_json
+from agent_control_protocol import ControlError, Controller, HANDOFF_NODES, validate_current, write_json
 
 
 def fingerprint(*parts):
@@ -165,6 +167,10 @@ def transcript(path, limit=40, row_adapter=None):
             if row.get('type') != 'message':
                 continue
         elif isinstance(row.get('message'), dict):
+            # Diagnostic blobs can repeat a prompt with private system context.
+            # Only native conversation envelopes belong in the visible history.
+            if row.get('type') not in ('user', 'assistant'):
+                continue
             row = row['message']
         role = row.get('role')
         if role not in ('user', 'assistant') or row.get('channel') in ('analysis', 'justify', 'confidence'):

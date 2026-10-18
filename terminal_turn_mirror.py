@@ -192,3 +192,186 @@ def telegram_chunks(text: str, limit: int = TELEGRAM_CHUNK_LIMIT) -> list[str]:
         start = end
     total = len(pieces)
     return [f"{piece}\n({idx}/{total})" for idx, piece in enumerate(pieces, start=1)]
+
+
+# T-261011-071: display metadata is shared by all four bridges. It never grants
+# dispatch authority and never selects a transport or another engine's bot.
+ENGINE_LABELS = {"claude": "클로드", "codex": "코덱스", "grok": "그록", "cursor": "커서"}
+
+
+def handoff_node_label(node: str) -> str:
+    return mask_secrets(node)[:50]
+
+
+def handoff_context(text: str, receiver: str, receiver_engine: str = "claude", *, skip_line=None, node_label=None):
+    raw = text or ""
+    if receiver_engine not in ENGINE_LABELS:
+        return None
+    route = re.search(r"(?m)^from=([^\s|]+)\s*\|\s*task=(T-\d{6}-\d+)\b([^\n]*)", raw)
+    label = node_label or handoff_node_label
+    sender_engine = ""
+    if route:
+        sender, task = route[1], route[2]
+        match = re.search(r"\bsender_engine=(claude|codex|grok|cursor)\b", route[3])
+        if not match:
+            match = re.search(r"(?m)^\[directive-sender-engine: (claude|codex|grok|cursor)\]$", raw)
+        sender_engine = match[1] if match else ""
+    elif is_approved_fleet_prompt(raw):
+        task, worker, issuer = fleet_link(raw)
+        if not task or not worker or not issuer or ":" not in worker or ":" not in issuer:
+            return None
+        target_node, target_engine = worker.rsplit(":", 1)
+        sender, sender_engine = issuer.rsplit(":", 1)
+        if target_engine != receiver_engine or label(target_node) != label(receiver):
+            return None
+        if sender_engine not in ENGINE_LABELS:
+            return None
+    else:
+        return None
+    lines = [line.strip() for line in raw.splitlines() if line.strip()]
+    lines = [line for line in lines if not re.match(
+        r"^(?:from=|\[(?:directive-|claude-skills HEAD|APPROVED-FLEET|CLAUDE-REVIEW-ROUTE)|<[^>]+>$)", line)
+        and not re.fullmatch(r"T-\d{6}-\d+", line)
+        and not (skip_line and skip_line(line))]
+    title = lines[0] if lines else "전달받은 작업"
+    title = re.sub(r"^#+\s*|^\[(?:명령|지시)\]\s*", "", title)
+    title = " ".join(mask_secrets(title.replace(task, "")).split()).strip(" —:|-#")
+    title = title[:159] + "…" if len(title) > 160 else title
+    source = label(sender) + (" " + ENGINE_LABELS[sender_engine] if sender_engine else "")
+    return {"title": title or "전달받은 작업", "task_id": task,
+            "route": f"{source} → {label(receiver)} {ENGINE_LABELS[receiver_engine]}"}
+
+
+def format_handoff_card(context, steps=(), *, done_label="", elapsed_text="", updated=""):
+    if isinstance(steps, str):
+        steps = steps.splitlines()
+    lines = [mask_secrets(str(line)).strip()[:160] for line in steps if str(line).strip()][-6:]
+    status = done_label or ("진행 중" if lines else "접수됨")
+    head = f"{status}\n{context['title']}\n\n{context['route']}\n{context['task_id']}"
+    detail = ("\n".join(lines) or "진행 내용은 작업을 시작하면 표시합니다.") if not done_label else ""
+    footer = f"소요 {elapsed_text}" if done_label and elapsed_text else (f"갱신 {updated}" if updated and lines else "")
+    return "\n\n".join(part for part in (head, detail, footer) if part)
+
+
+class HandoffCard:
+    """One durable card per native turn; an uncertain send is never reposted.
+
+    Callbacks stay on the receiving bridge's existing transport. Only masked
+    display context and native turn hashes are persisted, never prompt bodies.
+    """
+    def __init__(self, path, send, edit):
+        import json
+        import threading
+        from pathlib import Path
+        self.path, self.send, self.edit = Path(path), send, edit
+        self.lock = threading.RLock()
+        try:
+            self.state = json.loads(self.path.read_text())
+        except (OSError, ValueError):
+            self.state = {}
+        self.retry_close()
+
+    @property
+    def message_id(self):
+        value = self.state.get("message_id")
+        return value if type(value) is int and value > 0 else 0
+
+    @property
+    def active(self):
+        return bool(self.state.get("context")) and not self.state.get("closed")
+
+    def _save(self):
+        import json
+        import os
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = self.path.with_suffix(".tmp")
+        with open(tmp, "w", encoding="utf-8") as stream:
+            os.chmod(tmp, 0o600)
+            json.dump(self.state, stream, ensure_ascii=False)
+        os.replace(tmp, self.path)
+
+    def begin(self, context, key):
+        import hashlib
+        import time
+        key = hashlib.sha256(str(key).encode()).hexdigest()
+        with self.lock:
+            if self.state.get("key") == key:
+                self.retry_close()
+                return
+            if self.active:
+                self.finish("새 요청으로 전환")
+            pending = list(self.state.get("pending_cards", []))
+            if self.message_id and self.state.get("pending_close"):
+                pending.append({"message_id": self.message_id, "body": self.state["pending_close"]})
+            self.state = dict(key=key, context=context, message_id=0, closed=False,
+                              started=time.time(), steps=[], attempted=True, pending_cards=pending)
+            self._save()  # Before send: a timeout/crash must not produce a second card.
+            try:
+                mid = self.send(format_handoff_card(context))
+            except Exception:
+                mid = 0  # Unknown send: keep the durable intent, never repost.
+            try:
+                mid = int(mid) if not isinstance(mid, bool) else 0
+            except (TypeError, ValueError):
+                mid = 0
+            self.state["message_id"] = max(0, mid)
+            self._save()
+
+    def update(self, step="", *, done_label=""):
+        import time
+        from datetime import datetime
+        with self.lock:
+            if not self.active:
+                return False
+            if self.state.get("pending_close") and not done_label:
+                self.retry_close()
+                return False
+            steps = self.state.get("steps", [])
+            step = mask_secrets(step)[:160]
+            if step and (not steps or steps[-1] != step):
+                steps = (steps + [step])[-6:]
+                self.state["steps"] = steps
+            elapsed = f"{int(max(0, time.time() - self.state['started']))}초"
+            body = format_handoff_card(self.state["context"], steps, done_label=done_label,
+                                       elapsed_text=elapsed, updated=datetime.now().strftime("%H:%M"))
+            if done_label:
+                self.state["pending_close"] = body
+                self._save()
+            ok = bool(self.message_id and self._edit(self.message_id, body))
+            if done_label and (ok or not self.message_id):
+                self.state["closed"] = True
+                self.state.pop("pending_close", None)
+            self._save()
+            return ok
+
+    def _edit(self, mid, body):
+        try:
+            return bool(self.edit(mid, body))
+        except Exception:
+            return False
+
+    def retry_close(self):
+        with self.lock:
+            pending = self.state.get("pending_cards", [])
+            if pending:
+                self.state["pending_cards"] = [item for item in pending
+                    if not self._edit(item["message_id"], item["body"])]
+                self._save()
+            body = self.state.get("pending_close")
+            if body and self.message_id and self._edit(self.message_id, body):
+                self.state["closed"] = True
+                self.state.pop("pending_close", None)
+                self._save()
+
+    def finish(self, label="응답 완료"):
+        return self.update(done_label=label)
+
+    def forget(self):
+        with self.lock:
+            if self.active:
+                self.finish("새 요청으로 전환")
+            pending = list(self.state.get("pending_cards", []))
+            if self.message_id and self.state.get("pending_close"):
+                pending.append({"message_id": self.message_id, "body": self.state["pending_close"]})
+            self.state = {"pending_cards": pending}
+            self._save()
