@@ -13,7 +13,7 @@ import secrets
 import threading
 import time
 
-from agent_control_adapters import TerminalAdapter, fingerprint
+from agent_control_adapters import TerminalAdapter, fingerprint, session_key
 from agent_control_protocol import write_json
 
 
@@ -120,7 +120,7 @@ class SendNowButtons:
         current = self.adapter.snapshot(include_turn=True)
         if (current["status"] != "busy" or current["draft"] or current["question"]
                 or not current["turn"] or "stop" not in current["capabilities"]
-                or current["session"] != fingerprint("codex", b.repl.pane_pid(), b.session_path)
+                or current["session"] != session_key("codex", b.repl.pane_pid(), b.session_path)
                 or current["turn_id"] != ((b.bridge_state or {}).get("active_turn") or {}).get("id")):
             return None
         stop = getattr(b, "stop_buttons", None)
