@@ -69,7 +69,8 @@ class SendNowTests(unittest.TestCase):
         tmp = tempfile.TemporaryDirectory()
         self.addCleanup(tmp.cleanup)
         self.root = Path(tmp.name)
-        self.session = self.root / 'session.jsonl'
+        # A real rollout name: its thread id is the control session key.
+        self.session = self.root / 'rollout-2026-10-25T18-40-00-01a167a9-afe8-7cd0-9f59-398da85c06d1.jsonl'
         self.session.write_text(json.dumps({'type': 'event_msg', 'payload':
                                            {'type': 'task_started', 'turn_id': 'turn-a'}}) + '\n')
         cfg = SimpleNamespace(state_path=self.root / 'state.json', node='test-node', emoji='🤖',

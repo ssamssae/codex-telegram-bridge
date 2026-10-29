@@ -5331,8 +5331,9 @@ def descendants(root_pid: int) -> set[int]:
     return result
 
 
-def session_file_from_descendants(root_pid: int) -> Path | None:
-    candidates: list[Path] = []
+def descendant_open_files(root_pid: int) -> list[str] | None:
+    """Files held open by the pane process tree; None when they cannot be read."""
+    names: list[str] = []
     try:
         pids = descendants(root_pid)
         if not Path("/proc").exists():
@@ -5340,11 +5341,7 @@ def session_file_from_descendants(root_pid: int) -> Path | None:
                 ["lsof", "-a", "-p", ",".join(map(str, sorted(pids))), "-Fn"],
                 capture_output=True, text=True, timeout=5, check=False,
             )
-            candidates.extend(
-                Path(line[1:]) for line in proc.stdout.splitlines()
-                if line.startswith("n") and "/.codex/sessions/" in line
-                and line.endswith(".jsonl")
-            )
+            names.extend(line[1:] for line in proc.stdout.splitlines() if line.startswith("n"))
         else:
             for pid in pids:
                 fd_dir = Path(f"/proc/{pid}/fd")
@@ -5354,17 +5351,40 @@ def session_file_from_descendants(root_pid: int) -> Path | None:
                     continue
                 for fd in fds:
                     try:
-                        target = os.readlink(fd)
+                        names.append(os.readlink(fd))
                     except OSError:
                         continue
-                    if "/.codex/sessions/" in target and target.endswith(".jsonl"):
-                        candidates.append(Path(target))
     except (OSError, subprocess.SubprocessError):
         return None
+    return names
+
+
+def session_file_from_descendants(root_pid: int) -> Path | None:
+    names = descendant_open_files(root_pid)
+    if names is None:
+        return None
+    candidates = [Path(name) for name in names
+                  if "/.codex/sessions/" in name and name.endswith(".jsonl")]
     candidates = [path for path in candidates if is_root_codex_tui_session(path)]
     if not candidates:
         return None
     return max(candidates, key=lambda p: p.stat().st_mtime if p.exists() else 0)
+
+
+CODEX_THREAD_LOCK = re.compile(
+    r"/\.codex/thread-writer-locks/[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}\.lock$")
+
+
+def codex_thread_lock_from_descendants(root_pid: int) -> Path | None:
+    """Codex writes its rollout only after the first turn; a fresh TUI holds just this lock."""
+    names = descendant_open_files(root_pid)
+    # Any open rollout means the thread already has turns, even one the root filter
+    # rejected or an earlier listing missed; its empty lock is no native evidence.
+    if names is None or any("/.codex/sessions/" in name and name.endswith(".jsonl") for name in names):
+        return None
+    locks = {Path(name) for name in names if CODEX_THREAD_LOCK.search(name)}
+    # More than one thread cannot be told apart without a rollout, so never guess.
+    return next(iter(locks)) if len(locks) == 1 else None
 
 
 def is_root_codex_tui_session(path: Path) -> bool:
