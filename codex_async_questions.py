@@ -145,6 +145,66 @@ class AsyncQuestions:
             except Exception:
                 pass  # Durable state, not a stale Telegram keyboard, controls admission.
 
+    def sync_pins(self, session):
+        """Maintain only our question pins; one bounded API operation per tick.
+
+        Pinning is presentation, never an answer or permission. Persist ownership
+        before calling Telegram so a lost response cannot strand an unowned pin.
+        Network I/O stays outside the question lock to keep answers responsive.
+        """
+        chat_id = str(self.telegram.chat_id)
+        if not session or not chat_id.isdecimal() or int(chat_id) <= 0:
+            return
+        now = self.clock()
+        with self.lock:
+            for key, item in self.items.items():
+                mid = item.get('message_id')
+                if (type(mid) is not int or mid <= 0
+                        or item.get('message_chat_id') != chat_id):
+                    continue
+                pending = (item['session'] == session
+                           and item['status'] in {'open', 'submitting', 'uncertain'}
+                           and 0 <= now - item['created'] < TTL)
+                if pending and item.get('pin_confirmed') is True:
+                    continue
+                if not pending and not item.get('pin_managed'):
+                    continue
+                action = 'pinChatMessage' if pending else 'unpinChatMessage'
+                same_action = item.get('pin_action') == action
+                if same_action and (item.get('pin_attempts', 0) >= 3
+                                    or now < item.get('pin_retry_at', 0)):
+                    continue
+                attempt = item.get('pin_attempts', 0) + 1 if same_action else 1
+                item.update(pin_managed=True, pin_confirmed=None,
+                            pin_action=action, pin_attempts=attempt,
+                            pin_retry_at=now + 60)
+                self.save()
+                break
+            else:
+                return
+        kwargs = dict(chat_id=chat_id, message_id=mid)
+        if pending:
+            kwargs['disable_notification'] = True
+        try:
+            result = self.telegram.call(action, _attempts=1, _request_timeout=5.0, **kwargs)
+        except Exception:
+            result = None
+        if not (isinstance(result, dict) and result.get('ok') is True
+                and result.get('result') is True):
+            return  # Keep bounded retry and ownership, without changing the answer.
+        with self.lock:
+            item = self.items.get(key)
+            if (not item or item.get('message_id') != mid
+                    or item.get('pin_action') != action or item.get('pin_attempts') != attempt):
+                return
+            if pending:
+                item['pin_confirmed'] = True
+            else:
+                for field in ('pin_managed', 'pin_confirmed', 'pin_action',
+                              'pin_attempts', 'pin_retry_at'):
+                    item.pop(field, None)
+            self.save()
+
     @staticmethod
     def owns_message(item, message_id):
         return (item.get('message_id') == message_id
@@ -339,6 +399,7 @@ class AsyncQuestions:
                     except Exception:
                         mid = None
                     item['message_id'] = mid
+                    item['message_chat_id'] = str(self.telegram.chat_id)
                     item['status'] = 'open' if type(mid) is int and mid > 0 else 'uncertain'
                     self.save()
 
