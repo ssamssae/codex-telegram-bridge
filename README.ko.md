@@ -43,6 +43,30 @@ Python 3.10 이상과 로그인된 Codex CLI가 필요합니다. macOS·Linux·W
    이어서 짧은 질문을 보내 컴퓨터의 같은 Codex 창으로 전달되는지, 최종 답변이
    텔레그램으로 돌아오는지 확인합니다.
 
+### 제작자와 똑같이 쓰기 (한 줄 설치)
+
+```bash
+pipx install codex-telegram-bridge && codex-telegram-bridge setup --like-author --language ko
+```
+
+사람 손이 필요한 일은 둘뿐입니다. BotFather에서 봇을 만들어 토큰을 받는 것과, 그 봇에 `/start`를 보내는 것.
+나머지는 자동입니다. 설정 파일과 아래 스위치 2개(기존 설정 파일은 먼저 백업), 상시 서비스와 워치독,
+tmux 세션 `codex`/`codex`와 그 안의 Codex 실행, 그리고 폰→터미널→폰·터미널→폰 두 방향을 실제로
+한 번씩 돌려 보는 자가 점검까지 합니다. macOS·Linux·WSL에서 `tmux`와 REPL 모드로 동작합니다.
+대화식 설정 도구도 첫 질문으로 `Use the author's setup (recommended)? [Y/n]`을 묻고 기본값은 예입니다.
+
+| 스위치 | 하는 일 |
+| --- | --- |
+| `CRB_FLOW_MIRROR=1` | 작업 흐름 카드와 그 카드의 중지·바로 보내기 버튼. 폰에서 보낸 질문과 터미널에서 친 질문 모두 |
+| `CRB_TELEGRAM_FALLBACK_SECONDS=0` | 폰 질문이 오래 걸릴 때 따로 보내던 진행 안내를 끕니다. 흐름 카드가 이미 진행을 보여 줍니다 |
+
+Codex 훅은 설치하지 않습니다. 브릿지는 Codex 자체 세션 기록을 읽습니다.
+
+그다음부터는 어느 터미널에서든 `codex-tg`를 치면 브릿지가 보는 바로 그 Codex 세션에 붙습니다.
+세션이 없으면 먼저 만듭니다. 폰과 터미널이 같은 세션을 씁니다. 따로 연 Codex 창은 폰과 연결되지 않으며,
+`codex-telegram-bridge doctor`가 그런 창을 보면 경고합니다.
+`setup --like-author --dry-run`은 아무것도 바꾸지 않고 할 일만 보여 줍니다.
+
 ### Windows
 
 네이티브 Windows에서는 `tmux` 없이 텍스트 전용 `exec` 모드를 쓸 수 있습니다.

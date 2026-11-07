@@ -4,10 +4,12 @@
 from __future__ import annotations
 
 import argparse
+import dataclasses
 import getpass
 import json
 import os
 import platform
+import re
 import shlex
 import shutil
 import stat
@@ -43,6 +45,26 @@ WINDOWS_BRIDGE_PROCESS_PATTERN = (
     r"telegram_agent_bridge\.py|codex_repl_bridge\.py|telegram-agent-bridge-run|"
     r"(?:^|\s)-m\s+(?:codex_repl_bridge|telegram_agent_bridge)\b"
 )
+# "Like the author": the switches that make a fresh install behave like the
+# maintainer's own bridge. Each one differs from what the plain wizard writes.
+AUTHOR_PRESET_ENV: tuple[tuple[str, str], ...] = (
+    # The live flow card with its Stop and send-now buttons, for phone prompts
+    # and for prompts typed at the keyboard.
+    ("CRB_FLOW_MIRROR", "1"),
+    # The flow card already shows progress, so no extra one-shot progress note
+    # follows a slow phone prompt.
+    ("CRB_TELEGRAM_FALLBACK_SECONDS", "0"),
+)
+AUTHOR_PRESET_HEADER = "# Author preset (setup --like-author)"
+AUTHOR_PRESET_QUESTION = "Use the author's setup (recommended)? [Y/n] "
+ATTACH_COMMAND = "codex-tg"
+SELF_CHECK_PHONE_TIMEOUT = 60.0
+SELF_CHECK_TERMINAL_TIMEOUT = 90.0
+SELF_CHECK_PROBE = "Reply with the single word OK. (bridge setup self-check)"
+# REPL bridge log lines that prove each direction of the self-check.
+PHONE_ARRIVAL_RE = re.compile(r"matched (?:queued |active )?Telegram-origin prompt")
+PHONE_ANSWER_MARKERS = ("Telegram mirror handled from telegram",)
+TERMINAL_MIRROR_MARKERS = ("sent terminal-origin directive card", "Telegram mirror handled from terminal")
 
 
 class SetupError(RuntimeError):
@@ -417,11 +439,14 @@ def write_env_config(
     submit_key: str,
     audio_transcribe_cmd: str,
     language: str = "en",
+    like_author: bool = False,
 ) -> None:
     if agent != "codex":
         raise SetupError("agent supports only codex")
     if language not in {"en", "ko"}:
         raise SetupError("language must be en or ko")
+    if like_author and mode != "repl":
+        raise SetupError("the author preset needs repl mode")
     local_input_value = "off" if is_windows_platform() else str(local_input)
     codex_extra_args = "--skip-git-repo-check" if mode == "exec" else ""
     lines = [
@@ -466,6 +491,11 @@ def write_env_config(
                 f"CRB_AUDIO_TRANSCRIBE_CMD={shell_quote(audio_transcribe_cmd)}",
             ]
         )
+    if like_author:
+        # Each preset key appears once: the plain default line gives way to it.
+        preset_keys = {key for key, _value in AUTHOR_PRESET_ENV}
+        lines = [line for line in lines if line.split("=", 1)[0] not in preset_keys]
+        lines.extend(["", AUTHOR_PRESET_HEADER, *(f"{key}={value}" for key, value in AUTHOR_PRESET_ENV)])
     lines.append("")
     content = "\n".join(lines)
     write_text_atomic(path, content, mode=0o600)
@@ -627,8 +657,13 @@ def systemd_unit_content(runner_file: Path) -> str:
     )
 
 
+def launchd_log_file() -> Path:
+    """Where the macOS service writes the bridge log (the setup self-check reads it)."""
+    return Path("/tmp") / f"{APP_NAME}.log"
+
+
 def launchd_plist_content(runner_file: Path) -> str:
-    log_file = Path("/tmp") / f"{APP_NAME}.log"
+    log_file = launchd_log_file()
     return "\n".join(
         [
             '<?xml version="1.0" encoding="UTF-8"?>',
@@ -733,6 +768,9 @@ def watchdog_launchd_plist_content() -> str:
 
 def run_command(cmd: list[str], check: bool = False) -> subprocess.CompletedProcess[str]:
     return subprocess.run(cmd, capture_output=True, text=True, check=check)
+
+
+RunCommand = Callable[..., subprocess.CompletedProcess[str]]
 
 
 def command_output(proc: subprocess.CompletedProcess[str]) -> str:
@@ -1368,9 +1406,150 @@ class SetupOptions:
     non_interactive: bool
     yes: bool
     language: str = "en"
+    like_author: bool = False
+    dry_run: bool = False
+    create_session: bool = False
 
 
-def setup_bridge(options: SetupOptions, api_call: ApiCall = telegram_call) -> int:
+def validate_author_preset(options: SetupOptions) -> None:
+    if options.mode != "repl":
+        raise SetupError("--like-author needs --mode repl: the author runs Codex in a tmux session")
+    if is_windows_platform():
+        raise SetupError(
+            "--like-author needs tmux (macOS, Linux, or WSL); on native Windows run setup without it"
+        )
+
+
+def setup_plan_lines(options: SetupOptions) -> list[str]:
+    """What `setup --dry-run` would do: files, switches, session, checks. No I/O."""
+    lines = [
+        "Dry run: nothing is written, started, or sent to Telegram.",
+        f"mode: {options.mode}",
+        f"config: {options.config_file}"
+        + (" (an existing file is backed up first)" if options.like_author else ""),
+        f"runner: {options.runner_file}",
+        f"state dir: {options.state_dir}",
+        "service + watchdog: " + ("install" if options.install_service else "skip"),
+    ]
+    if options.like_author:
+        lines.append("author preset switches (written to the config):")
+        lines.extend(f"  {key}={value}" for key, value in AUTHOR_PRESET_ENV)
+    else:
+        lines.append("switches: plain wizard defaults")
+    lines.append("hooks: none (the bridge reads Codex session logs; it installs no Codex hooks)")
+    if options.mode == "repl":
+        if options.like_author or options.create_session:
+            lines.append(
+                f"tmux session: {options.tmux_socket}/{options.tmux_session} in {options.workdir}, "
+                f"`{options.agent_cmd}` started inside it when the session is missing"
+            )
+        else:
+            lines.append(
+                f"tmux session: start it yourself with tmux -L {options.tmux_socket} new -s {options.tmux_session}"
+            )
+    if options.like_author:
+        lines.append(f"attach any time with: {ATTACH_COMMAND}")
+        lines.append("self-check after install: bot -> phone, phone -> terminal -> phone, terminal -> phone")
+    return lines
+
+
+def backup_config(path: Path) -> Path:
+    """Copy the current private config aside (still chmod 600) before it is rewritten."""
+    stamp = time.strftime("%Y%m%d-%H%M%S")
+    backup = path.with_name(f"{path.name}.bak-{stamp}")
+    counter = 1
+    while backup.exists():
+        backup = path.with_name(f"{path.name}.bak-{stamp}-{counter}")
+        counter += 1
+    shutil.copy2(path, backup)
+    chmod_private(backup)
+    return backup
+
+
+def tmux_pane_target(session: str) -> str:
+    """Target for send-keys/display-message. tmux rejects a bare "=name" there."""
+    if session.startswith("%") or ":" in session or "." in session:
+        return session
+    return f"={session}:"
+
+
+def tmux_session_exists(*, tmux_bin: str, socket: str, session: str, run: RunCommand) -> bool | None:
+    """True/False for the session; None when tmux itself cannot run."""
+    try:
+        probe = run([tmux_bin, "-L", socket, "has-session", "-t", f"={session}"])
+    except OSError:
+        return None
+    return probe.returncode == 0
+
+
+def start_codex_tmux_session(
+    *,
+    tmux_bin: str,
+    socket: str,
+    session: str,
+    workdir: str | Path,
+    agent_cmd: str,
+    run: RunCommand,
+) -> bool:
+    """Create the detached session the bridge controls, with Codex started inside it."""
+    try:
+        first = shlex.split(agent_cmd)[0]
+    except (ValueError, IndexError):
+        fail(f"Codex command is invalid: {agent_cmd}")
+        return False
+    if not shutil.which(first):
+        fail(f"Codex CLI not found on PATH ({first}); install Codex, then run {ATTACH_COMMAND} again")
+        return False
+    try:
+        started = run([tmux_bin, "-L", socket, "new-session", "-d", "-s", session, "-c", str(workdir), agent_cmd])
+    except OSError as exc:
+        fail(f"could not run tmux ({exc}); install tmux, then run {ATTACH_COMMAND}")
+        return False
+    if started.returncode != 0:
+        fail(f"could not start the Codex tmux session: {command_output(started) or f'exit {started.returncode}'}")
+        return False
+    ok(f"started Codex in tmux session {socket}/{session}")
+    return True
+
+
+def ensure_codex_tmux_session(options: SetupOptions, *, run: RunCommand) -> bool:
+    """Start Codex in the bridge session when it is missing; never touch a running one."""
+    exists = tmux_session_exists(tmux_bin="tmux", socket=options.tmux_socket, session=options.tmux_session, run=run)
+    if exists is None:
+        warn(f"tmux was not found on PATH; install it, then run {ATTACH_COMMAND} to start Codex")
+        return False
+    if exists:
+        ok(f"tmux Codex session found: {options.tmux_socket}/{options.tmux_session} (left as it is)")
+        return True
+    return start_codex_tmux_session(
+        tmux_bin="tmux",
+        socket=options.tmux_socket,
+        session=options.tmux_session,
+        workdir=options.workdir,
+        agent_cmd=options.agent_cmd,
+        run=run,
+    )
+
+
+def setup_bridge(
+    options: SetupOptions,
+    api_call: ApiCall = telegram_call,
+    *,
+    run: RunCommand | None = None,
+) -> int:
+    run = run or run_command
+    if options.mode not in {"repl", "exec"}:
+        raise SetupError("--mode must be repl or exec")
+    if options.agent != "codex":
+        raise SetupError("--agent supports only codex")
+    if options.like_author:
+        validate_author_preset(options)
+    if options.dry_run:
+        out("Codex Telegram Bridge setup (dry run)")
+        for line in setup_plan_lines(options):
+            out(line)
+        return 0
+
     out("Codex Telegram Bridge setup")
     out("This wizard connects one Telegram bot to this local machine.")
     out("")
@@ -1381,10 +1560,20 @@ def setup_bridge(options: SetupOptions, api_call: ApiCall = telegram_call) -> in
     if options.mode == "repl":
         setup_note("for full REPL mode, a Codex tmux session: tmux -L codex new -s codex")
 
-    if options.mode not in {"repl", "exec"}:
-        raise SetupError("--mode must be repl or exec")
-    if options.agent != "codex":
-        raise SetupError("--agent supports only codex")
+    if not options.like_author and not options.non_interactive and options.mode == "repl" and not is_windows_platform():
+        out("")
+        setup_note(
+            "The author's setup turns on the live flow card with its Stop button, starts Codex "
+            f"in the bridge tmux session, adds the {ATTACH_COMMAND} command, and checks both "
+            "directions at the end. Answer n for the plain setup."
+        )
+        try:
+            answer = input(AUTHOR_PRESET_QUESTION)
+        except EOFError:
+            # No terminal to answer (a script without --non-interactive): keep the plain setup.
+            answer = "n"
+        if answer.strip().lower() not in {"n", "no"}:
+            options = dataclasses.replace(options, like_author=True)
 
     setup_step(1, "Paste the BotFather token")
     token = (options.token or "").strip()
@@ -1433,7 +1622,13 @@ def setup_bridge(options: SetupOptions, api_call: ApiCall = telegram_call) -> in
         ok(f"chat id configured: {chat_id}")
 
     setup_step(3, "Check the local Codex mode")
-    if options.mode == "repl":
+    if options.mode == "repl" and (options.like_author or options.create_session):
+        setup_note("REPL mode mirrors Telegram into a Codex CLI tmux session.")
+        setup_note(
+            f"Setup starts Codex in tmux session {options.tmux_socket}/{options.tmux_session} "
+            "after writing the config (a running session is left as it is)."
+        )
+    elif options.mode == "repl":
         setup_note("REPL mode mirrors Telegram into an existing Codex CLI tmux session.")
         setup_note("If you have not started that session yet, open another terminal and run:")
         setup_command(f"tmux -L {options.tmux_socket} new -s {options.tmux_session}")
@@ -1468,6 +1663,8 @@ def setup_bridge(options: SetupOptions, api_call: ApiCall = telegram_call) -> in
             else:
                 warn("audio transcription command will be configured, but dependencies are missing")
 
+    if options.like_author and options.config_file.exists():
+        ok(f"backed up previous config: {backup_config(options.config_file)}")
     write_env_config(
         options.config_file,
         mode=options.mode,
@@ -1486,13 +1683,19 @@ def setup_bridge(options: SetupOptions, api_call: ApiCall = telegram_call) -> in
         submit_key=options.submit_key,
         audio_transcribe_cmd=audio_transcribe_cmd,
         language=options.language,
+        like_author=options.like_author,
     )
     ok(f"wrote private config: {options.config_file}")
+    if options.like_author:
+        ok("author preset on: " + ", ".join(f"{key}={value}" for key, value in AUTHOR_PRESET_ENV))
     setup_note("The config file is chmod 600 and should stay out of git.")
 
     current_os = platform.system()
     install_runner(options.runner_file, options.config_file, os_name=current_os)
     ok(f"installed runner: {options.runner_file}")
+    tmux_ready = False
+    if options.mode == "repl" and (options.like_author or options.create_session) and not is_windows_platform():
+        tmux_ready = ensure_codex_tmux_session(options, run=run)
 
     setup_step(5, "Install the background service")
     service_state: str | None = None
@@ -1525,15 +1728,17 @@ def setup_bridge(options: SetupOptions, api_call: ApiCall = telegram_call) -> in
         setup_command(str(options.runner_file))
 
     setup_step(6, "Send a setup-complete test message")
+    bot_message_sent: bool | None = None
     if options.send_test:
-        if send_test_message(
+        bot_message_sent = send_test_message(
             token,
             chat_id,
             api_call=api_call,
             service_status_text=service_state,
             start_command=None if service_is_running(service_state) else start_command,
             language=options.language,
-        ):
+        )
+        if bot_message_sent:
             ok("sent setup-complete test message")
         else:
             warn("could not send setup-complete test message")
@@ -1554,10 +1759,288 @@ def setup_bridge(options: SetupOptions, api_call: ApiCall = telegram_call) -> in
         out("  1. In Telegram, send /ping to your bot.")
         out("  2. If /ping works, send a normal Codex prompt.")
         out(f"  3. Run a health check any time: {doctor_command_hint()}")
+    if options.like_author:
+        out(f"From now on, any terminal: {ATTACH_COMMAND} (the Codex session your phone uses)")
+        if tmux_ready and options.install_service and options.start_service and service_is_running(service_state):
+            author_self_check(
+                token=token,
+                chat_id=chat_id,
+                config=load_env_file(options.config_file),
+                os_name=current_os,
+                api_call=api_call,
+                run=run,
+                bot_message_sent=bot_message_sent,
+            )
+        else:
+            setup_note(
+                "Self-check skipped: it needs the running bridge service and the Codex tmux session. "
+                f"Start them, then run: {doctor_command_hint()}"
+            )
     return 0
 
 
-def doctor(config_file: Path, runner_file: Path, api_call: ApiCall = telegram_call) -> int:
+def codex_sessions_outside_bridge(pane_tty: str, ps_text: str, command: str = "codex") -> list[tuple[str, str]]:
+    """(pid, tty) of Codex CLI processes on a terminal other than the bridge pane.
+
+    `ps_text` is `ps -Ao pid=,tty=,comm=` output. The command field may contain
+    spaces (macOS app bundles), so each line splits into three fields at most.
+    Daemons without a terminal and other programs are ignored.
+    """
+    pane = (pane_tty or "").strip()
+    if not pane:
+        return []
+    pane_name = pane[len("/dev/"):] if pane.startswith("/dev/") else pane
+    found: list[tuple[str, str]] = []
+    for raw in ps_text.splitlines():
+        parts = raw.split(None, 2)
+        if len(parts) < 3:
+            continue
+        pid, tty, comm = parts
+        if os.path.basename(comm.strip()) != command:
+            continue
+        if tty in {"?", "??", "-", ""} or tty in {pane_name, pane}:
+            continue
+        found.append((pid, tty))
+    return found
+
+
+def warn_sessions_outside_bridge(
+    *,
+    tmux_bin: str,
+    socket: str,
+    session: str,
+    command: str,
+    run: RunCommand,
+) -> int:
+    """Doctor warning: a Codex window that is not the one the phone talks to."""
+    try:
+        pane = run([tmux_bin, "-L", socket, "display-message", "-p", "-t", tmux_pane_target(session), "#{pane_tty}"])
+        if pane.returncode != 0:
+            return 0
+        processes = run(["ps", "-Ao", "pid=,tty=,comm="])
+    except OSError:
+        return 0
+    outside = codex_sessions_outside_bridge(pane.stdout or "", processes.stdout or "", command)
+    if not outside:
+        return 0
+    listed = ", ".join(f"pid {pid} on {tty}" for pid, tty in outside)
+    warn(
+        f"a Codex session is running outside the bridge tmux session ({listed}); "
+        f"use {ATTACH_COMMAND} so your phone and terminal share one session"
+    )
+    return 1
+
+
+def attach_command(
+    config_file: Path,
+    *,
+    run: RunCommand | None = None,
+    exec_fn: Callable[[str, list[str]], Any] | None = None,
+    create_missing: bool = True,
+) -> int:
+    """Attach this terminal to the Codex session the bridge controls (`codex-tg`)."""
+    run = run or run_command
+    exec_fn = exec_fn or os.execvp
+    if not config_file.exists():
+        setup_note(f"config not found: {config_file}; using the default session codex/codex")
+    config = load_env_file(config_file)
+    if (config.get("TAB_BRIDGE_MODE") or "repl").strip().lower() != "repl":
+        fail("attach needs REPL mode; exec mode runs one-shot Codex turns without a terminal session")
+        return 2
+    if (config.get("CRB_REPL_TRANSPORT") or "tmux").strip().lower() == "conpty":
+        fail("attach works with the tmux transport; the native Windows host owns its own window")
+        return 2
+    tmux_bin = config.get("CRB_TMUX_BIN") or "tmux"
+    socket = config.get("CRB_TMUX_SOCKET") or config.get("TAB_AGENT_TMUX_SOCKET") or "codex"
+    session = config.get("CRB_TMUX_SESSION") or config.get("TAB_AGENT_TMUX_SESSION") or "codex"
+    exists = tmux_session_exists(tmux_bin=tmux_bin, socket=socket, session=session, run=run)
+    if exists is None:
+        fail(f"tmux could not run ({tmux_bin}); install tmux, then run {ATTACH_COMMAND} again")
+        return 2
+    if not exists:
+        if not create_missing:
+            fail(f"tmux session missing: {socket}/{session}")
+            return 2
+        workdir = Path(config.get("TAB_WORKDIR") or str(Path.home())).expanduser()
+        if not start_codex_tmux_session(
+            tmux_bin=tmux_bin,
+            socket=socket,
+            session=session,
+            workdir=workdir,
+            agent_cmd=config.get("TAB_AGENT_CMD") or "codex",
+            run=run,
+        ):
+            return 2
+    try:
+        clients = run([tmux_bin, "-L", socket, "list-clients", "-t", f"={session}"])
+    except OSError:
+        clients = None
+    if clients is not None and (clients.stdout or "").strip():
+        setup_note(
+            "another terminal is already attached; this one joins it. The pane keeps the "
+            "smaller size until the other terminal detaches (Ctrl+B then D)."
+        )
+    exec_fn(tmux_bin, [tmux_bin, "-L", socket, "attach", "-t", session])
+    return 0
+
+
+def attach_main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(
+        prog=ATTACH_COMMAND,
+        description="Attach this terminal to the Codex session the bridge controls",
+    )
+    parser.add_argument("--config", type=expand_path, default=default_config_file())
+    parser.add_argument("--no-create", action="store_true", help="fail instead of starting a missing session")
+    args = parser.parse_args(argv)
+    try:
+        return attach_command(args.config, create_missing=not args.no_create)
+    except SetupError as exc:
+        fail(str(exc))
+        return 2
+
+
+class BridgeLogTail:
+    """New bridge log text since construction: the launchd log on macOS, the user journal on Linux."""
+
+    def __init__(
+        self,
+        os_name: str,
+        *,
+        run: RunCommand | None = None,
+        since: float | None = None,
+        path: Path | None = None,
+    ) -> None:
+        self.os_name = os_name
+        self.run = run or run_command
+        self.since = time.time() if since is None else since
+        self.path = path if path is not None else (launchd_log_file() if os_name == "Darwin" else None)
+        self.offset = self.path.stat().st_size if self.path is not None and self.path.exists() else 0
+        self.seen = 0
+
+    def read_new(self) -> str:
+        if self.path is not None:
+            if not self.path.exists():
+                return ""
+            with self.path.open("rb") as handle:
+                handle.seek(self.offset)
+                data = handle.read()
+            self.offset += len(data)
+            return data.decode("utf-8", "replace")
+        if self.os_name == "Linux":
+            try:
+                proc = self.run(
+                    ["journalctl", "--user", "-u", SERVICE_NAME, "--since", f"@{int(self.since)}",
+                     "-o", "cat", "--no-pager"]
+                )
+            except OSError:
+                return ""
+            text = proc.stdout or ""
+            new, self.seen = text[self.seen:], len(text)
+            return new
+        return ""
+
+
+def author_self_check(
+    *,
+    token: str,
+    chat_id: str,
+    config: dict[str, str],
+    os_name: str,
+    api_call: ApiCall = telegram_call,
+    run: RunCommand | None = None,
+    sleep: Callable[[float], None] = time.sleep,
+    clock: Callable[[], float] = time.time,
+    log_tail: Any = None,
+    phone_timeout: float = SELF_CHECK_PHONE_TIMEOUT,
+    terminal_timeout: float = SELF_CHECK_TERMINAL_TIMEOUT,
+    bot_message_sent: bool | None = True,
+) -> list[str]:
+    """Three live checks after an author-preset install; the results go to the terminal and the phone."""
+    run = run or run_command
+    doctor_hint = doctor_command_hint()
+    out("")
+    out("Self-check: bot -> phone, phone -> terminal -> phone, terminal -> phone")
+    if bot_message_sent is None:
+        lines = ["1/3 bot -> phone: skipped (test message disabled)"]
+    elif bot_message_sent:
+        lines = ["1/3 bot -> phone: ok (setup message delivered)"]
+    else:
+        lines = [f"1/3 bot -> phone: the setup message was not delivered; run `{doctor_hint}`"]
+    tail = log_tail if log_tail is not None else BridgeLogTail(os_name, run=run, since=clock())
+
+    started = clock()
+    api_call(
+        token,
+        "sendMessage",
+        chat_id=chat_id,
+        text=(
+            f"Self-check 2/3: send any text to this bot within {int(phone_timeout)} s. "
+            "It should appear in the Codex terminal and the answer should come back here."
+        ),
+    )
+    setup_note(f"waiting up to {int(phone_timeout)}s for a message from your phone ...")
+    arrived = answered = False
+    while clock() - started < phone_timeout:
+        chunk = tail.read_new()
+        arrived = arrived or bool(PHONE_ARRIVAL_RE.search(chunk))
+        answered = answered or any(marker in chunk for marker in PHONE_ANSWER_MARKERS)
+        if answered:
+            break
+        sleep(2)
+    if answered:
+        lines.append("2/3 phone -> terminal -> phone: ok")
+    elif arrived:
+        lines.append(
+            "2/3 phone -> terminal -> phone: the message reached the terminal but no answer came back "
+            f"in time; look at the Codex session, then run `{doctor_hint}`"
+        )
+    else:
+        lines.append(
+            f"2/3 phone -> terminal -> phone: no phone message within {int(phone_timeout)} s; "
+            f"send any text to the bot later and run `{doctor_hint}`"
+        )
+
+    tmux_bin = config.get("CRB_TMUX_BIN") or "tmux"
+    socket = config.get("CRB_TMUX_SOCKET") or "codex"
+    session = config.get("CRB_TMUX_SESSION") or "codex"
+    target = tmux_pane_target(session)
+    try:
+        run([tmux_bin, "-L", socket, "send-keys", "-t", target, "-l", SELF_CHECK_PROBE])
+        sleep(0.5)
+        run([tmux_bin, "-L", socket, "send-keys", "-t", target, config.get("CRB_TMUX_SUBMIT_KEY") or "Tab"])
+    except OSError as exc:
+        warn(f"could not type the probe into the Codex session: {exc}")
+    setup_note(f"typed a probe into the Codex session; waiting up to {int(terminal_timeout)}s for its phone card ...")
+    started = clock()
+    mirrored = False
+    while clock() - started < terminal_timeout:
+        chunk = tail.read_new()
+        if any(marker in chunk for marker in TERMINAL_MIRROR_MARKERS):
+            mirrored = True
+            break
+        sleep(2)
+    if mirrored:
+        lines.append("3/3 terminal -> phone: ok")
+    else:
+        lines.append(
+            f"3/3 terminal -> phone: no terminal mirror card within {int(terminal_timeout)} s; "
+            f"confirm Codex runs in tmux session {socket}/{session} and the service restarted, "
+            f"then run `{doctor_hint}`"
+        )
+    for line in lines:
+        out(line)
+    api_call(token, "sendMessage", chat_id=chat_id, text="Setup self-check\n" + "\n".join(lines))
+    return lines
+
+
+def doctor(
+    config_file: Path,
+    runner_file: Path,
+    api_call: ApiCall = telegram_call,
+    *,
+    run: RunCommand | None = None,
+) -> int:
+    run = run or run_command
     failures = 0
     warnings = 0
     next_steps: list[str] = []
@@ -1633,9 +2116,20 @@ def doctor(config_file: Path, runner_file: Path, api_call: ApiCall = telegram_ca
         if sys.platform == "win32":
             add_next_step(f"Windows native mode has no tmux; use exec mode: {setup_command_hint(mode='exec')}")
         elif shutil.which("tmux"):
-            proc = run_command(["tmux", "-L", tmux_socket, "has-session", "-t", f"={tmux_session}"])
+            proc = run(["tmux", "-L", tmux_socket, "has-session", "-t", f"={tmux_session}"])
             if proc.returncode == 0:
                 ok(f"tmux Codex session found: {tmux_socket}/{tmux_session}")
+                try:
+                    codex_name = os.path.basename(shlex.split(config.get("TAB_AGENT_CMD") or "codex")[0])
+                except (ValueError, IndexError):
+                    codex_name = "codex"
+                warnings += warn_sessions_outside_bridge(
+                    tmux_bin="tmux",
+                    socket=tmux_socket,
+                    session=tmux_session,
+                    command=codex_name,
+                    run=run,
+                )
             else:
                 warn(f"tmux Codex session not found: {tmux_socket}/{tmux_session}")
                 codex_command = config.get("TAB_AGENT_CMD", "codex") or "codex"
@@ -1653,6 +2147,7 @@ def doctor(config_file: Path, runner_file: Path, api_call: ApiCall = telegram_ca
                         ]
                     )
                 )
+                add_next_step(f"Or start it and attach in one step: {ATTACH_COMMAND}")
                 add_next_step(f"To use it without tmux, switch to exec mode: {setup_command_hint(mode='exec')}")
                 warnings += 1
         else:
@@ -1764,6 +2259,22 @@ def build_parser() -> argparse.ArgumentParser:
     setup_parser.add_argument("--no-test-message", action="store_true")
     setup_parser.add_argument("--non-interactive", action="store_true")
     setup_parser.add_argument("-y", "--yes", action="store_true")
+    setup_parser.add_argument(
+        "--like-author",
+        action="store_true",
+        help="author preset: flow card with its Stop button, Codex started in the bridge tmux session, "
+        f"the {ATTACH_COMMAND} command, and a two-way self-check (repl mode, macOS/Linux/WSL)",
+    )
+    setup_parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="print what setup would write and start, without touching files, tmux, or Telegram",
+    )
+    setup_parser.add_argument(
+        "--create-session",
+        action="store_true",
+        help="start Codex in the tmux session when it is missing (the author preset always does)",
+    )
 
     doctor_parser = subparsers.add_parser("doctor", help="check configuration and service")
     doctor_parser.add_argument("--config", type=expand_path, default=default_config_file())
@@ -1775,6 +2286,12 @@ def build_parser() -> argparse.ArgumentParser:
     uninstall_parser.add_argument("--purge", action="store_true", help="also delete private config")
     uninstall_parser.add_argument("-y", "--yes", action="store_true")
 
+    attach_parser = subparsers.add_parser(
+        "attach", help=f"attach this terminal to the bridge's Codex tmux session (same as {ATTACH_COMMAND})"
+    )
+    attach_parser.add_argument("--config", type=expand_path, default=default_config_file())
+    attach_parser.add_argument("--no-create", action="store_true", help="fail instead of starting a missing session")
+
     return parser
 
 
@@ -1782,6 +2299,8 @@ def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
     try:
+        if args.command == "attach":
+            return attach_command(args.config, create_missing=not args.no_create)
         if args.command == "setup":
             return setup_bridge(
                 SetupOptions(
@@ -1808,6 +2327,9 @@ def main(argv: list[str] | None = None) -> int:
                     non_interactive=args.non_interactive,
                     yes=args.yes,
                     language=args.language,
+                    like_author=args.like_author,
+                    dry_run=args.dry_run,
+                    create_session=args.create_session,
                 )
             )
         if args.command == "doctor":

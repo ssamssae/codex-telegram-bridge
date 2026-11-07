@@ -357,13 +357,22 @@ class TelegramStopButtons:
         b = self.bridge
         if self.engine == 'claude':
             active = getattr(b, 'active_turn', None)
-            if not active or active.flow_closed:
-                return '', 0, ''
-            expected = active.user_uuid or ''
             binding = getattr(b, 'session_binding', None)
-            if expected and binding:
-                expected = claude_prompt_anchor(binding.transcript_path, expected)
-            return active.nonce, active.flow_message_id, expected
+            if active:
+                if active.flow_closed:
+                    return '', 0, ''
+                expected = active.user_uuid or ''
+                if expected and binding:
+                    expected = claude_prompt_anchor(binding.transcript_path, expected)
+                return active.nonce, active.flow_message_id, expected
+            # A terminal-started bout has no Telegram turn behind its work card.
+            # Bind the button to the native prompt that opened the bout instead;
+            # the bridge closes the bout before it retires the card.
+            origin = str(getattr(b, 'ambient_flow_origin_uuid', '') or '')
+            if not origin or getattr(b, 'ambient_flow_closed', True):
+                return '', 0, ''
+            expected = claude_prompt_anchor(binding.transcript_path, origin) if binding else ''
+            return 'ambient:' + origin, int(getattr(b, 'ambient_flow_message_id', 0) or 0), expected
         if getattr(b, 'flow_closing', False):
             return '', 0, ''
         state = getattr(b, 'bridge_state', None) or {}
