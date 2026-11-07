@@ -2,6 +2,7 @@
 import contextlib
 import io
 import os
+import shlex
 import subprocess
 import tempfile
 import unittest
@@ -9,6 +10,9 @@ from pathlib import Path
 from unittest import mock
 
 import bridge_setup as setup
+
+# The author preset runs Codex in tmux, so native Windows refuses it (WSL is Linux).
+POSIX_ONLY = unittest.skipIf(os.name == "nt", "the author preset needs tmux: macOS, Linux, or WSL")
 
 
 def completed(cmd, returncode=0, stdout="", stderr=""):
@@ -505,6 +509,7 @@ class LikeAuthorSetupTests(unittest.TestCase):
         values.update(overrides)
         return setup.SetupOptions(**values)
 
+    @POSIX_ONLY
     def test_like_author_setup_writes_preset_backs_up_config_and_starts_tmux_session(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             base = Path(tmpdir)
@@ -558,6 +563,7 @@ class LikeAuthorSetupTests(unittest.TestCase):
                 with self.assertRaises(setup.SetupError):
                     setup.setup_bridge(self.options(base, mode="exec", like_author=True), api_call=FakeApi())
 
+    @POSIX_ONLY
     def test_interactive_wizard_asks_author_preset_and_defaults_to_yes(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             base = Path(tmpdir)
@@ -614,8 +620,10 @@ class LikeAuthorSetupTests(unittest.TestCase):
     def test_attach_creates_missing_session_then_attaches(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             config = Path(tmpdir) / "bridge.env"
+            # Quoted like the wizard writes it, so a Windows path keeps its backslashes.
             config.write_text(
-                "TAB_BRIDGE_MODE=repl\nTAB_AGENT_CMD=codex\nTAB_WORKDIR=" + tmpdir + "\nCRB_TMUX_SOCKET=codex\nCRB_TMUX_SESSION=codex\n",
+                "TAB_BRIDGE_MODE=repl\nTAB_AGENT_CMD=codex\nTAB_WORKDIR=" + shlex.quote(tmpdir)
+                + "\nCRB_TMUX_SOCKET=codex\nCRB_TMUX_SESSION=codex\n",
                 encoding="utf-8",
             )
             calls, execs = [], []
@@ -668,6 +676,7 @@ class LikeAuthorSetupTests(unittest.TestCase):
         self.assertEqual(setup.codex_sessions_outside_bridge("/dev/ttys003", ps_text), [("30001", "ttys007")])
         self.assertEqual(setup.codex_sessions_outside_bridge("", ps_text), [])
 
+    @unittest.skipIf(os.name == "nt", "emulates a tmux host; Windows reports every config file as group-readable")
     def test_doctor_warns_when_codex_runs_outside_bridge_tmux(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             base = Path(tmpdir)
@@ -804,7 +813,8 @@ class LikeAuthorSetupTests(unittest.TestCase):
                 self.assertIn(expected, lines[0])
 
     def test_dry_run_prints_the_plan_without_writing_or_contacting_telegram(self):
-        for like_author in (True, False):
+        # Native Windows refuses the author preset before planning (see the test below).
+        for like_author in (False,) if os.name == "nt" else (True, False):
             with self.subTest(like_author=like_author), tempfile.TemporaryDirectory() as tmpdir:
                 base = Path(tmpdir)
                 api = FakeApi()
@@ -832,6 +842,7 @@ class LikeAuthorSetupTests(unittest.TestCase):
                 self.assertEqual(setup.ATTACH_COMMAND in text, like_author)
                 self.assertEqual("self-check" in text, like_author)
 
+    @POSIX_ONLY
     def test_like_author_keeps_an_existing_tmux_session(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             base = Path(tmpdir)
@@ -856,6 +867,7 @@ class LikeAuthorSetupTests(unittest.TestCase):
                     setup.setup_bridge(self.options(base, like_author=True), api_call=FakeApi())
             self.assertFalse((base / "bridge.env").exists())
 
+    @POSIX_ONLY
     def test_like_author_runs_self_check_only_after_the_service_started(self):
         for start, status, expected in ((True, "active", 1), (False, "active", 0), (True, "failed", 0)):
             with self.subTest(start=start, status=status), tempfile.TemporaryDirectory() as tmpdir:
@@ -906,11 +918,12 @@ class LikeAuthorSetupTests(unittest.TestCase):
     def test_log_tail_returns_only_new_text(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             log = Path(tmpdir) / "bridge.log"
-            log.write_text("old line\n", encoding="utf-8")
+            # Bytes, as the service writes them (text mode would add CR on Windows).
+            log.write_bytes(b"old line\n")
             tail = setup.BridgeLogTail("Darwin", path=log)
             self.assertEqual(tail.read_new(), "")
-            with log.open("a", encoding="utf-8") as handle:
-                handle.write("new line\n")
+            with log.open("ab") as handle:
+                handle.write(b"new line\n")
             self.assertEqual(tail.read_new(), "new line\n")
             self.assertEqual(tail.read_new(), "")
         journal = ["a\n", "a\nb\n", "a\nb\n"]
