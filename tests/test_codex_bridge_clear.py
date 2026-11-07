@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import importlib.util
+import io
 import json
 import os
 import sqlite3
@@ -688,6 +689,26 @@ class ClearAcknowledgementTest(unittest.TestCase):
         self.request()
         self.assertEqual(self.commands, [])
         self.assertNotIn(self.mod.CLEAR_SLASH_COMPLETE, self.sent())
+
+    def test_refused_clear_reports_and_ends_turn_on_legacy_code_page_stdout(self):
+        # Redirected stdout on Windows uses the ANSI code page (cp1252 on CI)
+        # with strict errors. Logging the Korean refusal must not escape the
+        # handler: the turn ends and Telegram still hears why /clear stopped.
+        self.identity_transport()
+        self.screen = self.screen.replace('Ask Codex to do anything', 'user draft')
+        raw = io.BytesIO()
+        legacy = io.TextIOWrapper(raw, encoding='cp1252', errors='strict',
+                                  write_through=True)
+        with mock.patch.object(sys, 'stdout', legacy):
+            self.request()
+        self.assertEqual(self.commands, [])
+        self.bridge.stop_repl_typing.assert_called_once_with()
+        self.bridge.clear_active_telegram_prompt.assert_called_once_with()
+        self.assertEqual(len(self.sent()), 1)
+        self.assertIn('/clear', self.sent()[0])
+        self.assertNotIn(self.mod.CLEAR_SLASH_COMPLETE, self.sent())
+        logged = raw.getvalue().decode('cp1252')
+        self.assertIn('REPL  paste failed: \\u', logged)
 
     def test_identity_draft_after_submission_blocks_status_probe(self):
         self.identity_transport()
