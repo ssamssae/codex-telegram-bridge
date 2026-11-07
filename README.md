@@ -78,6 +78,38 @@ That is the whole happy path. Everything below is reference — the guided begin
 walkthrough, the public export model, media, approvals, Windows modes, and
 advanced settings.
 
+### Like the author, in one command
+
+Want the maintainer's own setup instead of the bare defaults? Run setup with
+the author preset (Linux, macOS, or WSL; it needs tmux and REPL mode):
+
+```bash
+pipx install codex-telegram-bridge && codex-telegram-bridge setup --like-author
+```
+
+Only two steps still need a human: create the bot in `@BotFather` and send
+`/start` to it. Everything else is done for you: the private config with the
+switches below (an existing config is backed up first), the background service
+and watchdog, a tmux session `codex`/`codex` with Codex started inside it, and a
+short self-check that sends one message from your phone to the terminal and
+back, then mirrors one terminal prompt to your phone. The interactive wizard
+asks the same thing as its first question, `Use the author's setup
+(recommended)? [Y/n]`, and defaults to yes.
+
+| Switch | What it does |
+| --- | --- |
+| `CRB_FLOW_MIRROR=1` | The live work-flow card with its Stop and send-now buttons, for phone prompts and for prompts typed at the keyboard |
+| `CRB_TELEGRAM_FALLBACK_SECONDS=0` | No separate progress note after a slow phone prompt; the flow card already shows the progress |
+
+The preset installs no Codex hooks: the bridge reads Codex's own session log.
+
+From then on, type `codex-tg` in any terminal to land in the one Codex session
+the bridge controls; it starts that session first when it is missing. Phone and
+terminal share that session. A Codex window opened anywhere else is not
+connected to your phone, and `codex-telegram-bridge doctor` warns when it sees
+one. Add `--dry-run` to `setup --like-author` to print what would be written
+without touching anything.
+
 ## Features At A Glance
 
 Everything in the first table works out of the box. Everything in the second
@@ -389,7 +421,9 @@ Service restart
 
 ## Setup Wizard Details
 
-The setup wizard is designed for first-time users. It shows six steps:
+The setup wizard is designed for first-time users. Its first question offers
+the [author preset](#like-the-author-in-one-command); answer `n` for the plain
+setup described here. It shows six steps:
 
 ```text
 [1/6] Paste the BotFather token
@@ -749,6 +783,23 @@ Interactive install:
 codex-telegram-bridge setup
 # or:
 python3 bridge_setup.py setup
+```
+
+Author preset (flow card with its Stop button, Codex started in tmux, `codex-tg`,
+and a two-way self-check):
+
+```bash
+codex-telegram-bridge setup --like-author
+codex-telegram-bridge setup --like-author --dry-run   # print the plan only
+```
+
+Attach this terminal to the Codex session the bridge controls (starts it when
+missing; another attached terminal stays attached):
+
+```bash
+codex-tg
+# or:
+codex-telegram-bridge attach
 ```
 
 Text-only one-shot install:
