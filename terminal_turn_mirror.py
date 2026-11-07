@@ -259,11 +259,15 @@ class HandoffCard:
     Callbacks stay on the receiving bridge's existing transport. Only masked
     display context and native turn hashes are persisted, never prompt bodies.
     """
-    def __init__(self, path, send, edit):
+    def __init__(self, path, send, edit, log=None):
         import json
         import threading
         from pathlib import Path
         self.path, self.send, self.edit = Path(path), send, edit
+        # T-261031-001: 첫 발신 결과(mid·미확인·예외 종류)를 브릿지 로그로 한 줄 알린다. 10/30 맥
+        # 코덱스 인계 턴에서 pane 로그에 카드 발신 줄이 없어 「안 나갔다」와 「안 적혔다」를 못 갈랐다.
+        # 선택 인자라 기존 호출(커서·그록)은 그대로다.
+        self.log = log
         self.lock = threading.RLock()
         try:
             self.state = json.loads(self.path.read_text())
@@ -306,16 +310,32 @@ class HandoffCard:
             self.state = dict(key=key, context=context, message_id=0, closed=False,
                               started=time.time(), steps=[], attempted=True, pending_cards=pending)
             self._save()  # Before send: a timeout/crash must not produce a second card.
+            failure = ""
             try:
                 mid = self.send(format_handoff_card(context))
-            except Exception:
+            except Exception as exc:  # noqa: BLE001
                 mid = 0  # Unknown send: keep the durable intent, never repost.
+                failure = type(exc).__name__
             try:
                 mid = int(mid) if not isinstance(mid, bool) else 0
             except (TypeError, ValueError):
                 mid = 0
             self.state["message_id"] = max(0, mid)
             self._save()
+            if failure:
+                self._note(f"handoff card send failed: {failure}")
+            elif mid > 0:
+                self._note(f"handoff card sent mid={mid}")
+            else:
+                self._note("handoff card send unconfirmed (no message id; never reposted)")
+
+    def _note(self, text):
+        if not self.log:
+            return
+        try:
+            self.log(text)
+        except Exception:  # noqa: BLE001
+            pass  # 로그는 전달을 막지 않는다.
 
     def update(self, step="", *, done_label=""):
         import time
