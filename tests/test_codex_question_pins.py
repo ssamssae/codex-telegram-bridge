@@ -195,7 +195,8 @@ class QuestionPinsTest(unittest.TestCase):
 
         def inspect_journal(method, **kwargs):
             if method == 'pinChatMessage':
-                saved = json.loads(self.path.read_text())[key]
+                # The journal is UTF-8; Windows reads default to the ANSI code page.
+                saved = json.loads(self.path.read_text(encoding='utf-8'))[key]
                 self.assertTrue(saved['pin_managed'])
             return original(method, **kwargs)
 
@@ -329,12 +330,15 @@ class BridgePinIntegrationTest(unittest.TestCase):
             telegram = Telegram()
             bridge = module.Bridge(config, telegram, Mock())
             bridge.session_path = Path(SESSION)
+            # The bridge keys questions by str(session_path), which uses
+            # backslashes on Windows; observe under that same key.
+            session = str(bridge.session_path)
             bridge.choice_screen = Mock(return_value='› Ask Codex to do anything')
             bridge.maybe_notify_fast_mode = Mock()
             questions = bridge.get_async_questions()
             questions.clock = lambda: NOW
-            questions.observe(request(), SESSION)
-            questions.observe(accepted(), SESSION)
+            questions.observe(request(), session)
+            questions.observe(accepted(), session)
             bridge.stop_event.wait = lambda _: bridge.stop_event.set()
             bridge.approval_loop()
             self.assertEqual(telegram.pinned, {999, 56})

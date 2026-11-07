@@ -840,7 +840,15 @@ def run_midreport_obligation(args: list[str]) -> None:
 
 
 def log(label: str, message: str) -> None:
-    print(f"[{now_ts()}] {label:<5} {message}", flush=True)
+    line = f"[{now_ts()}] {label:<5} {message}"
+    try:
+        print(line, flush=True)
+    except UnicodeEncodeError:
+        # Redirected stdout on Windows uses the ANSI code page (e.g. cp1252),
+        # which cannot encode Korean text. A log line must never abort the
+        # caller's error handling, so escape what the stream cannot show.
+        encoding = getattr(sys.stdout, "encoding", None) or "utf-8"
+        print(line.encode(encoding, "backslashreplace").decode(encoding), flush=True)
 
 
 # ─ codex-CLI-style startup version check + button/auto self-update ─────────────
