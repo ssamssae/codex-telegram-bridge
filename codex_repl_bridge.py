@@ -6661,6 +6661,7 @@ class Bridge:
             self.config.state_path.with_suffix(".handoff.json"),
             lambda body: self.telegram.send_message_id(body, viewer=True),
             lambda mid, body: self.telegram.edit(mid, body, viewer=True),
+            log=lambda text: log("SEND", text),  # T-261031-001: 카드 첫 발신 결과를 pane 로그에 남긴다
         )
         self.flow_last_edit_at = 0.0
         # T-260727-104 하트비트 상태. flow_last_edit_at 을 재사용하지 않는 이유 —
@@ -10248,6 +10249,8 @@ class Bridge:
     def approval_loop(self) -> None:
         while not self.stop_event.is_set():
             try:
+                if getattr(self, "async_questions_lock", None) is not None:
+                    self.get_async_questions().sync_pins(str(self.session_path or ""))
                 with self.choice_submit_lock:
                     self.expire_choice_confirmations()
                     screen = self.choice_screen()
